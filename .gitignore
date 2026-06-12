@@ -1,0 +1,90 @@
+# ============================================================
+# LotVue360 — .gitignore   (SECURITY: never commit secrets/data)
+# ============================================================
+
+# --- Secrets & credentials (NEVER commit) ---
+.env
+*.env
+!.env.example
+.jwt_secret
+**/.jwt_secret
+*secret*
+*credentials*
+app/.env
+
+# --- Databases & personal data ---
+*.db
+*.sqlite
+*.sqlite3
+app/vehicles.db
+app/lotvue.db
+
+# --- Uploaded media / vehicle photos / generated assets ---
+app/storage/
+storage/
+**/app_profile/
+test_assets/
+*.mp4
+*.gif
+*.heic
+
+# --- Generated background images (regenerated at runtime) ---
+app/static/backgrounds/*.jpg
+app/static/backgrounds/thumbs/
+app/static/desktop/app_profile/
+
+# --- PyInstaller / build artifacts ---
+dist/
+build/
+build_pyi/
+build_pyi_sa/
+*.spec.bak
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# --- Models / large binaries (never in git) ---
+*.safetensors
+*.gguf
+*.onnx
+*.pth
+*.bin
+*.zip
+
+# --- Logs ---
+*.log
+server_stdout.log
+server_stderr.log
+standalone*.log
+desktop*.log
+
+# --- Backups & old source variants ---
+app/backups/
+*.bak
+main*.py.bak
+*_backup_*.py
+app/main_before_op6.py
+app/main_original.py
+app/main_v1.py
+app/main_backup_*.py
+app/commercial_pipeline.py.bak
+app/SESSION_TRANSCRIPT.md
+app/BUILD_SESSION_LOG.md
+
+# --- Internal dev/state/handoff docs (contain credentials & private notes) ---
+FABLE_EXECUTION_STATE.md
+FABLE_LOTVUE360_FINISH_SPEC.md
+LOTVUE360_EXACT_BUILD_SPEC.md
+COWORK_LOTVUE_PRO_BUILD.md
+LOTVUE360_DEMO.md
+SESSION_AUDIT_*.md
+NEXT_SESSION*.md
+*HANDOFF*.md
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+node_modules/
