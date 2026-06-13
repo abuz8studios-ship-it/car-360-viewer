@@ -89,6 +89,30 @@ async def clear_category(vin: str, category: str):
     return {"status": "cleared", "vin": vin.upper(), "category": category, "deleted": n}
 
 
+@router.delete("/api/vehicles/clear-all")
+async def clear_all_vehicles():
+    """Wipe the ENTIRE board — every vehicle record + all its photos. Start fresh."""
+    conn = _db()
+    vins = [r["vin"] for r in conn.execute("SELECT vin FROM vehicles").fetchall()]
+    conn.close()
+    removed = 0
+    for vin in vins:
+        d = STORAGE_DIR / str(vin).upper()
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+        c = _db()
+        c.execute("DELETE FROM vehicles WHERE vin=?", (vin,))
+        for t in ("hotspots", "gallery_photos", "interior_panoramas", "leads"):
+            try:
+                c.execute(f"DELETE FROM {t} WHERE vin=?", (vin,))
+            except Exception:
+                pass
+        c.commit()
+        c.close()
+        removed += 1
+    return {"status": "ok", "vehicles_removed": removed}
+
+
 @router.get("/manage/{vin}", response_class=HTMLResponse)
 async def manage_page(vin: str, request: Request):
     vin = vin.upper()
@@ -130,6 +154,8 @@ h1{font-size:1.3rem;color:#2E75B6;}
     <a class="btn secondary" href="/view/__VIN__" target="_blank">Preview 360</a>
     <a class="btn secondary" href="/dashboard">← Dashboard</a>
     <button class="btn" onclick="refinalize()">Rebuild 360 spin</button>
+    <button class="btn danger" onclick="deleteVehicle()">🗑 Delete this vehicle</button>
+    <button class="btn danger" onclick="clearAll()">⚠ Clear ALL vehicles</button>
   </div>
 </div>
 <div id="cats"></div>
@@ -154,20 +180,54 @@ async function load(){
     root.appendChild(sec);
   }
 }
+// custom confirm — native confirm() is suppressed in Edge/Chrome app-mode windows
+function lvConfirm(msg){
+  return new Promise(function(resolve){
+    var ov=document.createElement('div');
+    ov.style.cssText='position:fixed;inset:0;background:rgba(20,30,45,.55);display:flex;align-items:center;justify-content:center;z-index:9999';
+    ov.innerHTML='<div style="background:#fff;border-radius:14px;max-width:380px;padding:1.4rem;box-shadow:0 12px 40px rgba(0,0,0,.3);text-align:center">'+
+      '<div style="font-size:1rem;color:#2C3E50;margin-bottom:1.1rem;line-height:1.4">'+msg+'</div>'+
+      '<button id="lvNo" style="padding:.6rem 1.2rem;border:1.5px solid #DDE5EE;background:#fff;color:#2C3E50;border-radius:9px;font-weight:600;cursor:pointer;margin-right:.6rem">Cancel</button>'+
+      '<button id="lvYes" style="padding:.6rem 1.2rem;border:none;background:#C0392B;color:#fff;border-radius:9px;font-weight:700;cursor:pointer">Delete</button></div>';
+    document.body.appendChild(ov);
+    ov.querySelector('#lvYes').onclick=function(){ov.remove();resolve(true);};
+    ov.querySelector('#lvNo').onclick=function(){ov.remove();resolve(false);};
+    ov.onclick=function(e){if(e.target===ov){ov.remove();resolve(false);}};
+  });
+}
 async function del(cat,fn){
-  if(!confirm(`Delete ${fn}?`))return;
-  const r=await fetch(`/api/vehicle/${VIN}/photo?category=${cat}&filename=${encodeURIComponent(fn)}`,{method:'DELETE'});
-  if(r.ok){toast('Deleted '+fn);load();}else{toast('Delete failed');}
+  if(!(await lvConfirm('Delete <b>'+fn+'</b>?')))return;
+  const r=await fetch(`/api/vehicle/${VIN}/photo?category=${cat}&filename=${encodeURIComponent(fn)}`,{method:'DELETE',credentials:'same-origin'});
+  if(r.ok){toast('Deleted '+fn);load();}
+  else if(r.status===401){location.href='/login?next=/manage/'+VIN;}
+  else{toast('Delete failed ('+r.status+')');}
 }
 async function clearCat(cat,label){
-  if(!confirm(`Delete ALL ${label} photos? This cannot be undone.`))return;
-  const r=await fetch(`/api/vehicle/${VIN}/photos/clear?category=${cat}`,{method:'POST'});
-  const d=await r.json();if(r.ok){toast(`Deleted ${d.deleted} ${cat} photos`);load();}else{toast('Failed');}
+  if(!(await lvConfirm('Delete ALL '+label+' photos?<br>This cannot be undone.')))return;
+  const r=await fetch(`/api/vehicle/${VIN}/photos/clear?category=${cat}`,{method:'POST',credentials:'same-origin'});
+  if(r.ok){const d=await r.json();toast(`Deleted ${d.deleted} ${cat} photos`);load();}
+  else if(r.status===401){location.href='/login?next=/manage/'+VIN;}
+  else{toast('Failed ('+r.status+')');}
 }
 async function refinalize(){
   toast('Rebuilding 360 spin…');
-  const r=await fetch(`/api/finalize/${VIN}`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  const r=await fetch(`/api/finalize/${VIN}`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'});
   if(r.ok){toast('Rebuild started — refresh in ~30s');}else{toast('Rebuild failed (need exterior photos)');}
+}
+async function deleteVehicle(){
+  if(!(await lvConfirm('Delete the ENTIRE vehicle <b>'+VIN+'</b> and all its photos?<br>This cannot be undone.')))return;
+  const r=await fetch(`/api/vehicle/${VIN}`,{method:'DELETE',credentials:'same-origin'});
+  if(r.ok){toast('Vehicle deleted — returning to dashboard');setTimeout(()=>location.href='/dashboard',900);}
+  else if(r.status===401){location.href='/login?next=/manage/'+VIN;}
+  else{toast('Delete failed ('+r.status+')');}
+}
+async function clearAll(){
+  if(!(await lvConfirm('⚠ Delete EVERY vehicle and ALL photos on the whole board?<br>This wipes your entire inventory and cannot be undone.')))return;
+  if(!(await lvConfirm('Are you sure? This removes <b>ALL</b> vehicles to start completely fresh.')))return;
+  const r=await fetch('/api/vehicles/clear-all',{method:'DELETE',credentials:'same-origin'});
+  if(r.ok){const d=await r.json();toast('Cleared '+d.vehicles_removed+' vehicles — fresh board');setTimeout(()=>location.href='/dashboard',1200);}
+  else if(r.status===401){location.href='/login?next=/manage/'+VIN;}
+  else{toast('Clear-all failed ('+r.status+')');}
 }
 load();
 </script>

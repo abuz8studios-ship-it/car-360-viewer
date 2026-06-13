@@ -94,14 +94,22 @@ def install_auth_gate(app):
         except JWTError:
             return False
 
+    def _no_cache(resp):
+        # force fresh HTML so app-mode/browsers never show a stale "old style"
+        ct = resp.headers.get("content-type", "")
+        if "text/html" in ct:
+            resp.headers["Cache-Control"] = "no-store, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+        return resp
+
     @app.middleware("http")
     async def auth_gate_middleware(request: Request, call_next):
         path = request.url.path.rstrip("/") or "/"
         method = request.method.upper()
         if method == "OPTIONS" or _is_public(method, path):
-            return await call_next(request)
+            return _no_cache(await call_next(request))
         if _valid(_bearer_or_cookie(request)):
-            return await call_next(request)
+            return _no_cache(await call_next(request))
         # HTML navigation → login redirect; API → 401 JSON
         accept = request.headers.get("accept", "")
         if "text/html" in accept and method == "GET":

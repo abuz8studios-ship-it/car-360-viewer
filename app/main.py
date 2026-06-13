@@ -2249,18 +2249,35 @@ async def dashboard(request: Request):
             document.querySelectorAll('.bulk-cb').forEach(cb => cb.checked = false);
             updateBulkBar();
         }}
+        // custom confirm — native confirm() is suppressed in Edge/Chrome app-mode windows
+        function lvConfirm(msg) {{
+            return new Promise(function(resolve) {{
+                var ov = document.createElement('div');
+                ov.style.cssText = 'position:fixed;inset:0;background:rgba(20,30,45,.55);display:flex;align-items:center;justify-content:center;z-index:99999';
+                ov.innerHTML = '<div style="background:#fff;border-radius:14px;max-width:380px;padding:1.4rem;box-shadow:0 12px 40px rgba(0,0,0,.3);text-align:center;font-family:sans-serif">' +
+                    '<div style="font-size:1rem;color:#2C3E50;margin-bottom:1.1rem;line-height:1.4">' + msg + '</div>' +
+                    '<button id="lvNo" style="padding:.6rem 1.2rem;border:1.5px solid #DDE5EE;background:#fff;color:#2C3E50;border-radius:9px;font-weight:600;cursor:pointer;margin-right:.6rem">Cancel</button>' +
+                    '<button id="lvYes" style="padding:.6rem 1.2rem;border:none;background:#C0392B;color:#fff;border-radius:9px;font-weight:700;cursor:pointer">Delete</button></div>';
+                document.body.appendChild(ov);
+                ov.querySelector('#lvYes').onclick = function() {{ ov.remove(); resolve(true); }};
+                ov.querySelector('#lvNo').onclick = function() {{ ov.remove(); resolve(false); }};
+                ov.onclick = function(e) {{ if (e.target === ov) {{ ov.remove(); resolve(false); }} }};
+            }});
+        }}
         async function bulkDelete() {{
             const vins = [...document.querySelectorAll('.bulk-cb:checked')].map(cb => cb.value);
             if (!vins.length) return;
-            if (!confirm('Delete ' + vins.length + ' vehicle(s)?')) return;
-            await Promise.all(vins.map(v => fetch('/api/vehicle/' + v, {{method:'DELETE'}})));
+            if (!(await lvConfirm('Delete <b>' + vins.length + '</b> vehicle(s) and all their photos?'))) return;
+            await Promise.all(vins.map(v => fetch('/api/vehicle/' + v, {{ method: 'DELETE', credentials: 'same-origin' }})));
             location.reload();
         }}
         // Single delete
         async function deleteVehicle(vin) {{
-            if (!confirm('Delete ' + vin + '?')) return;
-            const r = await fetch('/api/vehicle/' + vin, {{ method: 'DELETE' }});
-            if (r.ok) location.reload();
+            if (!(await lvConfirm('Delete the entire vehicle <b>' + vin + '</b> and all its photos?<br>This cannot be undone.'))) return;
+            const r = await fetch('/api/vehicle/' + vin, {{ method: 'DELETE', credentials: 'same-origin' }});
+            if (r.ok) {{ location.reload(); }}
+            else if (r.status === 401) {{ location.href = '/login?next=/dashboard'; }}
+            else {{ alert('Delete failed (' + r.status + ')'); }}
         }}
 
         // ── AI Commercial Generator ──────────────────────────────────────────
@@ -2357,17 +2374,17 @@ async def dashboard(request: Request):
             const modal = document.createElement('div');
             modal.id = 'commercial-modal';
             modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.85);z-index:9999;display:flex;align-items:center;justify-content:center;';
-            modal.innerHTML = \`
+            modal.innerHTML = `
                 <div style="background:#1a1a2e;border:1px solid #7c3aed;border-radius:12px;padding:1.5rem;max-width:780px;width:95%;position:relative;">
                     <button onclick="document.getElementById('commercial-modal').remove()" style="position:absolute;top:0.75rem;right:0.75rem;background:none;border:none;color:#8b949e;font-size:1.4rem;cursor:pointer;">&times;</button>
                     <h3 style="color:#a78bfa;margin-bottom:1rem;font-size:1.1rem;">&#127916; AI Commercial Ready</h3>
                     <video controls autoplay style="width:100%;border-radius:8px;background:#000;" src="${{url}}"></video>
                     <div style="margin-top:1rem;display:flex;gap:0.75rem;flex-wrap:wrap;">
-                        <a href="${{url}}" download="commercial_${{vin}}.mp4" style="background:#7c3aed;color:white;padding:0.5rem 1rem;border-radius:6px;text-decoration:none;font-size:0.85rem;">&#11015; Download MP4 \${{sizeMb ? '(' + sizeMb + ' MB)' : ''}}</a>
+                        <a href="${{url}}" download="commercial_${{vin}}.mp4" style="background:#7c3aed;color:white;padding:0.5rem 1rem;border-radius:6px;text-decoration:none;font-size:0.85rem;">&#11015; Download MP4 ${{sizeMb ? '(' + sizeMb + ' MB)' : ''}}</a>
                         <button onclick="regenerateCommercial('${{vin}}')" style="background:#374151;color:#d1d5db;border:none;padding:0.5rem 1rem;border-radius:6px;cursor:pointer;font-size:0.85rem;">&#8635; Regenerate</button>
                     </div>
                 </div>
-            \`;
+            `;
             document.body.appendChild(modal);
             modal.addEventListener('click', e => {{ if (e.target === modal) modal.remove(); }});
         }}
@@ -2398,16 +2415,16 @@ async def dashboard(request: Request):
                     <button onclick="document.getElementById('pricing-modal').remove()" style="position:absolute;top:0.75rem;right:0.75rem;background:none;border:none;color:#8b949e;font-size:1.4rem;cursor:pointer;">&times;</button>
                     <h3 style="color:#2E75B6;margin-bottom:1rem;">&#128200; Market Price Intelligence</h3>
                     <div style="text-align:center;margin:1rem 0;">
-                        <div style="font-size:2rem;font-weight:800;color:#2E75B6;">$\${{p.market_average?.toLocaleString()}}</div>
+                        <div style="font-size:2rem;font-weight:800;color:#2E75B6;">$${{p.market_average?.toLocaleString()}}</div>
                         <div style="color:#6c757d;font-size:0.85rem;">Market Average</div>
-                        <div style="color:#6c757d;font-size:0.85rem;margin-top:4px;">Range: $\${{p.suggested_low?.toLocaleString()}} — $\${{p.suggested_high?.toLocaleString()}}</div>
+                        <div style="color:#6c757d;font-size:0.85rem;margin-top:4px;">Range: $${{p.suggested_low?.toLocaleString()}} — $${{p.suggested_high?.toLocaleString()}}</div>
                     </div>
-                    $\{{p.asking_price ? '<div style="text-align:center;margin:1rem 0;padding:0.75rem;border-radius:8px;background:' + p.rating_color + '15;border:1px solid ' + p.rating_color + '40;"><span style="color:' + p.rating_color + ';font-weight:700;font-size:1.1rem;">' + p.rating + '</span><div style="color:#6c757d;font-size:0.82rem;margin-top:4px;">Asking: $' + p.asking_price?.toLocaleString() + '</div></div>' : ''}}
+                    ${{p.asking_price ? '<div style="text-align:center;margin:1rem 0;padding:0.75rem;border-radius:8px;background:' + p.rating_color + '15;border:1px solid ' + p.rating_color + '40;"><span style="color:' + p.rating_color + ';font-weight:700;font-size:1.1rem;">' + p.rating + '</span><div style="color:#6c757d;font-size:0.82rem;margin-top:4px;">Asking: $' + p.asking_price?.toLocaleString() + '</div></div>' : ''}}
                     <div style="font-size:0.82rem;color:#6c757d;margin-top:1rem;">
-                        <div style="display:flex;justify-content:space-between;margin-bottom:4px;"><span>Body Type</span><span style="color:#2C3E50;font-weight:600;">\${{p.factors?.body_type || '-'}}</span></div>
-                        <div style="display:flex;justify-content:space-between;margin-bottom:4px;"><span>Make Premium</span><span style="color:#2C3E50;font-weight:600;">\${{p.factors?.make_premium || '-'}}x</span></div>
-                        <div style="display:flex;justify-content:space-between;margin-bottom:4px;"><span>Year Depreciation</span><span style="color:#2C3E50;font-weight:600;">\${{p.factors?.year_depreciation || '-'}}x</span></div>
-                        <div style="display:flex;justify-content:space-between;"><span>Mileage Factor</span><span style="color:#2C3E50;font-weight:600;">\${{p.factors?.mileage_factor || '-'}}x</span></div>
+                        <div style="display:flex;justify-content:space-between;margin-bottom:4px;"><span>Body Type</span><span style="color:#2C3E50;font-weight:600;">${{p.factors?.body_type || '-'}}</span></div>
+                        <div style="display:flex;justify-content:space-between;margin-bottom:4px;"><span>Make Premium</span><span style="color:#2C3E50;font-weight:600;">${{p.factors?.make_premium || '-'}}x</span></div>
+                        <div style="display:flex;justify-content:space-between;margin-bottom:4px;"><span>Year Depreciation</span><span style="color:#2C3E50;font-weight:600;">${{p.factors?.year_depreciation || '-'}}x</span></div>
+                        <div style="display:flex;justify-content:space-between;"><span>Mileage Factor</span><span style="color:#2C3E50;font-weight:600;">${{p.factors?.mileage_factor || '-'}}x</span></div>
                     </div>
                 `;
             }} catch(e) {{
@@ -4687,7 +4704,12 @@ function startAuto() {{
   if (autoRunning) return;
   autoRunning = true;
   document.getElementById('autoBtn').textContent = '⏸';
-  autoInterval = setInterval(() => spinStep(1), 60);
+  var steps = 0, maxSteps = EXT_URLS.length * 2; // ~2 rotations then stop (no infinite spin)
+  autoInterval = setInterval(() => {{
+    spinStep(1);
+    steps++;
+    if (steps >= maxSteps) stopAuto();
+  }}, 90);
 }}
 function stopAuto() {{
   if (!autoRunning) return;
