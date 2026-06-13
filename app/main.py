@@ -9,6 +9,7 @@ Requirements (run once):
 """
 
 import os
+import sys
 import re
 import io
 import json
@@ -7546,6 +7547,59 @@ async def reputation_dashboard():
 # =============================================================================
 app.mount("/storage", StaticFiles(directory=str(STORAGE_DIR)), name="storage")
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
+
+
+# =============================================================================
+# TRUE 3D (Gaussian Splatting) — walkaround video -> orbitable 3D scene
+# Trains on the GPU workstation (Brush + COLMAP); buyers view the .ply in-browser.
+# =============================================================================
+@app.get("/splat3d/{vin}")
+async def splat3d_viewer(vin: str):
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(f"/static/splat_viewer.html?vin={vin.upper()}")
+
+
+@app.get("/api/vehicle/{vin}/3d-status")
+async def vehicle_3d_status(vin: str):
+    sp = STORAGE_DIR / vin.upper() / "splat"
+    data = {}
+    st = sp / "status.json"
+    if st.exists():
+        try:
+            data = json.loads(st.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["ready"] = (sp / "scene.ply").exists()
+    if data["ready"]:
+        data.setdefault("url", f"/storage/{vin.upper()}/splat/scene.ply")
+        data.setdefault("viewer", f"/splat3d/{vin.upper()}")
+    return data
+
+
+@app.post("/api/vehicle/{vin}/generate-3d")
+async def generate_3d(vin: str, video: UploadFile = File(...), steps: str = Form("12000")):
+    vin = validate_vin(vin)
+    vdir = STORAGE_DIR / vin
+    (vdir / "splat").mkdir(parents=True, exist_ok=True)
+    walk = vdir / "walkaround.mp4"
+    content = await video.read()
+    if len(content) > MAX_VIDEO_MB * 1024 * 1024 * 6:
+        raise HTTPException(status_code=413, detail="Walkaround video too large")
+    with open(walk, "wb") as f:
+        f.write(content)
+    (vdir / "splat" / "status.json").write_text(
+        json.dumps({"status": "running", "step": "queued", "progress": 1, "vin": vin}), encoding="utf-8")
+    try:
+        steps_i = max(2000, min(int(steps), 30000))
+    except ValueError:
+        steps_i = 12000
+    subprocess.Popen(
+        [sys.executable, str(BASE_DIR / "gaussian_3d.py"), "--vin", vin,
+         "--video", str(walk), "--steps", str(steps_i)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(BASE_DIR))
+    return {"status": "started", "vin": vin,
+            "status_url": f"/api/vehicle/{vin}/3d-status", "viewer": f"/splat3d/{vin}",
+            "note": "3D training runs on the GPU workstation (~5-15 min). Poll status_url."}
 
 
 # =============================================================================

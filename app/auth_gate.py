@@ -28,7 +28,7 @@ PUBLIC_EXACT = {
 
 # Prefix-match public paths (any method — pages, assets, feeds)
 PUBLIC_PREFIXES = (
-    "/view/", "/embed/", "/viewer/", "/view3d/",
+    "/view/", "/embed/", "/viewer/", "/view3d/", "/splat3d/",
     "/showroom/",                 # public dealer storefront microsite
     "/storage/", "/static/",
     "/api/syndication/", "/api/feeds/",
