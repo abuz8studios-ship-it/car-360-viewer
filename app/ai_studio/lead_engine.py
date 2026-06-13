@@ -6,15 +6,23 @@ auto-response via text/email/chat — cloning best of 360autoai + Flai + BDC.ai.
 All AI responses powered by Ollama LOCAL models (LOCAL > CLOUD > PAID).
 Zero cloud cost — all local generation.
 """
+import os
 import json
 import sqlite3
 import re
+import smtplib
+import urllib.request
+import urllib.parse
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-OLLAMA_URL = "http://localhost:11434"
-DB_PATH = Path(r"E:\ABU\360Car\app\lotvue.db")
+OLLAMA_URL = os.getenv("LOTVUE_OLLAMA_URL", "http://localhost:11434")
+# Canonical app DB is vehicles.db (same file main.py / a2_extensions / g_glo3d use).
+# (Was pointed at a stray lotvue.db, orphaning follow_ups/appointments from the
+# real leads table — fixed so the queue actually joins live leads.)
+DB_PATH = Path(__file__).resolve().parents[1] / "vehicles.db"
 
 
 # =============================================================================
@@ -259,6 +267,38 @@ def generate_lead_response(lead: dict, vehicle: dict = None,
     }
 
     template = templates.get(response_type, templates["initial"])
+
+    # ── Try the LOCAL Ollama model for a personalized, on-brand rewrite.
+    #    Strictly grounded: only the facts below, never invented specs/history/
+    #    financing. Falls back to the template on any failure or weak output.
+    if os.getenv("LOTVUE_LEAD_AI", "1") != "0":
+        try:
+            facts = (f"Customer first name: {customer_name}. "
+                     f"Vehicle: {vehicle_title or 'the vehicle they asked about'}. "
+                     f"Price: {price_str or 'not provided'}. Dealer: {dealer_name}. "
+                     f"Their message: {(lead.get('message') or '')[:300] or '(none)'}. "
+                     f"Response type: {response_type}.")
+            system = ("You are an honest, friendly car-dealership BDC assistant. Use ONLY the "
+                      "given facts. NEVER invent specs, mileage, history, financing terms, or "
+                      "pricing you were not given. Output ONLY the requested text — no preamble.")
+            sms = _ollama_generate(
+                f"Write ONE warm, concise SMS (max 300 chars) to move this lead forward. "
+                f"End with the dealer name. Facts: {facts}", system)
+            body = _ollama_generate(
+                f"Write a warm, professional plain-text email body (60-120 words) to move this "
+                f"lead forward. Sign off with the dealer name. Facts: {facts}", system)
+            if _ai_text_ok(sms) and _ai_text_ok(body):
+                return {
+                    "sms": sms[:320],
+                    "email_subject": template["email_subject"],
+                    "email_body": body,
+                    "response_type": response_type,
+                    "generated_at": datetime.now().isoformat(),
+                    "model": f"ollama:{os.getenv('LOTVUE_OLLAMA_MODEL', 'qwen3.6-64k:latest')}",
+                }
+        except Exception as e:
+            print(f"[Lead-AI] Ollama generation failed, using template: {e}")
+
     return {
         "sms": template["sms"],
         "email_subject": template["email_subject"],
@@ -267,6 +307,30 @@ def generate_lead_response(lead: dict, vehicle: dict = None,
         "generated_at": datetime.now().isoformat(),
         "model": "template-v1",
     }
+
+
+def _ollama_generate(prompt: str, system: str, timeout: int = 45) -> str:
+    """One-shot local generation via Ollama /api/chat. Strips <think> blocks."""
+    model = os.getenv("LOTVUE_OLLAMA_MODEL", "qwen3.6-64k:latest")
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=json.dumps({"model": model, "stream": False,
+                         "messages": [{"role": "system", "content": system},
+                                      {"role": "user", "content": prompt}]}).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        txt = json.loads(r.read()).get("message", {}).get("content", "").strip()
+    if "</think>" in txt:
+        txt = txt.split("</think>", 1)[1].strip()
+    return txt.strip().strip('"')
+
+
+def _ai_text_ok(t: str) -> bool:
+    """Sanity gate — reject empty/garbled model output before it reaches a customer."""
+    if not t or len(t) < 8 or len(t) > 1500:
+        return False
+    letters = sum(c.isalpha() or c.isspace() for c in t)
+    return letters / max(1, len(t)) > 0.6
 
 
 # =============================================================================
@@ -594,3 +658,119 @@ def get_lead_analytics() -> dict:
         "follow_up_queue": queue_size,
         "conversion_rate": conversion_rate,
     }
+
+
+# =============================================================================
+# OUTBOUND DISPATCHER — actually SEND the scheduled follow-ups, compliantly.
+# Email via the dealer's SMTP; SMS via Twilio (dark until TWILIO_* set).
+# 'call' touches become dealer tasks (never auto-dialed). Guardrails: opt-out
+# suppression, one-click unsubscribe + STOP footer, per-run cap. DEFAULT OFF —
+# the periodic loop only runs when LOTVUE_AUTO_FOLLOWUP=1, so a dealer opts in.
+# =============================================================================
+def _conn():
+    c = sqlite3.connect(str(DB_PATH)); c.row_factory = sqlite3.Row
+    c.execute("""CREATE TABLE IF NOT EXISTS opt_outs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT DEFAULT '', phone TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')))""")
+    return c
+
+
+def record_opt_out(email: str = "", phone: str = "") -> bool:
+    if not (email or phone):
+        return False
+    c = _conn()
+    c.execute("INSERT INTO opt_outs (email, phone) VALUES (?,?)", (email or "", phone or ""))
+    c.commit(); c.close()
+    return True
+
+
+def _is_opted_out(c, email: str, phone: str) -> bool:
+    try:
+        return bool(c.execute(
+            "SELECT 1 FROM opt_outs WHERE (email!='' AND email=?) OR (phone!='' AND phone=?) LIMIT 1",
+            (email or "\x00", phone or "\x00")).fetchone())
+    except Exception:
+        return False
+
+
+def _get_vehicle(c, vin: str) -> dict:
+    if not vin:
+        return {}
+    try:
+        row = c.execute("SELECT * FROM vehicles WHERE vin=?", (vin.upper(),)).fetchone()
+        return {k: row[k] for k in row.keys()} if row else {}
+    except Exception:
+        return {}
+
+
+def _smtp_send(to_addr: str, subject: str, body: str) -> bool:
+    host = os.getenv("LOTVUE_SMTP_HOST", "")
+    if not (host and to_addr):
+        return False
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = os.getenv("LOTVUE_SMTP_FROM", os.getenv("LOTVUE_SMTP_USER", "lotvue@localhost"))
+        msg["To"] = to_addr
+        with smtplib.SMTP(host, int(os.getenv("LOTVUE_SMTP_PORT", "587")), timeout=20) as s:
+            s.starttls()
+            user = os.getenv("LOTVUE_SMTP_USER", "")
+            if user:
+                s.login(user, os.getenv("LOTVUE_SMTP_PASS", ""))
+            s.sendmail(msg["From"], [to_addr], msg.as_string())
+        return True
+    except Exception as e:
+        print(f"[Follow-up] email send failed: {e}")
+        return False
+
+
+def _twilio_sms(to_n: str, body: str) -> bool:
+    sid = os.getenv("TWILIO_ACCOUNT_SID", ""); token = os.getenv("TWILIO_AUTH_TOKEN", "")
+    from_n = os.getenv("TWILIO_FROM_NUMBER", "")
+    if not (sid and token and from_n and to_n):
+        return False
+    try:
+        import base64
+        data = urllib.parse.urlencode({"From": from_n, "To": to_n, "Body": body[:320]}).encode()
+        req = urllib.request.Request(
+            f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json", data=data, method="POST")
+        req.add_header("Authorization", "Basic " + base64.b64encode(f"{sid}:{token}".encode()).decode())
+        with urllib.request.urlopen(req, timeout=20):
+            return True
+    except Exception as e:
+        print(f"[Follow-up] SMS send failed: {e}")
+        return False
+
+
+def send_due_follow_ups(base_url: str = "", limit: int = 25) -> dict:
+    """Send every follow-up whose scheduled_for is due. Idempotent (stamps sent_at),
+    safe to call repeatedly. Email needs SMTP configured; SMS needs Twilio; otherwise
+    the touch is marked 'unsendable' so the queue never spins. Returns a summary."""
+    base_url = (base_url or os.getenv("LOTVUE_PUBLIC_URL", "http://127.0.0.1:8360")).rstrip("/")
+    queue = get_follow_up_queue()
+    sent = suppressed = unsendable = tasks = 0
+    c = _conn()
+    for f in queue[:limit]:
+        fid = f["id"]; channel = (f["channel"] or "").lower()
+        email = f.get("email") or ""; phone = f.get("phone") or ""; vin = f.get("vin") or ""
+        if channel == "call":
+            c.execute("UPDATE follow_ups SET status='dealer_task' WHERE id=?", (fid,)); tasks += 1; continue
+        if _is_opted_out(c, email, phone):
+            c.execute("UPDATE follow_ups SET status='suppressed' WHERE id=?", (fid,)); suppressed += 1; continue
+        lead = {"name": f.get("name"), "email": email, "phone": phone, "vin": vin, "id": f["lead_id"]}
+        content = generate_lead_response(lead, _get_vehicle(c, vin), response_type="follow_up")
+        ok = False
+        if channel == "email" and email:
+            footer = (f"\n\n—\nReply STOP to opt out. "
+                      f"Unsubscribe: {base_url}/api/unsubscribe?e={urllib.parse.quote(email)}")
+            ok = _smtp_send(email, content["email_subject"], content["email_body"] + footer)
+        elif channel == "text" and phone:
+            ok = _twilio_sms(phone, content["sms"] + " Reply STOP to opt out.")
+        if ok:
+            c.execute("UPDATE follow_ups SET status='sent', sent_at=?, content=? WHERE id=?",
+                      (datetime.now().isoformat(), content.get("sms", "")[:500], fid)); sent += 1
+        else:
+            c.execute("UPDATE follow_ups SET status='unsendable' WHERE id=?", (fid,)); unsendable += 1
+    c.commit(); c.close()
+    return {"sent": sent, "suppressed": suppressed, "unsendable": unsendable,
+            "dealer_tasks": tasks, "considered": min(len(queue), limit)}

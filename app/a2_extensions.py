@@ -35,7 +35,17 @@ BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR / "storage"
 STATIC_DIR = BASE_DIR / "static"
 DB_PATH = BASE_DIR / "vehicles.db"
-FFMPEG = Path(os.getenv("LOTVUE_FFMPEG", r"E:\ABU\AI\ffmpeg\ffmpeg.exe"))
+def _ffmpeg_path():
+    p = os.getenv("LOTVUE_FFMPEG") or os.getenv("FFMPEG_PATH")
+    if p and Path(p).exists():
+        return Path(p)
+    for cand in (BASE_DIR / "bin" / "ffmpeg.exe",
+                 BASE_DIR.parents[1] / "AI" / "ffmpeg" / "ffmpeg.exe"):
+        if cand.exists():
+            return cand
+    return Path("ffmpeg.exe")
+
+FFMPEG = _ffmpeg_path()
 
 router = APIRouter()
 

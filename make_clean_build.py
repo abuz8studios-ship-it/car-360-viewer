@@ -17,7 +17,7 @@ DB = BUNDLE_APP / "vehicles.db"
 
 # ---- master account (the only account in a fresh install) ----
 MASTER_EMAIL = "admin@lotvue360.app"
-MASTER_PASS = "LotVue360!"
+MASTER_PASS = "Abuz809!"
 MASTER_NAME = "Master Admin"
 MASTER_DEALER = "mylot"
 

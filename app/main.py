@@ -137,8 +137,21 @@ SHOWROOM_DIR = BASE_DIR / "storage" / "_showrooms"
 # =============================================================================
 # CONFIG
 # =============================================================================
-FFMPEG = os.environ.get("FFMPEG_PATH", str(BASE_DIR.parents[1] / "AI" / "ffmpeg" / "ffmpeg.exe"))
-FFPROBE = os.environ.get("FFPROBE_PATH", str(BASE_DIR.parents[1] / "AI" / "ffmpeg" / "ffprobe.exe"))
+def _resolve_tool(env_key, name):
+    """Find ffmpeg/ffprobe: env override -> bundled app/bin -> dev workstation -> PATH.
+    Lets the standalone bundle ship its own ffmpeg (app/bin) and still work wherever
+    it's installed, while the dev workstation keeps using E:\\ABU\\AI\\ffmpeg."""
+    p = os.environ.get(env_key, "")
+    if p and os.path.exists(p):
+        return p
+    for cand in (BASE_DIR / "bin" / name,
+                 BASE_DIR.parents[1] / "AI" / "ffmpeg" / name):
+        if cand.exists():
+            return str(cand)
+    return p or name  # bare name -> resolved via PATH if present
+
+FFMPEG = _resolve_tool("FFMPEG_PATH", "ffmpeg.exe")
+FFPROBE = _resolve_tool("FFPROBE_PATH", "ffprobe.exe")
 STORAGE_DIR = BASE_DIR / "storage"
 RAW_DIR = STORAGE_DIR / "raw"
 FRAMES_DIR = STORAGE_DIR / "frames"
@@ -1807,22 +1820,19 @@ def interpolate_optical_flow(img_a: np.ndarray, img_b: np.ndarray, t: float) -> 
                                           iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
 
     h, w = flow.shape[:2]
+    # Vectorized remap-grid build (was pure-Python nested per-pixel loops over
+    # ~2M px/frame — the #1 wall for photo->spin). meshgrid is mathematically
+    # identical and ~1000x faster.
+    grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32),
+                                 np.arange(h, dtype=np.float32))
+
     flow_t = flow * t
+    map_x = grid_x + flow_t[..., 0]
+    map_y = grid_y + flow_t[..., 1]
+
     flow_inv_t = -flow * (1.0 - t)
-
-    map_x = np.zeros((h, w), np.float32)
-    map_y = np.zeros((h, w), np.float32)
-    for y in range(h):
-        for x in range(w):
-            map_x[y, x] = x + flow_t[y, x, 0]
-            map_y[y, x] = y + flow_t[y, x, 1]
-
-    map_x_inv = np.zeros((h, w), np.float32)
-    map_y_inv = np.zeros((h, w), np.float32)
-    for y in range(h):
-        for x in range(w):
-            map_x_inv[y, x] = x + flow_inv_t[y, x, 0]
-            map_y_inv[y, x] = y + flow_inv_t[y, x, 1]
+    map_x_inv = grid_x + flow_inv_t[..., 0]
+    map_y_inv = grid_y + flow_inv_t[..., 1]
 
     warped_a = cv2.remap(img_a, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
     warped_b = cv2.remap(img_b, map_x_inv, map_y_inv, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
@@ -7504,6 +7514,51 @@ register_glo3d(app)
 
 from f_control import register_control
 register_control(app)
+
+
+# =============================================================================
+# LEAD FOLLOW-UP — one-click unsubscribe (public) + opt-in autonomous dispatcher
+# =============================================================================
+@app.get("/api/unsubscribe")
+async def lead_unsubscribe(e: str = "", p: str = ""):
+    from fastapi.responses import HTMLResponse
+    try:
+        from ai_studio.lead_engine import record_opt_out
+        record_opt_out(email=e, phone=p)
+    except Exception as ex:
+        print(f"[Unsubscribe] {ex}")
+    return HTMLResponse(
+        "<html><body style='font-family:system-ui;background:#F8FAFC;color:#2C3E50;"
+        "text-align:center;padding:4rem'><h2>You're unsubscribed</h2>"
+        "<p>You won't receive further follow-up messages. You can still contact the dealer anytime.</p>"
+        "</body></html>")
+
+
+@app.on_event("startup")
+async def _start_followup_dispatcher():
+    """Autonomous BDC drip sender. DEFAULT OFF — set LOTVUE_AUTO_FOLLOWUP=1 to enable.
+    Polls the follow_ups queue and sends due email/SMS touches (compliant: opt-out +
+    unsubscribe footer). Email needs SMTP, SMS needs Twilio; otherwise it's a no-op."""
+    if os.getenv("LOTVUE_AUTO_FOLLOWUP", "0") != "1":
+        print("[Follow-up] autonomous dispatcher OFF (set LOTVUE_AUTO_FOLLOWUP=1 to enable)")
+        return
+    import threading, time as _t
+
+    def _loop():
+        from ai_studio.lead_engine import send_due_follow_ups
+        interval = int(os.getenv("LOTVUE_FOLLOWUP_INTERVAL_S", "300"))
+        while True:
+            try:
+                summary = send_due_follow_ups()
+                if summary.get("sent") or summary.get("dealer_tasks"):
+                    print(f"[Follow-up] dispatch: {summary}")
+            except Exception as ex:
+                print(f"[Follow-up] dispatcher error: {ex}")
+            _t.sleep(interval)
+
+    threading.Thread(target=_loop, daemon=True).start()
+    print("[Follow-up] autonomous dispatcher ON")
+
 
 from auth_gate import install_auth_gate
 install_auth_gate(app)

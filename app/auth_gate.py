@@ -23,6 +23,7 @@ PUBLIC_EXACT = {
     "/api/auth/token", "/api/auth/refresh", "/api/auth/logout",
     "/mobile", "/mobile/manifest.json", "/mobile/sw.js",
     "/favicon.ico", "/api/analytics/event", "/api/leads/submit",
+    "/api/unsubscribe",
 }
 
 # Prefix-match public paths (any method — pages, assets, feeds)
