@@ -1732,14 +1732,45 @@ def auto_align_frames(frames: list, canvas_w: int = 1920, canvas_h: int = 1080) 
 def process_all_frames_background(frames_dir: Path, watermark_mode: str = "preview",
                                    background_path: str = None, turntable_style: str = "studio_shadow",
                                    bg_color: tuple = (26, 26, 26)):
-    """Process all frames: bg removal + auto-align + turntable composite + optional background image."""
-    if not REMBG_AVAILABLE:
-        print("[BG Removal] rembg not available — skipping")
-        return
-
+    """Prepare frames for the 360 spin. Two modes (env LOTVUE_RENDER_MODE):
+      - 'natural': KEEP the photographed background. Just auto-orient (EXIF),
+        normalize every frame to ONE uniform size so the spin doesn't jitter, and
+        apply a light sharpen. No cutout, no studio floor, no watermark — cleanest
+        look for a real walkaround video / on-lot photos.
+      - 'studio' (default): rembg cutout + auto-align + turntable shadow on a clean
+        backdrop (the GLO3D-style look; needs rembg).
+    """
     frames = sorted(list(frames_dir.glob("frame_*.jpg")) + list(frames_dir.glob("spin_*.jpg")))
     if not frames:
-        print(f"[BG Removal] No frames found in {frames_dir}")
+        print(f"[Render] No frames found in {frames_dir}")
+        return
+
+    render_mode = os.environ.get("LOTVUE_RENDER_MODE", "studio").lower()
+    watermark_on = (watermark_mode == "preview") and FEATURES_ENABLED.get("watermark", False)
+
+    # ── NATURAL mode: keep the real background; clean + normalize only ──────────
+    if render_mode == "natural":
+        from PIL import ImageOps, ImageFilter
+        first = ImageOps.exif_transpose(Image.open(frames[0])).convert("RGB")
+        fw, fh = first.size
+        scale = min(1.0, 1600 / max(fw, fh))                 # cap longest side at 1600px
+        TW, TH = (int(fw * scale) // 2) * 2, (int(fh * scale) // 2) * 2
+        for frame_path in frames:
+            try:
+                im = ImageOps.exif_transpose(Image.open(frame_path)).convert("RGB")
+                im = ImageOps.fit(im, (TW, TH), Image.LANCZOS, centering=(0.5, 0.5))
+                im = im.filter(ImageFilter.UnsharpMask(radius=1.4, percent=85, threshold=2))
+                if watermark_on:
+                    im = apply_diagonal_watermark(im, "LOTVUE PRO PREVIEW", 60)
+                im.save(frame_path, "JPEG", quality=94)
+            except Exception as e:
+                print(f"[Render] natural frame failed {frame_path.name}: {e}")
+        print(f"[Render] natural mode: kept background, normalized {len(frames)} frames to {TW}x{TH}.")
+        return
+
+    # ── STUDIO mode: rembg cutout + composite (needs rembg) ─────────────────────
+    if not REMBG_AVAILABLE:
+        print("[BG Removal] rembg not available — skipping")
         return
 
     CANVAS_W, CANVAS_H = 1920, 1080
@@ -1796,8 +1827,8 @@ def process_all_frames_background(frames_dir: Path, watermark_mode: str = "previ
             bg_rgba.paste(resized_car, (x, y), resized_car)
             final = bg_rgba.convert("RGB")
 
-            # Apply watermark
-            if watermark_mode == "preview":
+            # Apply watermark (only when the watermark feature is enabled)
+            if watermark_on:
                 final = apply_diagonal_watermark(final, "LOTVUE PRO PREVIEW", 60)
 
             final.save(frame_path, "JPEG", quality=92)

@@ -58,6 +58,7 @@ conn.close()
     "LOTVUE_FEATURE_AUTH=1\n"
     "LOTVUE_FEATURE_PAYMENTS=0\n"
     "LOTVUE_FEATURE_WATERMARK=0\n"
+    "LOTVUE_RENDER_MODE=natural\n"
     "LOTVUE_PORT=8360\n"
     "LOTVUE_PUBLIC_URL=http://127.0.0.1:8360\n"
     "LOTVUE_OLLAMA_MODEL=qwen3.6-64k:latest\n"
