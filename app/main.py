@@ -3053,7 +3053,30 @@ async def process_order(job_id: str):
 
     vin = vehicle["vin"]
     raw_dir = STORAGE_DIR / vin / "raw"
-    if not raw_dir.exists():
+    exterior_dir = STORAGE_DIR / vin / "exterior"
+    manifest_path = STORAGE_DIR / vin / "manifest.json"
+
+    # VIDEO path: /api/upload extracts frames straight into exterior/ (already
+    # ordered + background-processed) and leaves raw/ empty. The photo-mode logic
+    # below WIPES exterior and recopies from raw — which would destroy the video's
+    # frames (the "No frames found" bug). So if raw/ is empty but exterior already
+    # has frames, just order the existing exterior frames by filename, keep them
+    # in place, and let interpolate build the spin from them.
+    raw_frames = sorted(raw_dir.glob("frame_*.jpg")) if raw_dir.exists() else []
+    pre_extracted = sorted(exterior_dir.glob("*.jpg")) if exterior_dir.exists() else []
+    if not raw_frames and pre_extracted:
+        ordered_frames = [
+            {"file": f.name, "estimated_angle": round(i * 360.0 / len(pre_extracted), 2),
+             "confidence": 0.1}
+            for i, f in enumerate(pre_extracted)
+        ]
+        manifest = build_manifest(job_id, vin, ordered_frames)
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        return {"status": "ordered", "job_id": job_id, "vin": vin,
+                "confidence": 0.1, "source": "video", "frames": len(pre_extracted)}
+
+    if not raw_dir.exists() or not raw_frames:
         raise HTTPException(status_code=400, detail="No raw photos found")
 
     ordered_frames, confidence = estimate_angles_orb(raw_dir)
