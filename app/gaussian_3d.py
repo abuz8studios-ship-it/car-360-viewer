@@ -101,9 +101,12 @@ def train_brush(work, out_ply, steps):
     set_status("Training 3D Gaussian Splat on GPU (Brush)", 65)
     out_ply.parent.mkdir(parents=True, exist_ok=True)
     # Brush reads a COLMAP workspace dir (images/ + sparse/0). Export the ply at the end.
+    # Web-optimized: SH degree 1 + capped splats keep the .ply light enough to
+    # load fast on a buyer's phone (SH-3/uncapped can be 130MB+; this is ~20-30MB).
     cmd = [BRUSH, str(work), "--total-steps", str(steps),
            "--export-every", str(steps), "--export-path", str(out_ply.parent),
-           "--export-name", out_ply.name, "--max-resolution", "1600"]
+           "--export-name", out_ply.name, "--max-resolution", "1400",
+           "--sh-degree", "1", "--max-splats", "400000"]
     print(f"[3D] $ brush train ({steps} steps)"); sys.stdout.flush()
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
     # Brush may name export with iter; find the produced ply

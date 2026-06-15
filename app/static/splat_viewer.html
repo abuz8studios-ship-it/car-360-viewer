@@ -56,15 +56,25 @@ function showError(msg) {
   errBox.style.display = 'flex';
 }
 
+// Brush-exported .ply is Y-up; antimatter15 .splat is Y-down. Pick the right up-axis.
+const isPly = /\.ply(\?|$)/i.test(src);
+const camUp = isPly ? [0, 1, 0] : [0, -1, 0];
+
 try {
   const viewer = new GaussianSplats3D.Viewer({
-    cameraUp: [0, -1, 0],
-    initialCameraPosition: [3.5, 1.2, 3.5],
-    initialCameraLookAt: [0, 0, 0],
-    sphericalHarmonicsDegree: 2,
+    cameraUp: camUp,
+    initialCameraPosition: [-4.5, 2.0, 5.5],
+    initialCameraLookAt: [0, 0.5, 0],
+    sphericalHarmonicsDegree: 1,
     sharedMemoryForWorkers: false,
     rootElement: document.getElementById('viewer')
   });
+  // gentle auto-orbit so the vehicle is immediately alive; user drag overrides it
+  if (viewer.controls) {
+    viewer.controls.autoRotate = true;
+    viewer.controls.autoRotateSpeed = 1.2;
+    viewer.controls.enableDamping = true;
+  }
 
   viewer.addSplatScene(src, {
     showLoadingUI: false,
