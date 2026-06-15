@@ -7559,6 +7559,79 @@ async def splat3d_viewer(vin: str):
     return RedirectResponse(f"/static/splat_viewer.html?vin={vin.upper()}")
 
 
+@app.get("/3d-studio")
+async def studio_3d_page():
+    from fastapi.responses import HTMLResponse
+    html = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LotVue360 — True 3D Studio</title><style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,'Segoe UI',Roboto,sans-serif}
+body{background:#F8FAFC;color:#2C3E50;padding:2rem 1rem}
+.wrap{max-width:680px;margin:0 auto;background:#fff;border:1px solid #E3EAF2;border-radius:16px;padding:2rem}
+h1{font-size:1.5rem;color:#2E75B6}h1 span{color:#C8A55C}
+p.sub{color:#7A8CA0;margin:.4rem 0 1.5rem}
+label{display:block;font-weight:600;margin:1rem 0 .4rem}
+input[type=text],input[type=file]{width:100%;padding:.7rem;border:1.5px solid #DDE5EE;border-radius:10px;font-size:1rem}
+button{margin-top:1.5rem;width:100%;background:#2E75B6;color:#fff;border:0;padding:.9rem;border-radius:10px;font-size:1.05rem;font-weight:700;cursor:pointer}
+button:disabled{background:#9bb6d0;cursor:wait}
+.bar{height:8px;background:#E3EAF2;border-radius:4px;overflow:hidden;margin-top:1rem;display:none}
+.bar>div{height:100%;width:0;background:linear-gradient(90deg,#2E75B6,#58a6ff);transition:width .3s}
+#status{margin-top:1rem;font-weight:600}
+#view{display:none;margin-top:1rem;text-align:center}
+#view a{display:inline-block;background:#C8A55C;color:#fff;padding:.8rem 1.6rem;border-radius:10px;text-decoration:none;font-weight:700}
+.tips{margin-top:1.5rem;font-size:.85rem;color:#7A8CA0;line-height:1.5;background:#F8FAFC;padding:1rem;border-radius:10px}
+</style></head><body><div class="wrap">
+<h1>LotVue<span>360</span> — True 3D Studio</h1>
+<p class="sub">Upload a slow walkaround video of a car → get a real orbitable 3D model (car + scene). Trains on this workstation's GPU.</p>
+<label>Vehicle VIN / ID</label>
+<input id="vin" type="text" placeholder="e.g. 1HGBH41JXMN109186 (any ID works)">
+<label>Walkaround video (MP4/MOV — slow full circle, ~20-40s)</label>
+<input id="vid" type="file" accept="video/*">
+<button id="go" onclick="go()">Generate 3D Model</button>
+<div class="bar" id="bar"><div id="prog"></div></div>
+<div id="status"></div>
+<div id="view"><a id="vlink" href="#" target="_blank">🔄 Open Interactive 3D</a></div>
+<div class="tips"><b>For the best 3D:</b> walk a slow, steady full circle around the car keeping the whole car in frame; park with room to walk all the way around; even lighting. Training takes ~5–15 min on the GPU.</div>
+</div><script>
+let vin='';
+async function go(){
+  const f=document.getElementById('vid').files[0];
+  vin=(document.getElementById('vin').value||'').trim().toUpperCase();
+  if(!vin){alert('Enter a VIN/ID');return}
+  if(!f){alert('Choose a walkaround video');return}
+  const btn=document.getElementById('go');btn.disabled=true;btn.textContent='Uploading…';
+  const fd=new FormData();fd.append('video',f);
+  try{
+    const r=await fetch('/api/vehicle/'+encodeURIComponent(vin)+'/generate-3d',{method:'POST',body:fd,credentials:'same-origin'});
+    if(r.status===401){location.href='/login?next=/3d-studio';return}
+    const j=await r.json();
+    document.getElementById('bar').style.display='block';
+    document.getElementById('status').textContent='Training started — this runs on the GPU (~5-15 min).';
+    poll();
+  }catch(e){document.getElementById('status').textContent='Error: '+e;btn.disabled=false;btn.textContent='Generate 3D Model';}
+}
+async function poll(){
+  try{
+    const r=await fetch('/api/vehicle/'+encodeURIComponent(vin)+'/3d-status',{credentials:'same-origin'});
+    const j=await r.json();
+    document.getElementById('prog').style.width=(j.progress||0)+'%';
+    document.getElementById('status').textContent=(j.step||j.status||'working')+' ('+(j.progress||0)+'%)';
+    if(j.ready||j.status==='done'){
+      document.getElementById('status').textContent='✅ Done! Your interactive 3D model is ready.';
+      document.getElementById('prog').style.width='100%';
+      const v=document.getElementById('view');v.style.display='block';
+      document.getElementById('vlink').href='/splat3d/'+vin;
+      document.getElementById('go').disabled=false;document.getElementById('go').textContent='Generate 3D Model';
+      return;
+    }
+    if(j.status==='error'){document.getElementById('status').textContent='⚠ '+(j.error||'failed');document.getElementById('go').disabled=false;document.getElementById('go').textContent='Generate 3D Model';return;}
+  }catch(e){}
+  setTimeout(poll,5000);
+}
+</script></body></html>"""
+    return HTMLResponse(html)
+
+
 @app.get("/api/vehicle/{vin}/3d-status")
 async def vehicle_3d_status(vin: str):
     sp = STORAGE_DIR / vin.upper() / "splat"
