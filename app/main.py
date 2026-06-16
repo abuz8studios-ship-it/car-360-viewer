@@ -7604,9 +7604,11 @@ async function go(){
   try{
     const r=await fetch('/api/vehicle/'+encodeURIComponent(vin)+'/generate-3d',{method:'POST',body:fd,credentials:'same-origin'});
     if(r.status===401){location.href='/login?next=/3d-studio';return}
-    const j=await r.json();
+    const j=await r.json().catch(function(){return {}});
+    if(!r.ok){document.getElementById('status').textContent='⚠ '+(j.detail||('Upload failed — HTTP '+r.status));btn.disabled=false;btn.textContent='Generate 3D Model';return}
     document.getElementById('bar').style.display='block';
     document.getElementById('status').textContent='Training started — this runs on the GPU (~5-15 min).';
+    btn.textContent='Training…';
     poll();
   }catch(e){document.getElementById('status').textContent='Error: '+e;btn.disabled=false;btn.textContent='Generate 3D Model';}
 }
@@ -7651,7 +7653,10 @@ async def vehicle_3d_status(vin: str):
 
 @app.post("/api/vehicle/{vin}/generate-3d")
 async def generate_3d(vin: str, video: UploadFile = File(...), steps: str = Form("12000")):
-    vin = validate_vin(vin)
+    # Accept any vehicle ID (real VIN or freeform) — sanitize to a safe folder name.
+    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
+    if not vin:
+        raise HTTPException(status_code=400, detail="Provide a vehicle VIN or ID")
     vdir = STORAGE_DIR / vin
     (vdir / "splat").mkdir(parents=True, exist_ok=True)
     walk = vdir / "walkaround.mp4"
