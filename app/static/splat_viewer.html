@@ -3,92 +3,114 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>LotVue360 — Interactive 3D</title>
+<title>LotVue360 — Interactive Viewer</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   html,body { width:100%; height:100%; overflow:hidden; background:#0d1117; font-family:-apple-system,'Segoe UI',Roboto,sans-serif; }
-  #viewer { position:fixed; inset:0; }
-  #hud { position:fixed; top:12px; left:12px; z-index:10; color:#fff; background:rgba(13,17,23,.7);
-         backdrop-filter:blur(8px); padding:8px 14px; border-radius:10px; font-size:.85rem; font-weight:600; }
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  #spinimg { max-width:100%; max-height:100%; object-fit:contain; user-select:none; -webkit-user-drag:none; cursor:ew-resize; }
+  #hud { position:fixed; top:12px; left:12px; z-index:10; color:#fff; background:rgba(13,17,23,.7); backdrop-filter:blur(8px); padding:8px 14px; border-radius:10px; font-size:.85rem; font-weight:600; }
   #hud span { color:#58a6ff; }
-  #loader { position:fixed; inset:0; z-index:20; display:flex; flex-direction:column; align-items:center;
-            justify-content:center; background:#0d1117; color:#e6edf3; gap:1rem; transition:opacity .4s; }
+  #badge { position:fixed; top:12px; right:12px; z-index:10; color:#fff; font-size:.72rem; font-weight:700; padding:6px 12px; border-radius:20px; background:#2E75B6; }
+  #badge.three { background:#C8A55C; }
+  #loader { position:fixed; inset:0; z-index:20; display:flex; flex-direction:column; align-items:center; justify-content:center; background:#0d1117; color:#e6edf3; gap:1rem; transition:opacity .4s; }
   #loader.hidden { opacity:0; pointer-events:none; }
   .bar { width:240px; height:6px; background:#21262d; border-radius:3px; overflow:hidden; }
   .bar > div { height:100%; width:0%; background:linear-gradient(90deg,#2E75B6,#58a6ff); transition:width .2s; }
-  #err { position:fixed; inset:0; z-index:30; display:none; align-items:center; justify-content:center;
-         color:#e6edf3; text-align:center; padding:2rem; background:#0d1117; }
-  .hint { position:fixed; bottom:12px; left:50%; transform:translateX(-50%); z-index:10; color:#8b949e;
-          font-size:.78rem; background:rgba(13,17,23,.6); padding:6px 12px; border-radius:20px; }
+  .hint { position:fixed; bottom:12px; left:50%; transform:translateX(-50%); z-index:10; color:#8b949e; font-size:.78rem; background:rgba(13,17,23,.6); padding:6px 12px; border-radius:20px; }
+  #err { position:fixed; inset:0; z-index:30; display:none; align-items:center; justify-content:center; color:#e6edf3; text-align:center; padding:2rem; }
 </style>
 </head>
 <body>
-<div id="hud">LotVue<span>360</span> · Interactive 3D</div>
-<div id="loader"><div>Loading 3D scene…</div><div class="bar"><div id="prog"></div></div></div>
-<div id="err"><div><h2>3D scene not ready</h2><p id="errmsg" style="color:#8b949e;margin-top:.5rem"></p></div></div>
-<div class="hint">Drag to orbit · scroll to zoom · right-drag to pan</div>
-<div id="viewer"></div>
-<script type="importmap">
-{
-  "imports": {
-    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-    "@mkkellogg/gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
-  }
-}
-</script>
-<script type="module">
-import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d';
-
+<div id="hud">LotVue<span>360</span></div>
+<div id="badge">360°</div>
+<div id="loader"><div id="lmsg">Loading…</div><div class="bar"><div id="prog"></div></div></div>
+<div id="err"><div><h2>Not ready yet</h2><p id="errmsg" style="color:#8b949e;margin-top:.5rem"></p></div></div>
+<div class="hint" id="hint">Drag to rotate</div>
+<div id="stage"></div>
+<script>
 const params = new URLSearchParams(location.search);
-// ?src=<url to .ply/.splat/.ksplat>   OR   ?vin=<VIN> (loads /storage/<VIN>/splat/scene.ply)
-let src = params.get('src');
-const vin = params.get('vin');
-if (!src && vin) src = `/storage/${vin.toUpperCase()}/splat/scene.ply`;
-if (!src) src = '/storage/DEMO/splat/scene.ply';
-
+const vin = (params.get('vin') || '').toUpperCase();
+let src = params.get('src');           // explicit splat URL (.ply/.splat)
 const loader = document.getElementById('loader');
+const lmsg = document.getElementById('lmsg');
 const prog = document.getElementById('prog');
-const errBox = document.getElementById('err');
+const badge = document.getElementById('badge');
+const hint = document.getElementById('hint');
 
-function showError(msg) {
-  loader.classList.add('hidden');
-  document.getElementById('errmsg').textContent = msg;
-  errBox.style.display = 'flex';
+function showError(msg){ loader.classList.add('hidden'); document.getElementById('errmsg').textContent=msg; document.getElementById('err').style.display='flex'; }
+function hideLoader(){ loader.classList.add('hidden'); }
+
+async function exists(url){ try{ const r=await fetch(url,{method:'HEAD'}); return r.ok; }catch(e){ return false; } }
+
+async function init(){
+  if (src) { return loadSplat(src); }                       // explicit splat
+  if (!vin) { return showError('No vehicle specified.'); }
+  lmsg.textContent = 'Loading…';
+  const plyUrl = `/storage/${vin}/splat/scene.ply`;
+  if (await exists(plyUrl)) { return loadSplat(plyUrl); }    // true 3D available
+  return loadSpin(vin);                                      // fall back to 360 spin
 }
 
-// Brush-exported .ply is Y-up; antimatter15 .splat is Y-down. Pick the right up-axis.
-const isPly = /\.ply(\?|$)/i.test(src);
-const camUp = isPly ? [0, 1, 0] : [0, -1, 0];
+// ---------- TRUE 3D (Gaussian Splatting) ----------
+async function loadSplat(url){
+  badge.textContent = '3D'; badge.classList.add('three');
+  hint.textContent = 'Drag to orbit · scroll to zoom · right-drag to pan';
+  lmsg.textContent = 'Loading 3D model…';
+  try {
+    const GS = await import('https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js');
+    const isPly = /\.ply(\?|$)/i.test(url);
+    const viewer = new GS.Viewer({
+      cameraUp: isPly ? [0,1,0] : [0,-1,0],
+      initialCameraPosition: [-4.5, 2.0, 5.5],
+      initialCameraLookAt: [0, 0.5, 0],
+      sphericalHarmonicsDegree: 1,
+      sharedMemoryForWorkers: false,
+      rootElement: document.getElementById('stage')
+    });
+    if (viewer.controls){ viewer.controls.autoRotate=true; viewer.controls.autoRotateSpeed=1.2; viewer.controls.enableDamping=true; }
+    viewer.addSplatScene(url, { showLoadingUI:false, progressiveLoad:true, onProgress:(p)=>{ prog.style.width=Math.min(100,p)+'%'; } })
+      .then(()=>{ hideLoader(); viewer.start(); })
+      .catch((e)=>{ if(vin){ loadSpin(vin); } else { showError('Could not load 3D model.'); } });
+  } catch(e){ if(vin){ loadSpin(vin); } else { showError('3D viewer failed: '+e.message); } }
+}
 
-try {
-  const viewer = new GaussianSplats3D.Viewer({
-    cameraUp: camUp,
-    initialCameraPosition: [-4.5, 2.0, 5.5],
-    initialCameraLookAt: [0, 0.5, 0],
-    sphericalHarmonicsDegree: 1,
-    sharedMemoryForWorkers: false,
-    rootElement: document.getElementById('viewer')
-  });
-  // gentle auto-orbit so the vehicle is immediately alive; user drag overrides it
-  if (viewer.controls) {
-    viewer.controls.autoRotate = true;
-    viewer.controls.autoRotateSpeed = 1.2;
-    viewer.controls.enableDamping = true;
+// ---------- 360 SPIN (image sequence — works from anything) ----------
+async function loadSpin(vin){
+  badge.textContent = '360°'; badge.classList.remove('three');
+  hint.textContent = 'Drag left/right to spin';
+  lmsg.textContent = 'Loading 360 spin…';
+  let count = 0;
+  try { const r = await fetch(`/storage/${vin}/spin/manifest.json`); count = (await r.json()).count || 0; } catch(e){}
+  if (!count){ return showError('No 360 spin found for this vehicle yet.'); }
+  const imgs = [];
+  let loaded = 0;
+  for (let i=1;i<=count;i++){
+    const im = new Image();
+    im.src = `/storage/${vin}/spin/spin_${String(i).padStart(4,'0')}.jpg`;
+    im.onload = ()=>{ loaded++; prog.style.width=Math.round(loaded/count*100)+'%'; if(loaded===count) start(); };
+    im.onerror = ()=>{ loaded++; if(loaded===count) start(); };
+    imgs.push(im);
   }
-
-  viewer.addSplatScene(src, {
-    showLoadingUI: false,
-    progressiveLoad: true,
-    onProgress: (pct) => { prog.style.width = Math.min(100, pct) + '%'; }
-  }).then(() => {
-    loader.classList.add('hidden');
-    viewer.start();
-  }).catch((e) => {
-    showError('Could not load the 3D model (' + src + '). ' + (e && e.message ? e.message : e));
-  });
-} catch (e) {
-  showError('3D viewer failed to initialize: ' + (e && e.message ? e.message : e));
+  const el = document.createElement('img'); el.id='spinimg'; document.getElementById('stage').appendChild(el);
+  let frame = 0;
+  function show(f){ frame=(f%count+count)%count; if(imgs[frame].complete) el.src=imgs[frame].src; }
+  function start(){ hideLoader(); show(0);
+    let dragging=false, lastX=0, acc=0;
+    const sens = Math.max(2, window.innerWidth/count);
+    const down=(x)=>{dragging=true;lastX=x;};
+    const move=(x)=>{ if(!dragging) return; acc+=(x-lastX); lastX=x; while(Math.abs(acc)>=sens){ show(frame + (acc>0?1:-1)); acc+=(acc>0?-sens:sens); } };
+    const up=()=>{dragging=false;};
+    el.addEventListener('mousedown',e=>down(e.clientX)); window.addEventListener('mousemove',e=>move(e.clientX)); window.addEventListener('mouseup',up);
+    el.addEventListener('touchstart',e=>down(e.touches[0].clientX),{passive:true});
+    window.addEventListener('touchmove',e=>{ if(dragging){move(e.touches[0].clientX);} },{passive:true});
+    window.addEventListener('touchend',up);
+    // gentle auto-spin until first interaction
+    let auto=setInterval(()=>{ if(dragging){clearInterval(auto);return;} show(frame+1); }, 90);
+  }
 }
+
+init();
 </script>
 </body>
 </html>

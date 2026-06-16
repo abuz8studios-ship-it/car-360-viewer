@@ -7582,51 +7582,59 @@ button:disabled{background:#9bb6d0;cursor:wait}
 .tips{margin-top:1.5rem;font-size:.85rem;color:#7A8CA0;line-height:1.5;background:#F8FAFC;padding:1rem;border-radius:10px}
 </style></head><body><div class="wrap">
 <h1>LotVue<span>360</span> — True 3D Studio</h1>
-<p class="sub">Upload a slow walkaround video of a car → get a real orbitable 3D model (car + scene). Trains on this workstation's GPU.</p>
+<p class="sub">Upload a walkaround <b>video</b> OR a <b>set of photos</b>. You always get a draggable 360° spin — and it auto-upgrades to true orbit-anywhere 3D when the capture has enough motion. Runs on this workstation's GPU.</p>
 <label>Vehicle VIN / ID</label>
 <input id="vin" type="text" placeholder="e.g. 1HGBH41JXMN109186 (any ID works)">
-<label>Walkaround video (MP4/MOV — slow full circle, ~20-40s)</label>
-<input id="vid" type="file" accept="video/*">
-<button id="go" onclick="go()">Generate 3D Model</button>
+<label>Walkaround video — or select multiple photos (20+ recommended)</label>
+<input id="vid" type="file" accept="video/*,image/*" multiple>
+<button id="go" onclick="go()">Create 360 / 3D</button>
 <div class="bar" id="bar"><div id="prog"></div></div>
 <div id="status"></div>
 <div id="view"><a id="vlink" href="#" target="_blank">🔄 Open Interactive 3D</a></div>
-<div class="tips"><b>For the best 3D:</b> walk a slow, steady full circle around the car keeping the whole car in frame; park with room to walk all the way around; even lighting. Training takes ~5–15 min on the GPU.</div>
+<div class="tips"><b>You'll always get a 360° spin.</b> For full <b>orbit-anywhere 3D</b>: capture a slow, complete circle around the car — a 20–40s video, or 30+ overlapping photos — keep the whole car + some ground in frame, move smoothly, even lighting. ~5–15 min on the GPU.</div>
 </div><script>
 let vin='';
 async function go(){
-  const f=document.getElementById('vid').files[0];
+  const files=document.getElementById('vid').files;
   vin=(document.getElementById('vin').value||'').trim().toUpperCase();
   if(!vin){alert('Enter a VIN/ID');return}
-  if(!f){alert('Choose a walkaround video');return}
+  if(!files||!files.length){alert('Choose a walkaround video or a set of photos');return}
+  const vids=[...files].filter(f=>f.type.indexOf('video/')===0);
+  const imgs=[...files].filter(f=>f.type.indexOf('image/')===0);
+  const fd=new FormData();
+  if(imgs.length>=4){ imgs.forEach(f=>fd.append('photos',f)); }
+  else if(vids.length){ fd.append('video',vids[0]); }
+  else { alert('Upload one video, or at least 4 photos'); return; }
   const btn=document.getElementById('go');btn.disabled=true;btn.textContent='Uploading…';
-  const fd=new FormData();fd.append('video',f);
   try{
     const r=await fetch('/api/vehicle/'+encodeURIComponent(vin)+'/generate-3d',{method:'POST',body:fd,credentials:'same-origin'});
     if(r.status===401){location.href='/login?next=/3d-studio';return}
     const j=await r.json().catch(function(){return {}});
-    if(!r.ok){document.getElementById('status').textContent='⚠ '+(j.detail||('Upload failed — HTTP '+r.status));btn.disabled=false;btn.textContent='Generate 3D Model';return}
+    if(!r.ok){document.getElementById('status').textContent='⚠ '+(j.detail||('Upload failed — HTTP '+r.status));btn.disabled=false;btn.textContent='Create 360 / 3D';return}
     document.getElementById('bar').style.display='block';
-    document.getElementById('status').textContent='Training started — this runs on the GPU (~5-15 min).';
-    btn.textContent='Training…';
+    document.getElementById('status').textContent='Processing on the GPU…';
+    btn.textContent='Working…';
     poll();
-  }catch(e){document.getElementById('status').textContent='Error: '+e;btn.disabled=false;btn.textContent='Generate 3D Model';}
+  }catch(e){document.getElementById('status').textContent='Error: '+e;btn.disabled=false;btn.textContent='Create 360 / 3D';}
 }
 async function poll(){
   try{
     const r=await fetch('/api/vehicle/'+encodeURIComponent(vin)+'/3d-status',{credentials:'same-origin'});
     const j=await r.json();
     document.getElementById('prog').style.width=(j.progress||0)+'%';
-    document.getElementById('status').textContent=(j.step||j.status||'working')+' ('+(j.progress||0)+'%)';
-    if(j.ready||j.status==='done'){
-      document.getElementById('status').textContent='✅ Done! Your interactive 3D model is ready.';
+    if(j.status==='done'){
       document.getElementById('prog').style.width='100%';
+      let msg = j.splat_ready ? '✅ True 3D ready — orbit it anywhere!' : '✅ 360° spin ready.';
+      if(!j.splat_ready && j.note){ msg += '  ℹ '+j.note; }
+      document.getElementById('status').textContent=msg;
       const v=document.getElementById('view');v.style.display='block';
+      document.getElementById('vlink').textContent = j.splat_ready ? '🔄 Open Interactive 3D' : '🔄 Open 360 Viewer';
       document.getElementById('vlink').href='/splat3d/'+vin;
-      document.getElementById('go').disabled=false;document.getElementById('go').textContent='Generate 3D Model';
+      document.getElementById('go').disabled=false;document.getElementById('go').textContent='Create 360 / 3D';
       return;
     }
-    if(j.status==='error'){document.getElementById('status').textContent='⚠ '+(j.error||'failed');document.getElementById('go').disabled=false;document.getElementById('go').textContent='Generate 3D Model';return;}
+    if(j.status==='error'){document.getElementById('status').textContent='⚠ '+(j.error||'failed');document.getElementById('go').disabled=false;document.getElementById('go').textContent='Create 360 / 3D';return;}
+    document.getElementById('status').textContent=(j.step||j.status||'working')+' ('+(j.progress||0)+'%)';
   }catch(e){}
   setTimeout(poll,5000);
 }
@@ -7652,32 +7660,60 @@ async def vehicle_3d_status(vin: str):
 
 
 @app.post("/api/vehicle/{vin}/generate-3d")
-async def generate_3d(vin: str, video: UploadFile = File(...), steps: str = Form("12000")):
+async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
+                      photos: Optional[List[UploadFile]] = File(None),
+                      steps: str = Form("7000")):
     # Accept any vehicle ID (real VIN or freeform) — sanitize to a safe folder name.
     vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
     if not vin:
         raise HTTPException(status_code=400, detail="Provide a vehicle VIN or ID")
     vdir = STORAGE_DIR / vin
     (vdir / "splat").mkdir(parents=True, exist_ok=True)
-    walk = vdir / "walkaround.mp4"
-    content = await video.read()
-    if len(content) > MAX_VIDEO_MB * 1024 * 1024 * 6:
-        raise HTTPException(status_code=413, detail="Walkaround video too large")
-    with open(walk, "wb") as f:
-        f.write(content)
-    (vdir / "splat" / "status.json").write_text(
-        json.dumps({"status": "running", "step": "queued", "progress": 1, "vin": vin}), encoding="utf-8")
     try:
         steps_i = max(2000, min(int(steps), 30000))
     except ValueError:
-        steps_i = 12000
+        steps_i = 7000
+
+    # Either a walkaround VIDEO or a SET OF PHOTOS — both always produce a 360 spin,
+    # and auto-upgrade to true 3D when the capture supports it.
+    real_photos = [p for p in (photos or []) if getattr(p, "filename", "")]
+    if real_photos:
+        pdir = vdir / "_3dphotos"
+        if pdir.exists():
+            shutil.rmtree(pdir, ignore_errors=True)
+        pdir.mkdir(parents=True, exist_ok=True)
+        saved = 0
+        for i, p in enumerate(real_photos):
+            data = await p.read()
+            if not data or len(data) > MAX_PHOTO_MB * 1024 * 1024:
+                continue
+            try:  # convert ANY format (incl. HEIC/webp) to jpg
+                img = Image.open(io.BytesIO(data)).convert("RGB")
+                img.save(pdir / f"p_{i+1:04d}.jpg", "JPEG", quality=92)
+                saved += 1
+            except Exception:
+                continue
+        if saved < 4:
+            raise HTTPException(status_code=400, detail="Upload at least 4 readable photos.")
+        mode_args = ["--images", str(pdir)]
+    elif video is not None and getattr(video, "filename", ""):
+        walk = vdir / "walkaround.mp4"
+        content = await video.read()
+        if len(content) > MAX_VIDEO_MB * 1024 * 1024 * 6:
+            raise HTTPException(status_code=413, detail="Walkaround video too large")
+        with open(walk, "wb") as f:
+            f.write(content)
+        mode_args = ["--video", str(walk)]
+    else:
+        raise HTTPException(status_code=400, detail="Upload a walkaround video or 4+ photos.")
+
+    (vdir / "splat" / "status.json").write_text(
+        json.dumps({"status": "running", "step": "queued", "progress": 1, "vin": vin}), encoding="utf-8")
     subprocess.Popen(
-        [sys.executable, str(BASE_DIR / "gaussian_3d.py"), "--vin", vin,
-         "--video", str(walk), "--steps", str(steps_i)],
+        [sys.executable, str(BASE_DIR / "gaussian_3d.py"), "--vin", vin, *mode_args, "--steps", str(steps_i)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(BASE_DIR))
     return {"status": "started", "vin": vin,
-            "status_url": f"/api/vehicle/{vin}/3d-status", "viewer": f"/splat3d/{vin}",
-            "note": "3D training runs on the GPU workstation (~5-15 min). Poll status_url."}
+            "status_url": f"/api/vehicle/{vin}/3d-status", "viewer": f"/splat3d/{vin}"}
 
 
 # =============================================================================
