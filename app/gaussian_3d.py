@@ -12,7 +12,7 @@ Usage:
   python gaussian_3d.py --vin VIN --video PATH [--steps 12000] [--max-frames 120]
   python gaussian_3d.py --vin VIN --images DIR [--steps 12000]
 """
-import os, sys, json, time, shutil, argparse, subprocess
+import os, sys, json, time, shutil, struct, argparse, subprocess
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -93,7 +93,23 @@ def colmap_poses(work, images_dir):
           "--output_path", str(sparse)], 3600, "colmap mapper")
     model0 = sparse / "0"
     if not (model0 / "cameras.bin").exists():
-        raise RuntimeError("COLMAP could not reconstruct camera poses (need more overlap / a slow full walkaround).")
+        raise RuntimeError("COLMAP could not reconstruct the scene at all — the video lacks "
+                           "overlap/parallax. Reshoot a SLOW, steady full circle around the car.")
+    # How many frames actually aligned? (images.bin starts with a uint64 count.)
+    reg = 0
+    try:
+        with open(model0 / "images.bin", "rb") as fh:
+            reg = struct.unpack("<Q", fh.read(8))[0]
+    except Exception:
+        pass
+    total = len(list(images_dir.glob("frame_*.jpg")))
+    print(f"[3D] COLMAP registered {reg}/{total} frames")
+    if reg < max(25, int(0.40 * total)):
+        raise RuntimeError(
+            f"Only {reg} of {total} frames aligned — not enough for a 3D model. This happens when the "
+            f"walkaround is too fast, doesn't go fully around, the car is very reflective, or there's "
+            f"motion blur. Reshoot: walk a SLOW, steady full circle (~30-40s), keep the whole car AND "
+            f"some ground/background in frame, move smoothly (about one step per second).")
     return model0
 
 
