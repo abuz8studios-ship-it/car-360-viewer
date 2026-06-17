@@ -7580,6 +7580,12 @@ button:disabled{background:#9bb6d0;cursor:wait}
 #view{display:none;margin-top:1rem;text-align:center}
 #view a{display:inline-block;background:#C8A55C;color:#fff;padding:.8rem 1.6rem;border-radius:10px;text-decoration:none;font-weight:700}
 .tips{margin-top:1.5rem;font-size:.85rem;color:#7A8CA0;line-height:1.5;background:#F8FAFC;padding:1rem;border-radius:10px}
+.styles{display:flex;gap:.5rem;margin-top:.4rem}
+.opt{display:flex!important;align-items:center;justify-content:center;gap:.4rem;flex:1;margin:0;font-weight:600;font-size:.92rem;background:#F1F6FB;border:1.5px solid #DDE5EE;border-radius:10px;padding:.6rem .5rem;cursor:pointer}
+.opt input{width:auto;margin:0}
+.opt.sel{border-color:#2E75B6;background:#E8F1FB;color:#2E75B6}
+.styles+.hint{display:block;font-size:.8rem;color:#7A8CA0;margin-top:.4rem;font-weight:400}
+#dl a{display:inline-block;margin-left:.6rem;background:#fff;color:#2E75B6;border:1.5px solid #2E75B6;padding:.8rem 1.2rem;border-radius:10px;text-decoration:none;font-weight:700}
 </style></head><body><div class="wrap">
 <h1>LotVue<span>360</span> — True 3D Studio</h1>
 <p class="sub">Upload a walkaround <b>video</b> OR a <b>set of photos</b>. You always get a draggable 360° spin — and it auto-upgrades to true orbit-anywhere 3D when the capture has enough motion. Runs on this workstation's GPU.</p>
@@ -7587,13 +7593,25 @@ button:disabled{background:#9bb6d0;cursor:wait}
 <input id="vin" type="text" placeholder="e.g. 1HGBH41JXMN109186 (any ID works)">
 <label>Walkaround video — or select multiple photos (20+ recommended)</label>
 <input id="vid" type="file" accept="video/*,image/*" multiple>
+<label>Background style</label>
+<div class="styles">
+  <label class="opt sel"><input type="radio" name="style" value="natural" checked onchange="selStyle()">Real lot</label>
+  <label class="opt"><input type="radio" name="style" value="studio" onchange="selStyle()">Studio floor</label>
+  <label class="opt"><input type="radio" name="style" value="branded" onchange="selStyle()">Branded</label>
+</div>
+<span class="hint">Real lot = your actual lot, edges softened. Studio = clean floor + shadow + reflection. Branded = your backdrop + logo (drop background.* and logo.png in storage/_brand).</span>
 <button id="go" onclick="go()">Create 360 / 3D</button>
 <div class="bar" id="bar"><div id="prog"></div></div>
 <div id="status"></div>
-<div id="view"><a id="vlink" href="#" target="_blank">🔄 Open Interactive 3D</a></div>
+<div id="view"><a id="vlink" href="#" target="_blank">🔄 Open Interactive 3D</a><span id="dl" style="display:none"><a href="#" download>⬇ Download MP4</a></span></div>
 <div class="tips"><b>You'll always get a 360° spin.</b> For full <b>orbit-anywhere 3D</b>: capture a slow, complete circle around the car — a 20–40s video, or 30+ overlapping photos — keep the whole car + some ground in frame, move smoothly, even lighting. ~5–15 min on the GPU.</div>
 </div><script>
 let vin='';
+function selStyle(){
+  document.querySelectorAll('.opt').forEach(function(o){
+    o.classList.toggle('sel', o.querySelector('input').checked);
+  });
+}
 async function go(){
   const files=document.getElementById('vid').files;
   vin=(document.getElementById('vin').value||'').trim().toUpperCase();
@@ -7601,11 +7619,17 @@ async function go(){
   if(!files||!files.length){alert('Choose a walkaround video or a set of photos');return}
   const vids=[...files].filter(f=>f.type.indexOf('video/')===0);
   const imgs=[...files].filter(f=>f.type.indexOf('image/')===0);
+  const style=(document.querySelector('input[name=style]:checked')||{}).value||'natural';
   const fd=new FormData();
+  fd.append('style', style);
   if(imgs.length>=4){ imgs.forEach(f=>fd.append('photos',f)); }
   else if(vids.length){ fd.append('video',vids[0]); }
   else { alert('Upload one video, or at least 4 photos'); return; }
   const btn=document.getElementById('go');btn.disabled=true;btn.textContent='Uploading…';
+  // hide any prior run's viewer/MP4 buttons so they can't serve the previous vehicle
+  document.getElementById('view').style.display='none';
+  document.getElementById('dl').style.display='none';
+  document.getElementById('prog').style.width='0%';
   try{
     const r=await fetch('/api/vehicle/'+encodeURIComponent(vin)+'/generate-3d',{method:'POST',body:fd,credentials:'same-origin'});
     if(r.status===401){location.href='/login?next=/3d-studio';return}
@@ -7630,6 +7654,9 @@ async function poll(){
       const v=document.getElementById('view');v.style.display='block';
       document.getElementById('vlink').textContent = j.splat_ready ? '🔄 Open Interactive 3D' : '🔄 Open 360 Viewer';
       document.getElementById('vlink').href='/splat3d/'+vin;
+      const dl=document.getElementById('dl');
+      if(j.spin_mp4){ dl.style.display='inline'; dl.querySelector('a').href=j.spin_mp4; }
+      else { dl.style.display='none'; }
       document.getElementById('go').disabled=false;document.getElementById('go').textContent='Create 360 / 3D';
       return;
     }
@@ -7644,7 +7671,9 @@ async function poll(){
 
 @app.get("/api/vehicle/{vin}/3d-status")
 async def vehicle_3d_status(vin: str):
-    sp = STORAGE_DIR / vin.upper() / "splat"
+    # sanitize to a safe folder name (no path traversal) — same rule as generate-3d
+    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
+    sp = STORAGE_DIR / vin / "splat"
     data = {}
     st = sp / "status.json"
     if st.exists():
@@ -7654,19 +7683,25 @@ async def vehicle_3d_status(vin: str):
             data = {}
     data["ready"] = (sp / "scene.ply").exists()
     if data["ready"]:
-        data.setdefault("url", f"/storage/{vin.upper()}/splat/scene.ply")
-        data.setdefault("viewer", f"/splat3d/{vin.upper()}")
+        data.setdefault("url", f"/storage/{vin}/splat/scene.ply")
+        data.setdefault("viewer", f"/splat3d/{vin}")
+    if (STORAGE_DIR / vin / "spin" / "spin.mp4").exists():
+        data["spin_mp4"] = f"/storage/{vin}/spin/spin.mp4"
     return data
 
 
 @app.post("/api/vehicle/{vin}/generate-3d")
 async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
                       photos: Optional[List[UploadFile]] = File(None),
-                      steps: str = Form("7000")):
+                      steps: str = Form("7000"),
+                      style: str = Form("natural")):
     # Accept any vehicle ID (real VIN or freeform) — sanitize to a safe folder name.
     vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
     if not vin:
         raise HTTPException(status_code=400, detail="Provide a vehicle VIN or ID")
+    style = (style or "natural").strip().lower()
+    if style not in ("natural", "studio", "branded"):
+        style = "natural"
     vdir = STORAGE_DIR / vin
     (vdir / "splat").mkdir(parents=True, exist_ok=True)
     try:
@@ -7710,9 +7745,10 @@ async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
     (vdir / "splat" / "status.json").write_text(
         json.dumps({"status": "running", "step": "queued", "progress": 1, "vin": vin}), encoding="utf-8")
     subprocess.Popen(
-        [sys.executable, str(BASE_DIR / "gaussian_3d.py"), "--vin", vin, *mode_args, "--steps", str(steps_i)],
+        [sys.executable, str(BASE_DIR / "gaussian_3d.py"), "--vin", vin, *mode_args,
+         "--steps", str(steps_i), "--style", style],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(BASE_DIR))
-    return {"status": "started", "vin": vin,
+    return {"status": "started", "vin": vin, "style": style,
             "status_url": f"/api/vehicle/{vin}/3d-status", "viewer": f"/splat3d/{vin}"}
 
 

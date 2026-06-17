@@ -95,7 +95,7 @@ def copy_photos(src_dir, out_dir):
 
 
 # ── STEP A: the always-on 360 spin (works from ANY input) ────────────────────
-def build_spin(frames, vin, target=72):
+def build_spin(frames, vin, target=72, style=None):
     from PIL import Image, ImageOps
     spin_dir = STORAGE_DIR / vin / "spin"
     spin_dir.mkdir(parents=True, exist_ok=True)
@@ -112,7 +112,7 @@ def build_spin(frames, vin, target=72):
         sel = frames
     # STABILIZE into a smooth GLO3D-style turntable: lock the car centered at a
     # constant size so it rotates in place (raw handheld frames jitter/drift).
-    if _stabilize_frames(sel, spin_dir):
+    if _stabilize_frames(sel, spin_dir, style=style):
         cnt = len(list(spin_dir.glob("spin_*.jpg")))
     else:
         # fallback (no rembg, e.g. the light bundle): plain normalized frames
@@ -129,14 +129,38 @@ def build_spin(frames, vin, target=72):
     return cnt
 
 
-def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=854, TARGET_W=0.80):
+def export_mp4(vin):
+    """Render the finished turntable to a web-friendly looping MP4 (download / social /
+    marketplace). Best-effort: returns the path on success, None if ffmpeg is unavailable
+    or there are no frames — never raises, so it can't fail the spin delivery."""
+    spin_dir = STORAGE_DIR / vin / "spin"
+    frames = sorted(spin_dir.glob("spin_*.jpg"))
+    if not frames:
+        return None
+    out = spin_dir / "spin.mp4"
+    fps = max(8, round(len(frames) / 6.0))   # ~6s smooth loop regardless of frame count
+    try:
+        _run([FFMPEG, "-y", "-framerate", str(fps), "-start_number", "1",
+              "-i", str(spin_dir / "spin_%04d.jpg"),
+              "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
+              "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+              "-movflags", "+faststart", str(out)], 600, "ffmpeg spin.mp4")
+        return out if out.exists() else None
+    except Exception as e:
+        print(f"[3D] mp4 export skipped: {e}")
+        return None
+
+
+def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=854, TARGET_W=0.80, style=None):
     """Turn raw walkaround frames into a GLO3D-grade turntable. Per frame: segment the
-    car (rembg), lock it centered at constant size, then — in STUDIO style — drop the
-    cutout on a clean gradient floor with an angle-aware grounding shadow + a faded
-    reflection; in NATURAL style — keep the real lot, softly blurred at the edges.
+    car (rembg), lock it centered at constant size, then composite per style —
+      natural : keep the real lot, softly blurred at the edges (Ahmad's default);
+      studio  : drop the cutout on a clean gradient floor + grounding shadow + reflection;
+      branded : same cutout, but on the dealer's own backdrop (storage/_brand/background.*)
+                with the dealer logo (storage/_brand/logo.png) — falls back to studio look.
     A cross-set exposure/white-balance pass makes EVERY frame match so the spin never
-    flickers (the single biggest 'looks professional' lever). Env LOTVUE_SPIN_STYLE =
-    studio (default) | natural. Returns True on success, False if rembg is absent."""
+    flickers (the single biggest 'looks professional' lever). Per-call `style` wins; else
+    env LOTVUE_SPIN_STYLE; else natural. Returns True on success, False if rembg is absent."""
     try:
         import numpy as np
         from PIL import Image, ImageOps, ImageFilter, ImageDraw
@@ -144,9 +168,11 @@ def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=854, TARGET_W=0.80):
     except Exception as e:
         print(f"[3D] stabilize unavailable (rembg): {e}")
         return False
-    # Default to the real-lot "natural" look (Ahmad's pick); "studio" is the toggle.
-    # Both get the same stabilization + cross-set flicker normalization for consistency.
-    style = os.environ.get("LOTVUE_SPIN_STYLE", "natural").lower()
+    # Per-call style wins; else the install default (env); else natural (Ahmad's pick).
+    style = (style or os.environ.get("LOTVUE_SPIN_STYLE", "natural")).lower()
+    if style not in ("natural", "studio", "branded"):
+        style = "natural"
+    cutout = style in ("studio", "branded")   # both cut the car out onto a backdrop
     try:
         sess = None
         for m in ("isnet-general-use", "u2net", "u2netp"):
@@ -187,17 +213,43 @@ def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=854, TARGET_W=0.80):
             l = (p.width-OUT_W)//2; t = (p.height-OUT_H)//2
             return p.crop((l, t, l+OUT_W, t+OUT_H)).filter(ImageFilter.GaussianBlur(34))
 
+        # optional dealer branding (branded style only) — cover-fit backdrop + corner logo.
+        # Missing assets degrade gracefully to the plain studio look, so it never hard-fails.
+        _brand_bg = _brand_logo = None
+        if style == "branded":
+            bdir = STORAGE_DIR / "_brand"
+            for name in ("background.jpg", "background.jpeg", "background.png"):
+                bp = bdir / name
+                if bp.exists():
+                    try:
+                        bi = ImageOps.exif_transpose(Image.open(bp)).convert("RGB")
+                        s = max(OUT_W/bi.width, OUT_H/bi.height)
+                        bi = bi.resize((int(bi.width*s)+2, int(bi.height*s)+2), Image.LANCZOS)
+                        l = (bi.width-OUT_W)//2; t = (bi.height-OUT_H)//2
+                        _brand_bg = bi.crop((l, t, l+OUT_W, t+OUT_H)).convert("RGBA")
+                    except Exception:
+                        _brand_bg = None
+                    break
+            lp = bdir / "logo.png"
+            if lp.exists():
+                try:
+                    lg = Image.open(lp).convert("RGBA")
+                    lw = max(1, int(OUT_W*0.18)); lh = max(1, int(lg.height*lw/lg.width))
+                    _brand_logo = lg.resize((lw, lh), Image.LANCZOS)
+                except Exception:
+                    _brand_logo = None
+
         # ── Pass B: normalize colour to the shared target, then composite ──
         for i, (im, a, cx, cy, cw) in enumerate(zip(origs, alphas, cxs, cys, cws)):
             gain = np.clip(target / np.maximum(means[i], 1e-3), 0.75, 1.35)
             scale = (OUT_W*TARGET_W) / max(cw, 1)
-            if style == "studio":
+            if cutout:
                 rgba = np.dstack([np.asarray(im, dtype=np.float32), a.astype(np.float32)])
                 rgba[:, :, :3] = np.clip(rgba[:, :, :3] * gain, 0, 255)
                 car = Image.fromarray(rgba.astype(np.uint8), "RGBA").resize(
                     (max(1, int(im.width*scale)), max(1, int(im.height*scale))), Image.LANCZOS)
                 px = int(OUT_W/2 - cx*scale); py = int(OUT_H*0.44 - cy*scale)
-                canvas = studio_bg()
+                canvas = _brand_bg.copy() if _brand_bg is not None else studio_bg()
                 ca = np.array(car)[:, :, 3]; cyy, cxx = np.where(ca > 40)
                 if len(cxx) > 100:
                     foot_y = py+int(cyy.max()); foot_cx = px+int((cxx.min()+cxx.max())/2); foot_w = int(cxx.max()-cxx.min())
@@ -213,6 +265,9 @@ def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=854, TARGET_W=0.80):
                 refl[:, :, 3] *= np.linspace(0.28, 0.0, refl.shape[0])[:, None]
                 canvas.alpha_composite(Image.fromarray(refl.astype(np.uint8), "RGBA"), (px, foot_y))
                 canvas.alpha_composite(car, (px, py))
+                if _brand_logo is not None:   # branded: dealer logo, bottom-right
+                    canvas.alpha_composite(_brand_logo,
+                                           (OUT_W - _brand_logo.width - 24, OUT_H - _brand_logo.height - 20))
                 canvas.convert("RGB").save(out_dir / f"spin_{i+1:04d}.jpg", "JPEG", quality=92)
             else:
                 arr = np.clip(np.asarray(im, dtype=np.float32) * gain, 0, 255).astype(np.uint8)
@@ -322,10 +377,13 @@ def run(args):
 
     # STEP A — always deliver a 360 spin (works from anything)
     set_status("Building 360 spin", 25)
-    nspin = build_spin(frames, _VIN)
+    nspin = build_spin(frames, _VIN, style=(getattr(args, "style", "") or None))
     _STATE["spin_ready"] = nspin > 0
     _STATE["spin_frames"] = nspin
     _STATE["spin_url"] = f"/storage/{_VIN}/spin/"
+    # web-friendly MP4 of the turntable (download / social) — best-effort
+    if nspin > 0 and export_mp4(_VIN):
+        _STATE["spin_mp4"] = f"/storage/{_VIN}/spin/spin.mp4"
     set_status("360 spin ready — now attempting true 3D", 35, spin_ready=True, spin_frames=nspin)
 
     # STEP B — best-effort true 3D upgrade
@@ -358,5 +416,6 @@ if __name__ == "__main__":
     ap.add_argument("--images", default="")
     ap.add_argument("--steps", type=int, default=7000)
     ap.add_argument("--max-frames", type=int, default=150)
+    ap.add_argument("--style", default="", help="natural | studio | branded (else env default)")
     a = ap.parse_args()
     sys.exit(0 if run(a) else 1)
