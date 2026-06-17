@@ -121,9 +121,9 @@ rely on true volumetric 3D for everyday inventory; the *stabilized turntable* is
 
 ## ▶️ TO BE A FULL REPLICABLE CLONE — REMAINING ROADMAP (priority order)
 
-1. **Per-car style choice in `/3d-studio`** — radio: *Real lot (natural)* / *Studio floor* / *Branded background*. Today it's the env default; expose it per listing (and per-dealer default).
-2. **Auto-MP4 export** of the finished turntable (ffmpeg from `spin/spin_*.jpg`) for social/marketplace posting — competitors all offer the spin AND a video.
-3. **Branded/virtual backgrounds** (Spyne's 100+ / GLO3D custom) — a picker of clean studio backdrops + dealership logo watermark in studio mode.
+1. ✅ **DONE (HEAD 01697a3)** — **Per-car style picker in `/3d-studio`**: radio *Real lot / Studio floor / Branded*; flows UI → generate-3d (allowlist-validated) → engine `--style`. Per-call beats env LOTVUE_SPIN_STYLE beats natural.
+2. ✅ **DONE (HEAD 01697a3)** — **Auto-MP4 export**: `export_mp4()` makes a web-friendly ~6s looping H.264 (faststart) at `storage/{vin}/spin/spin.mp4`, surfaced as status `spin_mp4` + a "Download MP4" button.
+3. **Branded assets pipeline** — branded style already reads `storage/_brand/background.*` + `storage/_brand/logo.png` (graceful fallback to studio). NEXT: a small upload UI for those assets + a picker of several clean studio backdrops (Spyne's 100+ / GLO3D custom), per-dealer.
 4. **Interior panorama + hotspots** (GLO3D/CloudPano parity) — equirectangular interior view with tappable feature pins.
 5. **VIN-keyed instant VDP embed** + feed integration (CloudPano/CarCutter parity) — one embed snippet per VIN; push to Dealer.com-style feeds.
 6. **Guided-capture coaching** in the PWA (Impel parity) — on-screen prompts ("walk slower", "keep car centered") to raise input quality.
@@ -132,8 +132,8 @@ rely on true volumetric 3D for everyday inventory; the *stabilized turntable* is
 9. Carry-overs: P6 lead-email SMTP credential (owner-blocked — needs Ahmad's app password via Telegram); re-sync the 64GB card (`G:\LotVue360`) to the latest build; full dealer-journey QA pass.
 
 ## First moves in the new chat
-- Probe `:8360`, open `/splat3d/DS8097NAT` so Ahmad re-confirms the natural look.
-- Ask Ahmad which roadmap item to take first (recommend #1 per-car style picker, then #2 auto-MP4 — both are small and high-visibility).
+- Probe `:8360`, open `/splat3d/DS8097NAT` (natural look) + `/splat3d/DS8097STU` (studio + has an MP4 demo).
+- Recommend next: #3 branded-assets upload UI + backdrop picker (the branded style is already wired in the engine), then #4 interior panorama.
 - Work tracked (TaskCreate the queue), verify each from disk, commit with clean messages (no secrets).
 
 *Sources for the research above:* GLO3D (glo3d.com, glo3d.net/pricing), Spyne (spyne.ai/features/car-360-spin, /360-car-photography), CloudPano (auto.cloudpano.com, blog.cloudpano.com), CarCutter (carcutter.com/360-spin, /resources/what-is-a-360-car-spin), Impel (impel.ai/360-walkarounds).
