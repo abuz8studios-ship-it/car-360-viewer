@@ -129,50 +129,101 @@ def build_spin(frames, vin, target=72):
     return cnt
 
 
-def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=800, TARGET_W=0.82):
-    """Detect the car per frame (rembg), lock it centered at constant size, fill the
-    edges with a soft blurred plate of the real scene. Returns True on success, False
-    if rembg isn't available (caller falls back to plain frames)."""
+def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=854, TARGET_W=0.80):
+    """Turn raw walkaround frames into a GLO3D-grade turntable. Per frame: segment the
+    car (rembg), lock it centered at constant size, then — in STUDIO style — drop the
+    cutout on a clean gradient floor with an angle-aware grounding shadow + a faded
+    reflection; in NATURAL style — keep the real lot, softly blurred at the edges.
+    A cross-set exposure/white-balance pass makes EVERY frame match so the spin never
+    flickers (the single biggest 'looks professional' lever). Env LOTVUE_SPIN_STYLE =
+    studio (default) | natural. Returns True on success, False if rembg is absent."""
     try:
         import numpy as np
-        from PIL import Image, ImageOps, ImageFilter
+        from PIL import Image, ImageOps, ImageFilter, ImageDraw
         from rembg import remove, new_session
     except Exception as e:
         print(f"[3D] stabilize unavailable (rembg): {e}")
         return False
+    style = os.environ.get("LOTVUE_SPIN_STYLE", "studio").lower()
     try:
-        sess = new_session("u2netp")
-        imgs, cxs, cys, cws = [], [], [], []
+        sess = None
+        for m in ("isnet-general-use", "u2net", "u2netp"):
+            try:
+                sess = new_session(m); print(f"[3D] segmentation model: {m}"); break
+            except Exception:
+                continue
+        # ── Pass A: segment every frame, collect car box + per-frame car color means ──
+        origs, alphas, bboxes, means = [], [], [], []
         last = None
         for f in sel:
-            im = ImageOps.exif_transpose(Image.open(f)).convert("RGB"); imgs.append(im)
+            im = ImageOps.exif_transpose(Image.open(f)).convert("RGB")
             a = np.array(remove(im, session=sess))[:, :, 3]
             ys, xs = np.where(a > 40)
             b = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())) if len(xs) > 200 else last
             last = b or (0, 0, im.width, im.height); b = last
-            cxs.append((b[0]+b[2])/2); cys.append((b[1]+b[3])/2); cws.append(b[2]-b[0])
-        med_w = float(np.median(cws)) if cws else OUT_W*0.5
+            origs.append(im); alphas.append(a); bboxes.append(b)
+            arr = np.asarray(im, dtype=np.float32); mask = a > 40
+            means.append([arr[:, :, c][mask].mean() if mask.sum() > 500 else arr[:, :, c].mean() for c in range(3)])
+        means = np.array(means)
+        target = np.median(means, axis=0)           # shared color/brightness target
 
+        cxs = [(b[0]+b[2])/2 for b in bboxes]; cys = [(b[1]+b[3])/2 for b in bboxes]; cws = [b[2]-b[0] for b in bboxes]
+        med_w = float(np.median(cws)) if cws else OUT_W*0.5
         def smooth(v, k=2):
             return [sum(v[max(0,i-k):min(len(v),i+k+1)])/len(v[max(0,i-k):min(len(v),i+k+1)]) for i in range(len(v))]
         cxs, cys, cws = smooth(cxs), smooth(cys), smooth([max(w, med_w*0.6) for w in cws])
 
-        def plate(im):
+        def studio_bg():
+            top = np.array([249, 250, 252], np.float32); bot = np.array([210, 215, 222], np.float32)
+            g = np.linspace(0, 1, OUT_H)[:, None, None]
+            arr = np.repeat((top*(1-g)+bot*g).astype(np.uint8), OUT_W, axis=1)
+            return Image.fromarray(arr, "RGB").convert("RGBA")
+
+        def blur_plate(im):
             s = max(OUT_W/im.width, OUT_H/im.height)
             p = im.resize((int(im.width*s)+2, int(im.height*s)+2), Image.LANCZOS)
             l = (p.width-OUT_W)//2; t = (p.height-OUT_H)//2
             return p.crop((l, t, l+OUT_W, t+OUT_H)).filter(ImageFilter.GaussianBlur(34))
 
-        for i, (im, cx, cy, cw) in enumerate(zip(imgs, cxs, cys, cws)):
-            scale = (OUT_W*TARGET_W)/max(cw, 1)
-            scaled = im.resize((max(1, int(im.width*scale)), max(1, int(im.height*scale))), Image.LANCZOS)
-            canvas = plate(im)
-            canvas.paste(scaled, (int(OUT_W/2 - cx*scale), int(OUT_H*0.5 - cy*scale)))
-            canvas.save(out_dir / f"spin_{i+1:04d}.jpg", "JPEG", quality=90)
-        print(f"[3D] stabilized {len(sel)} frames into a smooth turntable")
+        # ── Pass B: normalize colour to the shared target, then composite ──
+        for i, (im, a, cx, cy, cw) in enumerate(zip(origs, alphas, cxs, cys, cws)):
+            gain = np.clip(target / np.maximum(means[i], 1e-3), 0.75, 1.35)
+            scale = (OUT_W*TARGET_W) / max(cw, 1)
+            if style == "studio":
+                rgba = np.dstack([np.asarray(im, dtype=np.float32), a.astype(np.float32)])
+                rgba[:, :, :3] = np.clip(rgba[:, :, :3] * gain, 0, 255)
+                car = Image.fromarray(rgba.astype(np.uint8), "RGBA").resize(
+                    (max(1, int(im.width*scale)), max(1, int(im.height*scale))), Image.LANCZOS)
+                px = int(OUT_W/2 - cx*scale); py = int(OUT_H*0.44 - cy*scale)
+                canvas = studio_bg()
+                ca = np.array(car)[:, :, 3]; cyy, cxx = np.where(ca > 40)
+                if len(cxx) > 100:
+                    foot_y = py+int(cyy.max()); foot_cx = px+int((cxx.min()+cxx.max())/2); foot_w = int(cxx.max()-cxx.min())
+                else:
+                    foot_y, foot_cx, foot_w = int(OUT_H*0.8), OUT_W//2, int(OUT_W*0.6)
+                # grounding shadow (angle-aware: follows the car footprint)
+                sh = Image.new("RGBA", (OUT_W, OUT_H), (0, 0, 0, 0)); d = ImageDraw.Draw(sh)
+                ew, eh = int(foot_w*0.96), max(10, int(foot_w*0.15))
+                d.ellipse([foot_cx-ew//2, foot_y-eh//2, foot_cx+ew//2, foot_y+eh//2], fill=(0, 0, 0, 130))
+                canvas = Image.alpha_composite(canvas, sh.filter(ImageFilter.GaussianBlur(20)))
+                # floor reflection (flip lower car, fade out)
+                refl = np.array(car.transpose(Image.FLIP_TOP_BOTTOM), dtype=np.float32)
+                refl[:, :, 3] *= np.linspace(0.28, 0.0, refl.shape[0])[:, None]
+                canvas.alpha_composite(Image.fromarray(refl.astype(np.uint8), "RGBA"), (px, foot_y))
+                canvas.alpha_composite(car, (px, py))
+                canvas.convert("RGB").save(out_dir / f"spin_{i+1:04d}.jpg", "JPEG", quality=92)
+            else:
+                arr = np.clip(np.asarray(im, dtype=np.float32) * gain, 0, 255).astype(np.uint8)
+                imn = Image.fromarray(arr, "RGB")
+                scaled = imn.resize((max(1, int(im.width*scale)), max(1, int(im.height*scale))), Image.LANCZOS)
+                canvas = blur_plate(imn)
+                canvas.paste(scaled, (int(OUT_W/2 - cx*scale), int(OUT_H*0.5 - cy*scale)))
+                canvas.save(out_dir / f"spin_{i+1:04d}.jpg", "JPEG", quality=92)
+        print(f"[3D] stabilized+normalized {len(sel)} frames (style={style}) into a GLO3D-grade turntable")
         return True
     except Exception as e:
         print(f"[3D] stabilize failed, using plain frames: {e}")
+        import traceback; traceback.print_exc()
         return False
 
 
