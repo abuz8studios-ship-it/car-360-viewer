@@ -110,17 +110,70 @@ def build_spin(frames, vin, target=72):
         sel = [frames[i] for i in idx]
     else:
         sel = frames
-    for i, f in enumerate(sel):
-        try:
-            im = ImageOps.exif_transpose(Image.open(f)).convert("RGB")
-            if im.width > 1280:
-                im = im.resize((1280, round(im.height * 1280 / im.width)), Image.LANCZOS)
-            im.save(spin_dir / f"spin_{i+1:04d}.jpg", "JPEG", quality=90)
-        except Exception as e:
-            print(f"[3D] spin frame fail {f.name}: {e}")
-    cnt = len(list(spin_dir.glob("spin_*.jpg")))
+    # STABILIZE into a smooth GLO3D-style turntable: lock the car centered at a
+    # constant size so it rotates in place (raw handheld frames jitter/drift).
+    if _stabilize_frames(sel, spin_dir):
+        cnt = len(list(spin_dir.glob("spin_*.jpg")))
+    else:
+        # fallback (no rembg, e.g. the light bundle): plain normalized frames
+        for i, f in enumerate(sel):
+            try:
+                im = ImageOps.exif_transpose(Image.open(f)).convert("RGB")
+                if im.width > 1280:
+                    im = im.resize((1280, round(im.height * 1280 / im.width)), Image.LANCZOS)
+                im.save(spin_dir / f"spin_{i+1:04d}.jpg", "JPEG", quality=90)
+            except Exception as e:
+                print(f"[3D] spin frame fail {f.name}: {e}")
+        cnt = len(list(spin_dir.glob("spin_*.jpg")))
     (spin_dir / "manifest.json").write_text(json.dumps({"count": cnt}), encoding="utf-8")
     return cnt
+
+
+def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=800, TARGET_W=0.82):
+    """Detect the car per frame (rembg), lock it centered at constant size, fill the
+    edges with a soft blurred plate of the real scene. Returns True on success, False
+    if rembg isn't available (caller falls back to plain frames)."""
+    try:
+        import numpy as np
+        from PIL import Image, ImageOps, ImageFilter
+        from rembg import remove, new_session
+    except Exception as e:
+        print(f"[3D] stabilize unavailable (rembg): {e}")
+        return False
+    try:
+        sess = new_session("u2netp")
+        imgs, cxs, cys, cws = [], [], [], []
+        last = None
+        for f in sel:
+            im = ImageOps.exif_transpose(Image.open(f)).convert("RGB"); imgs.append(im)
+            a = np.array(remove(im, session=sess))[:, :, 3]
+            ys, xs = np.where(a > 40)
+            b = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())) if len(xs) > 200 else last
+            last = b or (0, 0, im.width, im.height); b = last
+            cxs.append((b[0]+b[2])/2); cys.append((b[1]+b[3])/2); cws.append(b[2]-b[0])
+        med_w = float(np.median(cws)) if cws else OUT_W*0.5
+
+        def smooth(v, k=2):
+            return [sum(v[max(0,i-k):min(len(v),i+k+1)])/len(v[max(0,i-k):min(len(v),i+k+1)]) for i in range(len(v))]
+        cxs, cys, cws = smooth(cxs), smooth(cys), smooth([max(w, med_w*0.6) for w in cws])
+
+        def plate(im):
+            s = max(OUT_W/im.width, OUT_H/im.height)
+            p = im.resize((int(im.width*s)+2, int(im.height*s)+2), Image.LANCZOS)
+            l = (p.width-OUT_W)//2; t = (p.height-OUT_H)//2
+            return p.crop((l, t, l+OUT_W, t+OUT_H)).filter(ImageFilter.GaussianBlur(34))
+
+        for i, (im, cx, cy, cw) in enumerate(zip(imgs, cxs, cys, cws)):
+            scale = (OUT_W*TARGET_W)/max(cw, 1)
+            scaled = im.resize((max(1, int(im.width*scale)), max(1, int(im.height*scale))), Image.LANCZOS)
+            canvas = plate(im)
+            canvas.paste(scaled, (int(OUT_W/2 - cx*scale), int(OUT_H*0.5 - cy*scale)))
+            canvas.save(out_dir / f"spin_{i+1:04d}.jpg", "JPEG", quality=90)
+        print(f"[3D] stabilized {len(sel)} frames into a smooth turntable")
+        return True
+    except Exception as e:
+        print(f"[3D] stabilize failed, using plain frames: {e}")
+        return False
 
 
 # ── STEP B: true 3D (Gaussian Splatting), best-effort ────────────────────────
@@ -128,15 +181,23 @@ def colmap_poses(work, images_dir, ordered):
     db = work / "database.db"
     sparse = work / "sparse"; sparse.mkdir(parents=True, exist_ok=True)
     set_status("Solving camera positions (COLMAP)", 45, spin_ready=True)
+    # Grab far more features per frame (16k vs ~8k default) — helps glossy cars /
+    # low-texture asphalt where default SIFT finds too few stable points to chain.
+    # (affine-shape/DSP are CPU-only in COLMAP and ~10x slower, so we stay on GPU.)
     _run([COLMAP, "feature_extractor", "--database_path", str(db), "--image_path", str(images_dir),
           "--ImageReader.single_camera", "1", "--ImageReader.camera_model", "OPENCV",
-          "--FeatureExtraction.use_gpu", "1"], 1800, "colmap feature_extractor")
+          "--FeatureExtraction.use_gpu", "1",
+          "--SiftExtraction.max_num_features", "16384"], 2400, "colmap feature_extractor")
     set_status("Matching frames (COLMAP)", 55, spin_ready=True)
     if ordered:
         # walkaround video frames are time-ordered -> sequential matching is far more
-        # robust + faster than exhaustive (matches neighbours along the path).
+        # robust + faster than exhaustive. Wider overlap + quadratic chaining links
+        # frames that are several steps apart (helps when the background changes fast).
         _run([COLMAP, "sequential_matcher", "--database_path", str(db),
-              "--FeatureMatching.use_gpu", "1"], 2400, "colmap sequential_matcher")
+              "--FeatureMatching.use_gpu", "1",
+              "--SequentialMatching.overlap", "20",
+              "--SequentialMatching.quadratic_overlap", "1",
+              "--FeatureMatching.guided_matching", "1"], 3600, "colmap sequential_matcher")
     else:
         _run([COLMAP, "exhaustive_matcher", "--database_path", str(db),
               "--FeatureMatching.use_gpu", "1"], 3600, "colmap exhaustive_matcher")
@@ -145,9 +206,9 @@ def colmap_poses(work, images_dir, ordered):
     try:
         _run([COLMAP, "mapper", "--database_path", str(db), "--image_path", str(images_dir),
               "--output_path", str(sparse),
-              "--Mapper.init_min_num_inliers", "50",
-              "--Mapper.abs_pose_min_num_inliers", "12",
-              "--Mapper.min_num_matches", "8",
+              "--Mapper.init_min_num_inliers", "30",
+              "--Mapper.abs_pose_min_num_inliers", "8",
+              "--Mapper.min_num_matches", "5",
               "--Mapper.multiple_models", "0"], 5400, "colmap mapper")
     except Exception:
         raise RuntimeError("scene couldn't be reconstructed — not enough camera motion/overlap")
