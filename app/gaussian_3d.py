@@ -144,7 +144,9 @@ def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=854, TARGET_W=0.80):
     except Exception as e:
         print(f"[3D] stabilize unavailable (rembg): {e}")
         return False
-    style = os.environ.get("LOTVUE_SPIN_STYLE", "studio").lower()
+    # Default to the real-lot "natural" look (Ahmad's pick); "studio" is the toggle.
+    # Both get the same stabilization + cross-set flicker normalization for consistency.
+    style = os.environ.get("LOTVUE_SPIN_STYLE", "natural").lower()
     try:
         sess = None
         for m in ("isnet-general-use", "u2net", "u2netp"):
