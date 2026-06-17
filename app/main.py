@@ -7586,6 +7586,11 @@ button:disabled{background:#9bb6d0;cursor:wait}
 .opt.sel{border-color:#2E75B6;background:#E8F1FB;color:#2E75B6}
 .styles+.hint{display:block;font-size:.8rem;color:#7A8CA0;margin-top:.4rem;font-weight:400}
 #dl a{display:inline-block;margin-left:.6rem;background:#fff;color:#2E75B6;border:1.5px solid #2E75B6;padding:.8rem 1.2rem;border-radius:10px;text-decoration:none;font-weight:700}
+.brandrow{display:flex;gap:.6rem;margin-top:.4rem}.brandrow>div{flex:1}
+.blab{display:block;font-size:.8rem;color:#7A8CA0;margin:0 0 .25rem;font-weight:600}
+button.ghost{margin-top:.6rem;width:auto;background:#fff;color:#2E75B6;border:1.5px solid #2E75B6;padding:.55rem 1rem;font-size:.92rem;font-weight:700;border-radius:10px;cursor:pointer}
+button.ghost:disabled{opacity:.6;cursor:wait}
+#brandState{font-weight:600}
 </style></head><body><div class="wrap">
 <h1>LotVue<span>360</span> — True 3D Studio</h1>
 <p class="sub">Upload a walkaround <b>video</b> OR a <b>set of photos</b>. You always get a draggable 360° spin — and it auto-upgrades to true orbit-anywhere 3D when the capture has enough motion. Runs on this workstation's GPU.</p>
@@ -7599,7 +7604,26 @@ button:disabled{background:#9bb6d0;cursor:wait}
   <label class="opt"><input type="radio" name="style" value="studio" onchange="selStyle()">Studio floor</label>
   <label class="opt"><input type="radio" name="style" value="branded" onchange="selStyle()">Branded</label>
 </div>
-<span class="hint">Real lot = your actual lot, edges softened. Studio = clean floor + shadow + reflection. Branded = your backdrop + logo (drop background.* and logo.png in storage/_brand).</span>
+<span class="hint">Real lot = your actual lot, edges softened. Studio = clean studio floor. Branded = your own backdrop + logo.</span>
+<div id="backdropPanel" style="display:none">
+  <label>Studio backdrop</label>
+  <div class="styles" id="backdrops">
+    <label class="opt sel"><input type="radio" name="backdrop" value="light" checked onchange="syncSel()">Light</label>
+    <label class="opt"><input type="radio" name="backdrop" value="white" onchange="syncSel()">White</label>
+    <label class="opt"><input type="radio" name="backdrop" value="silver" onchange="syncSel()">Silver</label>
+    <label class="opt"><input type="radio" name="backdrop" value="warm" onchange="syncSel()">Warm</label>
+    <label class="opt"><input type="radio" name="backdrop" value="blue" onchange="syncSel()">Blue</label>
+  </div>
+</div>
+<div id="brandPanel" style="display:none">
+  <label>Your branding <span id="brandState" class="hint" style="display:inline"></span></label>
+  <div class="brandrow">
+    <div><span class="blab">Backdrop image</span><input id="bgFile" type="file" accept="image/*"></div>
+    <div><span class="blab">Logo (PNG, transparent)</span><input id="logoFile" type="file" accept="image/*"></div>
+  </div>
+  <button id="saveBrand" type="button" class="ghost" onclick="saveBrand()">Save branding</button>
+  <span class="hint">Your backdrop replaces the studio floor; your logo sits bottom-right. Saved once, reused for every Branded spin.</span>
+</div>
 <button id="go" onclick="go()">Create 360 / 3D</button>
 <div class="bar" id="bar"><div id="prog"></div></div>
 <div id="status"></div>
@@ -7607,10 +7631,42 @@ button:disabled{background:#9bb6d0;cursor:wait}
 <div class="tips"><b>You'll always get a 360° spin.</b> For full <b>orbit-anywhere 3D</b>: capture a slow, complete circle around the car — a 20–40s video, or 30+ overlapping photos — keep the whole car + some ground in frame, move smoothly, even lighting. ~5–15 min on the GPU.</div>
 </div><script>
 let vin='';
-function selStyle(){
+function syncSel(){
   document.querySelectorAll('.opt').forEach(function(o){
     o.classList.toggle('sel', o.querySelector('input').checked);
   });
+}
+function selStyle(){
+  syncSel();
+  var s=(document.querySelector('input[name=style]:checked')||{}).value||'natural';
+  document.getElementById('backdropPanel').style.display=(s==='studio')?'block':'none';
+  document.getElementById('brandPanel').style.display=(s==='branded')?'block':'none';
+  if(s==='branded'){ loadBrandState(); }
+}
+async function loadBrandState(){
+  try{
+    const r=await fetch('/api/brand/assets',{credentials:'same-origin'});
+    if(!r.ok) return;
+    const j=await r.json();
+    const parts=[]; if(j.background) parts.push('backdrop ✓'); if(j.logo) parts.push('logo ✓');
+    document.getElementById('brandState').textContent = parts.length ? ('— saved: '+parts.join(', ')) : '— none saved yet';
+  }catch(e){}
+}
+async function saveBrand(){
+  const bg=document.getElementById('bgFile').files[0];
+  const lg=document.getElementById('logoFile').files[0];
+  if(!bg && !lg){ alert('Choose a backdrop image and/or a logo'); return; }
+  const fd=new FormData();
+  if(bg) fd.append('background', bg);
+  if(lg) fd.append('logo', lg);
+  const btn=document.getElementById('saveBrand'); btn.disabled=true; btn.textContent='Saving…';
+  try{
+    const r=await fetch('/api/brand/assets',{method:'POST',body:fd,credentials:'same-origin'});
+    const j=await r.json().catch(function(){return {}});
+    if(r.ok){ btn.textContent='Saved ✓'; loadBrandState(); }
+    else { alert(j.detail||('Save failed — HTTP '+r.status)); btn.textContent='Save branding'; }
+  }catch(e){ alert('Error: '+e); btn.textContent='Save branding'; }
+  btn.disabled=false;
 }
 async function go(){
   const files=document.getElementById('vid').files;
@@ -7620,8 +7676,10 @@ async function go(){
   const vids=[...files].filter(f=>f.type.indexOf('video/')===0);
   const imgs=[...files].filter(f=>f.type.indexOf('image/')===0);
   const style=(document.querySelector('input[name=style]:checked')||{}).value||'natural';
+  const backdrop=(document.querySelector('input[name=backdrop]:checked')||{}).value||'light';
   const fd=new FormData();
   fd.append('style', style);
+  fd.append('backdrop', backdrop);
   if(imgs.length>=4){ imgs.forEach(f=>fd.append('photos',f)); }
   else if(vids.length){ fd.append('video',vids[0]); }
   else { alert('Upload one video, or at least 4 photos'); return; }
@@ -7694,7 +7752,8 @@ async def vehicle_3d_status(vin: str):
 async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
                       photos: Optional[List[UploadFile]] = File(None),
                       steps: str = Form("7000"),
-                      style: str = Form("natural")):
+                      style: str = Form("natural"),
+                      backdrop: str = Form("light")):
     # Accept any vehicle ID (real VIN or freeform) — sanitize to a safe folder name.
     vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
     if not vin:
@@ -7702,6 +7761,9 @@ async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
     style = (style or "natural").strip().lower()
     if style not in ("natural", "studio", "branded"):
         style = "natural"
+    backdrop = (backdrop or "light").strip().lower()
+    if backdrop not in ("light", "white", "silver", "warm", "blue"):
+        backdrop = "light"
     vdir = STORAGE_DIR / vin
     (vdir / "splat").mkdir(parents=True, exist_ok=True)
     try:
@@ -7746,10 +7808,76 @@ async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
         json.dumps({"status": "running", "step": "queued", "progress": 1, "vin": vin}), encoding="utf-8")
     subprocess.Popen(
         [sys.executable, str(BASE_DIR / "gaussian_3d.py"), "--vin", vin, *mode_args,
-         "--steps", str(steps_i), "--style", style],
+         "--steps", str(steps_i), "--style", style, "--backdrop", backdrop],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(BASE_DIR))
-    return {"status": "started", "vin": vin, "style": style,
+    return {"status": "started", "vin": vin, "style": style, "backdrop": backdrop,
             "status_url": f"/api/vehicle/{vin}/3d-status", "viewer": f"/splat3d/{vin}"}
+
+
+# ── Dealer branding assets (for the "branded" turntable style) ───────────────
+@app.get("/api/brand/assets")
+async def brand_assets_status():
+    """Report which dealer-branding assets are currently on disk (for the studio UI)."""
+    bdir = STORAGE_DIR / "_brand"
+    bg = None
+    for n in ("background.jpg", "background.jpeg", "background.png"):
+        if (bdir / n).exists():
+            bg = f"/storage/_brand/{n}"; break
+    logo = "/storage/_brand/logo.png" if (bdir / "logo.png").exists() else None
+    return {"background": bg, "logo": logo}
+
+
+@app.post("/api/brand/assets")
+async def brand_assets_upload(background: Optional[UploadFile] = File(None),
+                              logo: Optional[UploadFile] = File(None)):
+    """Save the dealer's backdrop and/or logo used by the 'branded' turntable style.
+    Background is normalized to a JPG; logo keeps transparency as PNG."""
+    bdir = STORAGE_DIR / "_brand"
+    bdir.mkdir(parents=True, exist_ok=True)
+    saved = {}
+    if background is not None and getattr(background, "filename", ""):
+        data = await background.read()
+        if len(data) > MAX_PHOTO_MB * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"Background too large (max {MAX_PHOTO_MB}MB)")
+        try:
+            img = Image.open(io.BytesIO(data)).convert("RGB")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Background isn't a readable image")
+        for n in ("background.jpg", "background.jpeg", "background.png"):
+            (bdir / n).unlink(missing_ok=True)        # drop stale variants
+        img.save(bdir / "background.jpg", "JPEG", quality=92)
+        saved["background"] = "/storage/_brand/background.jpg"
+    if logo is not None and getattr(logo, "filename", ""):
+        data = await logo.read()
+        if len(data) > MAX_PHOTO_MB * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"Logo too large (max {MAX_PHOTO_MB}MB)")
+        try:
+            img = Image.open(io.BytesIO(data)).convert("RGBA")   # keep transparency
+        except Exception:
+            raise HTTPException(status_code=400, detail="Logo isn't a readable image")
+        img.save(bdir / "logo.png", "PNG")
+        saved["logo"] = "/storage/_brand/logo.png"
+    if not saved:
+        raise HTTPException(status_code=400, detail="Upload a background and/or a logo image")
+    return {"status": "ok", "saved": saved}
+
+
+@app.post("/api/brand/clear")
+async def brand_assets_clear(target: str = Form("all")):
+    """Remove dealer-branding assets (target = all | background | logo)."""
+    bdir = STORAGE_DIR / "_brand"
+    targets = ("background", "logo") if target == "all" else (target,)
+    removed = []
+    if "background" in targets:
+        for n in ("background.jpg", "background.jpeg", "background.png"):
+            p = bdir / n
+            if p.exists():
+                p.unlink(); removed.append(n)
+    if "logo" in targets:
+        p = bdir / "logo.png"
+        if p.exists():
+            p.unlink(); removed.append("logo.png")
+    return {"status": "ok", "removed": removed}
 
 
 # =============================================================================

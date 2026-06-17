@@ -95,7 +95,7 @@ def copy_photos(src_dir, out_dir):
 
 
 # ── STEP A: the always-on 360 spin (works from ANY input) ────────────────────
-def build_spin(frames, vin, target=72, style=None):
+def build_spin(frames, vin, target=72, style=None, backdrop=None):
     from PIL import Image, ImageOps
     spin_dir = STORAGE_DIR / vin / "spin"
     spin_dir.mkdir(parents=True, exist_ok=True)
@@ -112,7 +112,7 @@ def build_spin(frames, vin, target=72, style=None):
         sel = frames
     # STABILIZE into a smooth GLO3D-style turntable: lock the car centered at a
     # constant size so it rotates in place (raw handheld frames jitter/drift).
-    if _stabilize_frames(sel, spin_dir, style=style):
+    if _stabilize_frames(sel, spin_dir, style=style, backdrop=backdrop):
         cnt = len(list(spin_dir.glob("spin_*.jpg")))
     else:
         # fallback (no rembg, e.g. the light bundle): plain normalized frames
@@ -151,7 +151,7 @@ def export_mp4(vin):
         return None
 
 
-def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=854, TARGET_W=0.80, style=None):
+def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=854, TARGET_W=0.80, style=None, backdrop=None):
     """Turn raw walkaround frames into a GLO3D-grade turntable. Per frame: segment the
     car (rembg), lock it centered at constant size, then composite per style —
       natural : keep the real lot, softly blurred at the edges (Ahmad's default);
@@ -201,8 +201,21 @@ def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=854, TARGET_W=0.80, style=
             return [sum(v[max(0,i-k):min(len(v),i+k+1)])/len(v[max(0,i-k):min(len(v),i+k+1)]) for i in range(len(v))]
         cxs, cys, cws = smooth(cxs), smooth(cys), smooth([max(w, med_w*0.6) for w in cws])
 
+        # studio backdrop presets (procedural top->bottom gradients — no assets to download).
+        # All keep a darker floor band so the grounding shadow + reflection always read.
+        BACKDROPS = {
+            "light":  ((249, 250, 252), (210, 215, 222)),   # default cool-light
+            "white":  ((255, 255, 255), (238, 240, 243)),   # bright catalog
+            "silver": ((228, 230, 234), (176, 180, 188)),   # neutral mid-gray studio
+            "warm":   ((250, 247, 240), (225, 216, 201)),   # warm cream
+            "blue":   ((234, 241, 250), (186, 205, 228)),   # cool showroom
+        }
+        bd = (backdrop or "light").lower()
+        if bd not in BACKDROPS:
+            bd = "light"
+
         def studio_bg():
-            top = np.array([249, 250, 252], np.float32); bot = np.array([210, 215, 222], np.float32)
+            top = np.array(BACKDROPS[bd][0], np.float32); bot = np.array(BACKDROPS[bd][1], np.float32)
             g = np.linspace(0, 1, OUT_H)[:, None, None]
             arr = np.repeat((top*(1-g)+bot*g).astype(np.uint8), OUT_W, axis=1)
             return Image.fromarray(arr, "RGB").convert("RGBA")
@@ -377,7 +390,8 @@ def run(args):
 
     # STEP A — always deliver a 360 spin (works from anything)
     set_status("Building 360 spin", 25)
-    nspin = build_spin(frames, _VIN, style=(getattr(args, "style", "") or None))
+    nspin = build_spin(frames, _VIN, style=(getattr(args, "style", "") or None),
+                       backdrop=(getattr(args, "backdrop", "") or None))
     _STATE["spin_ready"] = nspin > 0
     _STATE["spin_frames"] = nspin
     _STATE["spin_url"] = f"/storage/{_VIN}/spin/"
@@ -417,5 +431,6 @@ if __name__ == "__main__":
     ap.add_argument("--steps", type=int, default=7000)
     ap.add_argument("--max-frames", type=int, default=150)
     ap.add_argument("--style", default="", help="natural | studio | branded (else env default)")
+    ap.add_argument("--backdrop", default="", help="light|white|silver|warm|blue (studio backdrop)")
     a = ap.parse_args()
     sys.exit(0 if run(a) else 1)
