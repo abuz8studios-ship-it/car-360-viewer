@@ -512,6 +512,18 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pano_hotspots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vin TEXT NOT NULL,
+            pano_file TEXT DEFAULT '',
+            yaw REAL DEFAULT 0,
+            pitch REAL DEFAULT 0,
+            label TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
     # Phase 2A + 2B: Add new columns to vehicles table if not present
     for col_def in [
         "job_id TEXT DEFAULT ''",
@@ -3665,10 +3677,10 @@ async def upload_panorama(
     photo: UploadFile = File(...)
 ):
     """Upload an equirectangular interior panorama for Pannellum viewer."""
-    if not vin or len(vin) < 5:
-        import uuid
-        vin = str(uuid.uuid4())[:17].upper().replace("-", "0")
-    vin = validate_vin(vin)
+    # Accept any vehicle ID (matches /3d-studio + /interior-studio); sanitize to a safe folder.
+    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
+    if not vin:
+        raise HTTPException(status_code=400, detail="Provide a vehicle VIN or ID")
     vehicle_dir = STORAGE_DIR / vin
     pano_dir = vehicle_dir / "panoramas"
     pano_dir.mkdir(parents=True, exist_ok=True)
@@ -3682,10 +3694,20 @@ async def upload_panorama(
 
     try:
         img = Image.open(io.BytesIO(raw)).convert("RGB")
-        # Validate 2:1 aspect ratio (equirectangular requirement)
+        # Equirectangular needs a 2:1 width:height ratio. If the upload isn't ~2:1,
+        # pad the short side with neutral gray so Pannellum maps it without stretch
+        # (a too-wide phone pano gets top/bottom bands; a too-tall one gets side bands).
         w, h = img.size
-        if w > 4096:
-            img = img.resize((4096, int(4096 * h / w)), Image.LANCZOS)
+        if abs((w / max(h, 1)) - 2.0) > 0.10:
+            if w >= 2 * h:                       # too wide -> add top/bottom bands
+                nh = max(w // 2, 1); canvas = Image.new("RGB", (w, nh), (32, 34, 38))
+                canvas.paste(img, (0, (nh - h) // 2))
+            else:                                # too tall/narrow -> add left/right bands
+                nw = max(2 * h, 1); canvas = Image.new("RGB", (nw, h), (32, 34, 38))
+                canvas.paste(img, ((nw - w) // 2, 0))
+            img = canvas; w, h = img.size
+        if w > 4096:                             # cap; image is now exactly 2:1
+            img = img.resize((4096, 2048), Image.LANCZOS)
         img.save(pano_path, "JPEG", quality=92)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
@@ -3955,6 +3977,56 @@ async def delete_hotspot(hotspot_id: int):
     return {"status": "ok"}
 
 
+# ── Interior-panorama hotspots (Pannellum yaw/pitch feature pins) ─────────────
+@app.post("/api/pano-hotspot")
+async def add_pano_hotspot(vin: str = Form(...), pano_file: str = Form(""),
+                           yaw: str = Form("0"), pitch: str = Form("0"),
+                           label: str = Form(...), description: str = Form("")):
+    """Add a tappable feature pin to an interior 360 (stored as yaw/pitch). Gated (dealer)."""
+    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
+    # strip angle brackets so a label can never inject HTML on the public buyer page
+    # (defense-in-depth; the Pannellum viewers also run with escapeHTML:true)
+    label = (label or "").replace("<", "").replace(">", "").strip()[:80]
+    description = (description or "").replace("<", "").replace(">", "").strip()[:500]
+    if not vin or not label:
+        raise HTTPException(status_code=400, detail="vin and label are required")
+    try:
+        y = max(-180.0, min(180.0, float(yaw))); p = max(-90.0, min(90.0, float(pitch)))
+    except ValueError:
+        y, p = 0.0, 0.0
+    pano_file = re.sub(r"[^A-Za-z0-9_.-]", "", pano_file or "")[:64]
+    conn = sqlite3.connect(str(DB_PATH))
+    cur = conn.execute(
+        "INSERT INTO pano_hotspots (vin, pano_file, yaw, pitch, label, description, created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (vin, pano_file, y, p, label, description, datetime.now().isoformat()))
+    conn.commit(); hid = cur.lastrowid; conn.close()
+    return {"status": "ok", "id": hid}
+
+
+@app.get("/api/pano-hotspots/{vin}")
+async def get_pano_hotspots(vin: str):
+    """List interior-pano hotspots (public read — the buyer viewer renders them)."""
+    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
+    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, pano_file, yaw, pitch, label, description FROM pano_hotspots WHERE vin=? ORDER BY id",
+        (vin,)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "pano_file": r["pano_file"], "yaw": r["yaw"], "pitch": r["pitch"],
+             "label": r["label"], "description": r["description"]} for r in rows]
+
+
+@app.delete("/api/pano-hotspot/{hotspot_id}")
+async def delete_pano_hotspot(hotspot_id: int):
+    """Delete an interior-pano hotspot. Gated (dealer)."""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("DELETE FROM pano_hotspots WHERE id = ?", (hotspot_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+
 # =============================================================================
 # ROUTES — TAGGING PAGE
 # =============================================================================
@@ -4201,7 +4273,7 @@ async def view_vehicle(vin: str, request: Request):
         _cb = int(_time.time())
         ext_urls_js = _json.dumps([f"{frame_path_prefix}/{f}?v={_cb}" for f in ext_frames])
         int_urls_js = _json.dumps([f"/storage/{vin}/interior/{f}" for f in int_photos])
-        pano_urls_js = _json.dumps([{"src": f"/storage/{vin}/panoramas/{f}", "name": f"Scene {i+1}"} for i, f in enumerate(pano_files)])
+        pano_urls_js = _json.dumps([{"src": f"/storage/{vin}/panoramas/{f}", "name": f"Scene {i+1}", "file": f} for i, f in enumerate(pano_files)])
         gallery_urls_js = _json.dumps([f"{gallery_prefix}/{f}" for f in gallery_files])
 
         # ── Tab visibility ───────────────────────────────────────────────────
@@ -4315,6 +4387,10 @@ body{{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif
 /* ── Interior panorama ────────────────────────────────────────────────── */
 #pano-container{{width:100%;height:480px;position:relative;}}
 .pano-scene-selector{{position:absolute;top:0.75rem;left:0.75rem;z-index:100;background:rgba(10,22,40,0.85);border:1px solid #1a2e50;color:#f5f0e8;padding:0.4rem 0.7rem;border-radius:6px;font-size:0.8rem;cursor:pointer;}}
+.pano-hs-card{{display:none;position:fixed;left:50%;bottom:2rem;transform:translateX(-50%);z-index:9999;background:#0f2040;color:#f5f0e8;border:1px solid #1a2e50;border-radius:12px;padding:1rem 2.4rem 1rem 1.2rem;max-width:340px;box-shadow:0 10px 30px rgba(0,0,0,0.45);}}
+.pano-hs-card h4{{margin:0 0 0.3rem;color:#C8A55C;font-size:1rem;}}
+.pano-hs-card p{{margin:0;font-size:0.86rem;line-height:1.45;color:#cdd9ea;}}
+.pano-hs-x{{position:absolute;top:0.5rem;right:0.75rem;cursor:pointer;font-size:1.3rem;line-height:1;color:#8b9bb4;}}
 .int-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:0.5rem;padding:0.75rem;max-height:480px;overflow-y:auto;}}
 .int-thumb{{aspect-ratio:16/10;border-radius:6px;overflow:hidden;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s;}}
 .int-thumb:hover{{border-color:#c9a84c;}}
@@ -4809,15 +4885,31 @@ function updateStripHighlight(idx) {{
 
 // ── Interior tab ────────────────────────────────────────────────────────────
 let panoViewer = null, panoInited = false;
-function initInterior() {{
+function showPanoHotspot(evt, args) {{
+  // GLO3D-style feature card when a buyer taps an interior pin
+  let c = document.getElementById('panoHsCard');
+  if (!c) {{ c = document.createElement('div'); c.id = 'panoHsCard'; c.className = 'pano-hs-card'; document.body.appendChild(c); }}
+  c.textContent = '';
+  const x = document.createElement('span'); x.className = 'pano-hs-x'; x.textContent = '×';
+  x.onclick = function() {{ c.style.display = 'none'; }};
+  const h = document.createElement('h4'); h.textContent = (args && args.label) || '';
+  const p = document.createElement('p'); p.textContent = (args && args.description) || '';
+  c.appendChild(x); c.appendChild(h); c.appendChild(p);
+  c.style.display = 'block';
+}}
+async function initInterior() {{
   if (panoInited) return;
   panoInited = true;
   if (PANO_URLS.length > 0) {{
     // Equirectangular panorama with Pannellum
     document.getElementById('pano-container').style.display = 'block';
     document.getElementById('intGrid').style.display = 'none';
+    // feature pins (yaw/pitch) — best-effort; pano still renders if this fails
+    let _hs = [];
+    try {{ const r = await fetch('/api/pano-hotspots/{vin}'); if (r.ok) _hs = await r.json(); }} catch (e) {{}}
     const scenes = {{}};
     PANO_URLS.forEach((p, i) => {{
+      const mine = _hs.filter(h => !h.pano_file || h.pano_file === p.file);
       scenes['scene' + i] = {{
         type: 'equirectangular',
         panorama: p.src,
@@ -4825,10 +4917,16 @@ function initInterior() {{
         autoLoad: i === 0,
         hfov: 120,
         minHfov: 50,
-        maxHfov: 150
+        maxHfov: 150,
+        hotSpots: mine.map(h => ({{
+          pitch: h.pitch, yaw: h.yaw, type: 'info', text: h.label,
+          clickHandlerFunc: showPanoHotspot,
+          clickHandlerArgs: {{ label: h.label, description: h.description }}
+        }}))
       }};
     }});
     panoViewer = pannellum.viewer('pano-container', {{
+      escapeHTML: true,
       default: {{ firstScene: 'scene0', sceneFadeDuration: 1000, autoLoad: true }},
       scenes: scenes
     }});
@@ -5063,6 +5161,9 @@ function trackEvent(event_type, data={{}}) {{
 // ── Init ─────────────────────────────────────────────────────────────────────
 initSpin();
 trackEvent('viewer_open', {{vin: VIN}});
+// deep-link: open the Interior tab when arriving with #interior (e.g. from the turntable viewer)
+(function(){{ const ib=document.getElementById('tab-interior');
+  if(location.hash==='#interior' && ib && !ib.classList.contains('hidden')){{ switchTab('interior'); }} }})();
 
 // ── Background Selector ─────────────────────────────────────────────────────
 let activeBgSlug = '{vehicle.get("background_id", "") or ""}';
@@ -7628,9 +7729,18 @@ button.ghost:disabled{opacity:.6;cursor:wait}
 <div class="bar" id="bar"><div id="prog"></div></div>
 <div id="status"></div>
 <div id="view"><a id="vlink" href="#" target="_blank">🔄 Open Interactive 3D</a><span id="dl" style="display:none"><a href="#" download>⬇ Download MP4</a></span></div>
+<div style="margin-top:1.2rem;padding-top:1rem;border-top:1px solid #E3EAF2">
+  <button type="button" class="ghost" onclick="goInterior()">🛋 Interior 360 + hotspots →</button>
+  <span class="hint" style="display:block;margin-top:.4rem">Add a tappable interior 360 for this vehicle (separate from the exterior turntable).</span>
+</div>
 <div class="tips"><b>You'll always get a 360° spin.</b> For full <b>orbit-anywhere 3D</b>: capture a slow, complete circle around the car — a 20–40s video, or 30+ overlapping photos — keep the whole car + some ground in frame, move smoothly, even lighting. ~5–15 min on the GPU.</div>
 </div><script>
 let vin='';
+function goInterior(){
+  const v=(document.getElementById('vin').value||'').trim();
+  if(!v){ alert('Enter the VIN/ID first'); return; }
+  location.href='/interior-studio/'+encodeURIComponent(v);
+}
 function syncSel(){
   document.querySelectorAll('.opt').forEach(function(o){
     o.classList.toggle('sel', o.querySelector('input').checked);
@@ -7878,6 +7988,173 @@ async def brand_assets_clear(target: str = Form("all")):
         if p.exists():
             p.unlink(); removed.append("logo.png")
     return {"status": "ok", "removed": removed}
+
+
+# ── Interior 360 studio (dealer): upload interior pano + place feature hotspots ──
+_INTERIOR_STUDIO_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LotVue360 — Interior 360 Studio</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.css"/>
+<script src="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,'Segoe UI',Roboto,sans-serif}
+body{background:#F8FAFC;color:#2C3E50;padding:1.5rem 1rem}
+.wrap{max-width:900px;margin:0 auto;background:#fff;border:1px solid #E3EAF2;border-radius:16px;padding:1.6rem}
+h1{font-size:1.4rem;color:#2E75B6}h1 span{color:#C8A55C}
+p.sub{color:#7A8CA0;margin:.3rem 0 1.2rem;font-size:.92rem}
+label{display:block;font-weight:600;margin:.8rem 0 .35rem;font-size:.92rem}
+input[type=text],input[type=file]{width:100%;padding:.6rem;border:1.5px solid #DDE5EE;border-radius:10px;font-size:.95rem}
+button{background:#2E75B6;color:#fff;border:0;padding:.7rem 1.1rem;border-radius:10px;font-size:.95rem;font-weight:700;cursor:pointer}
+button:disabled{background:#9bb6d0;cursor:wait}
+button.ghost{background:#fff;color:#2E75B6;border:1.5px solid #2E75B6}
+button.gold{background:#C8A55C}
+.row{display:flex;gap:.6rem;align-items:flex-end;flex-wrap:wrap}
+.row>div{flex:1;min-width:160px}
+#pano{width:100%;height:460px;border-radius:12px;overflow:hidden;background:#0f2040;margin-top:1rem;display:none}
+.bar{display:flex;gap:.6rem;align-items:center;margin-top:.8rem;flex-wrap:wrap}
+.hint{font-size:.82rem;color:#7A8CA0}
+.addform{display:none;margin-top:.8rem;padding:1rem;border:1.5px dashed #C8A55C;border-radius:12px;background:#FFFDF7}
+.pins{margin-top:1rem}
+.pin{display:flex;align-items:center;gap:.6rem;padding:.55rem .7rem;border:1px solid #E3EAF2;border-radius:10px;margin-bottom:.5rem}
+.pin b{color:#2E75B6}.pin .d{color:#7A8CA0;font-size:.85rem;flex:1}
+.pin button{background:#fff;color:#c0392b;border:1.5px solid #c0392b;padding:.35rem .7rem;font-size:.8rem}
+.empty{color:#7A8CA0;padding:1rem;text-align:center}
+a.preview{display:inline-block;margin-left:auto;color:#2E75B6;font-weight:700;text-decoration:none}
+.addmode{outline:3px solid #C8A55C;outline-offset:-3px}
+</style></head><body><div class="wrap">
+<h1>LotVue<span>360</span> — Interior 360 Studio</h1>
+<p class="sub">Upload an <b>equirectangular</b> interior 360 (from a 360 camera or a phone pano app), then click on it to drop <b>feature hotspots</b> buyers can tap — just like GLO3D/CloudPano. VIN: <b id="vinlabel"></b></p>
+
+<div id="uploadBox">
+  <div class="row">
+    <div><label>Interior 360 photo (equirectangular, ~2:1)</label><input id="panoFile" type="file" accept="image/*"></div>
+    <div style="flex:0 0 200px"><label>Scene name</label><input id="sceneName" type="text" value="Front Seat"></div>
+    <div style="flex:0 0 auto"><button id="upBtn" onclick="uploadPano()">Upload interior 360</button></div>
+  </div>
+  <p class="hint" style="margin-top:.4rem">Tip: a 360 camera (Insta360/Ricoh Theta) or the Google Street View app exports a proper equirectangular photo. Non-2:1 images are auto-padded.</p>
+</div>
+
+<div id="pano"></div>
+<div class="bar" id="editbar" style="display:none">
+  <button id="addBtn" class="gold" onclick="toggleAdd()">＋ Add hotspot</button>
+  <select id="sceneSel" onchange="switchScene()" style="display:none;padding:.5rem;border-radius:8px;border:1.5px solid #DDE5EE"></select>
+  <span class="hint" id="addHint"></span>
+  <a class="preview" id="previewLink" target="_blank">Preview on buyer page →</a>
+</div>
+
+<div class="addform" id="addform">
+  <label>Feature label (e.g. "Heated leather seats")</label>
+  <input id="hsLabel" type="text" placeholder="Short feature name">
+  <label>Description (optional)</label>
+  <input id="hsDesc" type="text" placeholder="A sentence buyers see when they tap the pin">
+  <div class="bar"><button class="gold" onclick="saveHotspot()">Save hotspot</button><button class="ghost" onclick="cancelAdd()">Cancel</button></div>
+</div>
+
+<div class="pins" id="pins"></div>
+</div>
+<script>
+const VIN="__VIN__", PANOS=__PANOS__;
+let viewer=null, addMode=false, curFile=(PANOS[0]||{}).file||'', curPinIds=[], pendingPitch=0, pendingYaw=0, downX=0, downY=0;
+document.getElementById('vinlabel').textContent=VIN;
+document.getElementById('previewLink').href='/view/'+VIN;
+
+function mountViewer(){
+  if(!PANOS.length){ return; }
+  document.getElementById('pano').style.display='block';
+  document.getElementById('editbar').style.display='flex';
+  const scenes={};
+  PANOS.forEach((p,i)=>{ scenes['s'+i]={type:'equirectangular',panorama:p.src,title:p.name,autoLoad:i===0,hfov:110}; });
+  viewer=pannellum.viewer('pano',{escapeHTML:true,default:{firstScene:'s0',autoLoad:true},scenes:scenes});
+  if(PANOS.length>1){
+    const sel=document.getElementById('sceneSel'); sel.style.display='inline-block';
+    PANOS.forEach((p,i)=>{ const o=document.createElement('option'); o.value='s'+i; o.textContent=p.name; sel.appendChild(o); });
+  }
+  viewer.on('load', loadPins);
+  const panoEl=document.getElementById('pano');
+  panoEl.addEventListener('mousedown', function(e){ downX=e.clientX; downY=e.clientY; });
+  panoEl.addEventListener('click', function(e){
+    if(!addMode) return;
+    if(Math.hypot(e.clientX-downX, e.clientY-downY)>5) return;   // a look-around drag, not a placement tap
+    try{ const c=viewer.mouseEventToCoords(e); pendingPitch=c[0]; pendingYaw=c[1]; openAddForm(); }catch(err){}
+  });
+}
+function switchScene(){
+  const v=document.getElementById('sceneSel').value; const idx=parseInt(v.slice(1));
+  curFile=(PANOS[idx]||{}).file||''; viewer.loadScene(v);
+}
+async function loadPins(){
+  curPinIds.forEach(id=>{ try{viewer.removeHotSpot(id);}catch(e){} }); curPinIds=[];
+  let all=[]; try{ all=await (await fetch('/api/pano-hotspots/'+VIN)).json(); }catch(e){}
+  all.filter(h=>!h.pano_file||h.pano_file===curFile).forEach(h=>{
+    const hid='pin'+h.id;
+    try{ viewer.addHotSpot({id:hid,pitch:h.pitch,yaw:h.yaw,type:'info',text:h.label}); curPinIds.push(hid); }catch(e){}
+  });
+  renderList(all);
+}
+function renderList(all){
+  const box=document.getElementById('pins'); box.textContent='';
+  if(!all.length){ box.innerHTML='<div class="empty">No hotspots yet. Click ＋ Add hotspot, then click a spot on the 360.</div>'; return; }
+  all.forEach(h=>{
+    const d=document.createElement('div'); d.className='pin';
+    const b=document.createElement('b'); b.textContent=h.label;
+    const s=document.createElement('span'); s.className='d'; s.textContent=h.description||'';
+    const x=document.createElement('button'); x.textContent='Delete'; x.onclick=function(){ delHotspot(h.id); };
+    d.appendChild(b); d.appendChild(s); d.appendChild(x); box.appendChild(d);
+  });
+}
+function toggleAdd(){
+  addMode=!addMode;
+  document.getElementById('pano').classList.toggle('addmode', addMode);
+  document.getElementById('addBtn').textContent = addMode ? '✓ Click a spot on the 360…' : '＋ Add hotspot';
+  document.getElementById('addHint').textContent = addMode ? 'Click the feature on the panorama to place a pin.' : '';
+  if(!addMode) cancelAdd();
+}
+function openAddForm(){ document.getElementById('addform').style.display='block'; document.getElementById('hsLabel').focus(); }
+function cancelAdd(){ document.getElementById('addform').style.display='none'; document.getElementById('hsLabel').value=''; document.getElementById('hsDesc').value=''; }
+async function saveHotspot(){
+  const label=document.getElementById('hsLabel').value.trim();
+  if(!label){ alert('Enter a feature label'); return; }
+  const fd=new FormData();
+  fd.append('vin',VIN); fd.append('pano_file',curFile);
+  fd.append('yaw',pendingYaw); fd.append('pitch',pendingPitch);
+  fd.append('label',label); fd.append('description',document.getElementById('hsDesc').value.trim());
+  const r=await fetch('/api/pano-hotspot',{method:'POST',body:fd,credentials:'same-origin'});
+  if(r.ok){ cancelAdd(); toggleAdd(); loadPins(); } else { alert('Save failed — are you signed in?'); }
+}
+async function delHotspot(id){
+  if(!confirm('Delete this hotspot?')) return;
+  await fetch('/api/pano-hotspot/'+id,{method:'DELETE',credentials:'same-origin'});
+  loadPins();
+}
+async function uploadPano(){
+  const f=document.getElementById('panoFile').files[0];
+  if(!f){ alert('Choose an interior 360 photo'); return; }
+  const fd=new FormData();
+  fd.append('vin',VIN); fd.append('scene_name',document.getElementById('sceneName').value||'Interior'); fd.append('photo',f);
+  const btn=document.getElementById('upBtn'); btn.disabled=true; btn.textContent='Uploading…';
+  try{
+    const r=await fetch('/api/upload/panorama',{method:'POST',body:fd,credentials:'same-origin'});
+    if(r.ok){ location.reload(); } else { const j=await r.json().catch(()=>({})); alert(j.detail||'Upload failed'); btn.disabled=false; btn.textContent='Upload interior 360'; }
+  }catch(e){ alert('Error: '+e); btn.disabled=false; btn.textContent='Upload interior 360'; }
+}
+mountViewer();
+if(!PANOS.length){ document.getElementById('pins').innerHTML='<div class="empty">Upload an interior 360 above to start placing hotspots.</div>'; }
+</script></body></html>"""
+
+
+@app.get("/interior-studio/{vin}")
+async def interior_studio_page(vin: str):
+    from fastapi.responses import HTMLResponse
+    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
+    pano_dir = STORAGE_DIR / vin / "panoramas"
+    pano_files = sorted([f.name for f in pano_dir.glob("*.jpg")] +
+                        [f.name for f in pano_dir.glob("*.jpeg")] +
+                        [f.name for f in pano_dir.glob("*.png")]) if pano_dir.exists() else []
+    import json as _json
+    panos_js = _json.dumps([{"src": f"/storage/{vin}/panoramas/{f}", "file": f, "name": f"Scene {i+1}"}
+                            for i, f in enumerate(pano_files)])
+    html = _INTERIOR_STUDIO_HTML.replace("__VIN__", vin).replace("__PANOS__", panos_js)
+    return HTMLResponse(html)
 
 
 # =============================================================================

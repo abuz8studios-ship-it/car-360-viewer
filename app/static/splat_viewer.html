@@ -24,6 +24,7 @@
 <body>
 <div id="hud">LotVue<span>360</span></div>
 <div id="badge">360°</div>
+<a id="interiorBtn" href="#" style="position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:10;display:none;color:#fff;font-size:.78rem;font-weight:700;padding:7px 14px;border-radius:20px;background:#C8A55C;text-decoration:none;">🛋 Interior 360</a>
 <div id="loader"><div id="lmsg">Loading…</div><div class="bar"><div id="prog"></div></div></div>
 <div id="err"><div><h2>Not ready yet</h2><p id="errmsg" style="color:#8b949e;margin-top:.5rem"></p></div></div>
 <div class="hint" id="hint">Drag to rotate</div>
@@ -46,6 +47,10 @@ async function exists(url){ try{ const r=await fetch(url,{method:'HEAD'}); retur
 async function init(){
   if (src) { return loadSplat(src); }                       // explicit splat
   if (!vin) { return showError('No vehicle specified.'); }
+  // surface an Interior 360 button if this vehicle has an interior panorama
+  exists(`/storage/${vin}/panoramas/pano_001.jpg`).then(ok=>{
+    if(ok){ const b=document.getElementById('interiorBtn'); b.href='/view/'+vin+'#interior'; b.style.display='inline-block'; }
+  });
   lmsg.textContent = 'Loading…';
   const plyUrl = `/storage/${vin}/splat/scene.ply`;
   if (await exists(plyUrl)) { return loadSplat(plyUrl); }    // true 3D available

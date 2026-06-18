@@ -40,6 +40,7 @@ PUBLIC_PREFIXES = (
 # Prefix-match public for GET ONLY (read-only viewer data; writes stay gated)
 PUBLIC_GET_PREFIXES = (
     "/api/hotspots/",            # viewer hotspot overlay (read)
+    "/api/pano-hotspots/",       # interior-360 feature pins (read)
     "/api/backgrounds",          # viewer background thumbnails (read)
 )
 
