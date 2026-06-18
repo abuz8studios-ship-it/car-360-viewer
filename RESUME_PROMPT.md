@@ -124,8 +124,8 @@ rely on true volumetric 3D for everyday inventory; the *stabilized turntable* is
 1. ✅ **DONE (HEAD 01697a3)** — **Per-car style picker in `/3d-studio`**: radio *Real lot / Studio floor / Branded*; flows UI → generate-3d (allowlist-validated) → engine `--style`. Per-call beats env LOTVUE_SPIN_STYLE beats natural.
 2. ✅ **DONE (HEAD 01697a3)** — **Auto-MP4 export**: `export_mp4()` makes a web-friendly ~6s looping H.264 (faststart) at `storage/{vin}/spin/spin.mp4`, surfaced as status `spin_mp4` + a "Download MP4" button.
 3. ✅ **DONE (HEAD 064e3e2)** — **Branded assets + backdrop picker**: 5 studio backdrop presets (light/white/silver/warm/blue) selectable per car; branding **upload UI** (GET/POST/clear `/api/brand/assets`) saves the dealer backdrop + logo (used by `branded` style; graceful studio fallback if unset). Verified renders + endpoint end-to-end; 0 findings in adversarial review.
-4. **Interior panorama + hotspots** (GLO3D/CloudPano parity) — equirectangular interior view with tappable feature pins. ← **NEXT**
-5. **VIN-keyed instant VDP embed** + feed integration (CloudPano/CarCutter parity) — one embed snippet per VIN; push to Dealer.com-style feeds.
+4. ✅ **DONE (HEAD 1cf1252)** — **Interior 360 + tappable hotspots**: pano_hotspots table + `/api/pano-hotspot` (public GET, gated write); buyer `/view` interior tab renders Pannellum `hotSpots` with a tap-to-open feature card; new gated `/interior-studio/{vin}` (upload pano + click-to-place hotspots + delete + preview), reached from `/3d-studio`; splat viewer gets an "Interior 360" button + `/view#interior` deep-link. `/api/upload/panorama` now accepts any vehicle ID + pads non-2:1 to true equirectangular. Browser-verified; stored-XSS closed (escapeHTML + bracket-strip).
+5. **VIN-keyed instant VDP embed** + feed integration (CloudPano/CarCutter parity) — one embed snippet per VIN; push to Dealer.com-style feeds. ← **NEXT**
 6. **Guided-capture coaching** in the PWA (Impel parity) — on-screen prompts ("walk slower", "keep car centered") to raise input quality.
 7. **Optional AI frame interpolation/upscale** for very short clips — smoother spins from sparse input; sharpen pass last.
 8. **Per-dealer install + pricing tiers** — provision each of the 5 dealerships, set a fair monthly price, document the install.
@@ -133,7 +133,7 @@ rely on true volumetric 3D for everyday inventory; the *stabilized turntable* is
 
 ## First moves in the new chat
 - Probe `:8360`, open `/splat3d/DS8097NAT` (natural look) + `/splat3d/DS8097STU` (studio + has an MP4 demo).
-- Recommend next: #4 interior panorama + hotspots (equirectangular interior view with feature pins), then #5 VIN→VDP embed.
+- Recommend next: #5 VIN-keyed VDP embed snippet + feed integration, then #6 PWA guided-capture coaching.
 - Work tracked (TaskCreate the queue), verify each from disk, commit with clean messages (no secrets).
 
 *Sources for the research above:* GLO3D (glo3d.com, glo3d.net/pricing), Spyne (spyne.ai/features/car-360-spin, /360-car-photography), CloudPano (auto.cloudpano.com, blog.cloudpano.com), CarCutter (carcutter.com/360-spin, /resources/what-is-a-360-car-spin), Impel (impel.ai/360-walkarounds).
