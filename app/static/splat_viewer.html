@@ -4,6 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>LotVue360 — Interactive Viewer</title>
+<!-- gaussian-splats-3d is an ESM module that does `import 'three'` (bare specifier);
+     without this importmap that import throws and the viewer silently falls back
+     to the 360 spin — i.e. true 3D never renders. Keep the three version in the
+     range gaussian-splats-3d@0.4.7 supports. -->
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+} }
+</script>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   html,body { width:100%; height:100%; overflow:hidden; background:#0d1117; font-family:-apple-system,'Segoe UI',Roboto,sans-serif; }
@@ -66,15 +76,19 @@ async function loadSplat(url){
     const GS = await import('https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js');
     const isPly = /\.ply(\?|$)/i.test(url);
     const viewer = new GS.Viewer({
-      cameraUp: isPly ? [0,1,0] : [0,-1,0],
-      initialCameraPosition: [-4.5, 2.0, 5.5],
-      initialCameraLookAt: [0, 0.5, 0],
+      // Brush/COLMAP exports are Y-down (OpenCV convention) — for BOTH ply and
+      // ksplat. [0,1,0] rendered every car upside-down.
+      cameraUp: [0,-1,0],
+      initialCameraPosition: [-4.5, -2.0, 5.5],
+      initialCameraLookAt: [0, -0.5, 0],
       sphericalHarmonicsDegree: 1,
       sharedMemoryForWorkers: false,
       rootElement: document.getElementById('stage')
     });
     if (viewer.controls){ viewer.controls.autoRotate=true; viewer.controls.autoRotateSpeed=1.2; viewer.controls.enableDamping=true; }
-    viewer.addSplatScene(url, { showLoadingUI:false, progressiveLoad:true, onProgress:(p)=>{ prog.style.width=Math.min(100,p)+'%'; } })
+    // splatAlphaRemovalThreshold drops near-transparent "fog" splats (0-255)
+    // so the car reads clean instead of shrouded in haze.
+    viewer.addSplatScene(url, { showLoadingUI:false, progressiveLoad:true, splatAlphaRemovalThreshold: 24, onProgress:(p)=>{ prog.style.width=Math.min(100,p)+'%'; } })
       .then(()=>{ hideLoader(); viewer.start(); })
       .catch((e)=>{ if(vin){ loadSpin(vin); } else { showError('Could not load 3D model.'); } });
   } catch(e){ if(vin){ loadSpin(vin); } else { showError('3D viewer failed: '+e.message); } }

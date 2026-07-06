@@ -445,6 +445,56 @@ def _save_frames_to_video(frames, output_path: str, fps: int = 24):
 # STEP 2: KOKORO TTS VOICEOVER
 # ─────────────────────────────────────────────────────────────────────────────
 
+def generate_real_footage(vin: str, output_path: str) -> bool:
+    """Build the commercial base video from the car's REAL photos — the
+    stabilized spin exteriors + interior shots — with Ken Burns motion and
+    hard cuts. No generative video: WAN 2.2 re-imagines the vehicle (a 2007
+    Continental GT came out as a ~2020 model, 2026-07-06), which misrepresents
+    the actual car being sold. Real footage is the only honest default."""
+    spin_dir = STORAGE_DIR / vin / "spin"
+    int_dir = STORAGE_DIR / vin / "interior"
+    exts = sorted(spin_dir.glob("spin_*.jpg"))[:8]
+    ints = sorted(int_dir.glob("*.jpg"))[:2]
+    if len(exts) < 4:
+        print(f"[RealFootage] only {len(exts)} spin frames — not enough")
+        return False
+    shots = exts + ints + exts[:1]              # orbit → interior peek → closing beauty
+    tmp = Path(tempfile.mkdtemp(prefix="lv_real_"))
+    seg_files = []
+    try:
+        for i, img in enumerate(shots):
+            seg = tmp / f"seg_{i:02d}.mp4"
+            vf = ("scale=720:480:force_original_aspect_ratio=decrease,"
+                  "pad=720:480:(ow-iw)/2:(oh-ih)/2:color=white,"
+                  "zoompan=z='min(zoom+0.0028,1.09)':"
+                  "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=720x480:fps=24,"
+                  "format=yuv420p")
+            r = subprocess.run([FFMPEG, "-y", "-loop", "1", "-t", "1.34", "-i", str(img),
+                                "-vf", vf, "-r", "24", "-an", str(seg)],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode == 0 and seg.exists():
+                seg_files.append(seg)
+        if len(seg_files) < 4:
+            print("[RealFootage] segment build failed")
+            return False
+        lst = tmp / "list.txt"
+        lst.write_text("".join(f"file '{s.as_posix()}'\n" for s in seg_files),
+                       encoding="utf-8")
+        r = subprocess.run([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+                            "-c", "copy", str(output_path)],
+                           capture_output=True, text=True, timeout=120)
+        ok = r.returncode == 0 and os.path.exists(output_path)
+        if ok:
+            print(f"[RealFootage] {len(seg_files)} real shots -> {output_path}")
+        return ok
+    finally:
+        try:
+            import shutil as _sh
+            _sh.rmtree(tmp, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def generate_voiceover(script: str, output_wav: str) -> bool:
     """Generate voiceover audio using Kokoro TTS (kokoro-onnx)."""
     set_status("Generating voiceover (Kokoro TTS)", 60)
@@ -586,11 +636,13 @@ def assemble_commercial(video_path: str, audio_path: str, output_path: str,
 
     drawtext_filters = []
 
-    # Vehicle title
+    # Vehicle title — shrink to fit 720px frame (36 chars+ overflowed at 36pt:
+    # "...CONTINENTAL GT COU" cut off, 2026-07-06)
+    title_fs = min(36, max(20, int(1100 / max(1, len(title_line1)))))
     drawtext_filters.append(
         f"drawtext=fontfile='{font_path}':"
         f"text='{_escape_ffmpeg(title_line1)}':"
-        f"fontsize=36:fontcolor=white:x=40:y=h-120:"
+        f"fontsize={title_fs}:fontcolor=white:x=40:y=h-120:"
         f"shadowcolor=black:shadowx=2:shadowy=2:"
         f"enable='between(t,{fade_in_end},{audio_duration})'"
     )
@@ -781,19 +833,29 @@ def run_pipeline(args):
     print(f"[Pipeline] Script: {script}")
 
     # ── Step 2: Generate video ─────────────────────────────────────────────
-    video_prompt = (
-        f"Cinematic car commercial, {args.year} {args.make} {args.model}, "
-        f"smooth camera orbit, professional automotive photography, "
-        f"studio lighting, high quality, 4K, photorealistic"
-    )
-
-    video_ok = generate_wan_video(
-        image_path=args.image,
-        output_path=raw_video,
-        prompt=video_prompt,
-        width=720, height=480, num_frames=81,
-        steps=20, cfg=6.0, seed=42
-    )
+    # DEFAULT = real footage (the actual car's photos). Generative video (WAN)
+    # re-imagines the vehicle — wrong body/generation — so it is opt-in only,
+    # for concept b-roll, never the default listing commercial.
+    video_ok = False
+    if getattr(args, "mode", "real") == "real":
+        set_status("Building video from real vehicle photos", 15)
+        video_ok = generate_real_footage(args.vin, raw_video)
+        if not video_ok:
+            print("[Pipeline] real footage unavailable, static-image fallback")
+            video_ok = _fallback_slideshow(args.image, raw_video)
+    else:
+        video_prompt = (
+            f"Cinematic car commercial, {args.year} {args.make} {args.model}, "
+            f"smooth camera orbit, professional automotive photography, "
+            f"studio lighting, high quality, 4K, photorealistic"
+        )
+        video_ok = generate_wan_video(
+            image_path=args.image,
+            output_path=raw_video,
+            prompt=video_prompt,
+            width=720, height=480, num_frames=81,
+            steps=20, cfg=6.0, seed=42
+        )
 
     if not video_ok or not os.path.exists(raw_video):
         set_error("Video generation failed")
@@ -847,6 +909,9 @@ if __name__ == "__main__":
     parser.add_argument("--transmission", default="",     help="Transmission type")
     parser.add_argument("--price",        default="",     help="Vehicle price")
     parser.add_argument("--dealer",       default="",     help="Dealer name")
+    parser.add_argument("--mode",         default="real", choices=["real", "ai"],
+                        help="real = actual vehicle photos (default, honest); "
+                             "ai = WAN 2.2 generative concept video (re-imagines the car)")
     args = parser.parse_args()
 
     success = run_pipeline(args)

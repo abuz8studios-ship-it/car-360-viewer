@@ -94,13 +94,212 @@ def copy_photos(src_dir, out_dir):
     return sorted(out_dir.glob("frame_*.jpg"))
 
 
+# ── photo ordering + optical-flow interpolation (the CarCutter 4-photo wire) ─
+# Sparse photo sets (a dealer's 4-8 standard shots) must become a SMOOTH closed
+# 360. Three stages: (1) order the photos around the car (ORB feature-shift,
+# same math as the proven /api/process order route), (2) stabilize as before,
+# (3) interpolate the stabilized frames up to SPIN_DENSE frames with Farneback
+# optical flow, wrap-around included, weighted by the estimated per-gap degrees.
+SPIN_DENSE = 36           # output frame count for interpolated photo spins (10°/frame)
+ORDER_MIN_CONFIDENCE = 0.25
+
+def order_photos_by_angle(frames):
+    """Order sparse photos into walkaround sequence via ORB feature shifts.
+    Returns (ordered_frames, gap_degrees_or_None). Falls back to the incoming
+    (filename/upload) order — which for dealer listings IS the walkaround order —
+    whenever matching confidence is too low to trust."""
+    try:
+        import cv2
+    except Exception:
+        return frames, None
+    n = len(frames)
+    if n < 3:
+        return frames, None
+    try:
+        orb = cv2.ORB_create(nfeatures=2000)
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        kps_desc, widths = [], []
+        for f in frames:
+            img = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                kp, des = [], None
+                widths.append(1)
+            else:
+                kp, des = orb.detectAndCompute(img, None)
+                widths.append(img.shape[1])
+            kps_desc.append((kp, des))
+        relative_shifts, match_counts, failed = [], [], []
+        for i in range(n):
+            kp1, des1 = kps_desc[i]
+            kp2, des2 = kps_desc[(i + 1) % n]
+            if des1 is None or des2 is None or len(kp1) < 10 or len(kp2) < 10:
+                relative_shifts.append(0.0); match_counts.append(0); failed.append(i); continue
+            good = []
+            for m_n in bf.knnMatch(des1, des2, k=2):
+                if len(m_n) == 2 and m_n[0].distance < 0.75 * m_n[1].distance:
+                    good.append(m_n[0])
+            if len(good) < 10:
+                relative_shifts.append(0.0); match_counts.append(len(good)); failed.append(i); continue
+            dxs = sorted(kp2[m.trainIdx].pt[0] - kp1[m.queryIdx].pt[0] for m in good)
+            relative_shifts.append(dxs[len(dxs) // 2] / max(1, widths[i]))
+            match_counts.append(len(good))
+        confidences = [min(1.0, c / 50.0) for c in match_counts]
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+        if avg_conf < ORDER_MIN_CONFIDENCE or len(failed) > n // 2:
+            print(f"[3D] angle-order confidence {avg_conf:.2f} (failed pairs {len(failed)}/{n}) — keeping upload order")
+            return frames, None
+        # A failed pair contributes a 0.0 shift; left as-is it collapses the angle
+        # integration (a failed WRAP pair pins the last photo onto photo 0 and the
+        # sort scrambles a correct walkaround). Substitute the median good shift.
+        good_shifts = [s for i, s in enumerate(relative_shifts) if i not in failed]
+        if failed and good_shifts:
+            med = sorted(good_shifts)[len(good_shifts) // 2]
+            for i in failed:
+                relative_shifts[i] = med
+        abs_angles = [0.0]
+        for shift in relative_shifts[:-1]:
+            abs_angles.append(abs_angles[-1] + shift)
+        total_span = abs_angles[-1] + relative_shifts[-1]
+        if abs(total_span) < 1e-6:
+            return frames, None
+        normalized = [(a / total_span) * 360.0 % 360.0 for a in abs_angles]
+        order = sorted(range(n), key=lambda i: normalized[i])
+        ordered = [frames[i] for i in order]
+        angles = [normalized[i] for i in order]
+        gaps = []
+        for i in range(n):
+            a1, a2 = angles[i], angles[(i + 1) % n]
+            deg = ((360.0 - a1) + a2) if i == n - 1 else (a2 - a1)
+            gaps.append(max(1.0, deg))
+        print(f"[3D] angle-ordered {n} photos (confidence {avg_conf:.2f})")
+        return ordered, gaps
+    except Exception as e:
+        print(f"[3D] angle ordering failed, keeping upload order: {e}")
+        return frames, None
+
+
+def _interp_pair(img_a, img_b, t):
+    """Farneback optical-flow interpolation between two frames (t in 0..1)."""
+    import cv2
+    import numpy as np
+    gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
+    gray_b = cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY)
+    flow = cv2.calcOpticalFlowFarneback(gray_a, gray_b, None,
+                                        pyr_scale=0.5, levels=3, winsize=15,
+                                        iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
+    h, w = flow.shape[:2]
+    grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32),
+                                 np.arange(h, dtype=np.float32))
+    map_x = grid_x + flow[..., 0] * t
+    map_y = grid_y + flow[..., 1] * t
+    map_x_inv = grid_x - flow[..., 0] * (1.0 - t)
+    map_y_inv = grid_y - flow[..., 1] * (1.0 - t)
+    warped_a = cv2.remap(img_a, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+    warped_b = cv2.remap(img_b, map_x_inv, map_y_inv, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+    return cv2.addWeighted(warped_a, 1.0 - t, warped_b, t, 0)
+
+
+def interpolate_spin_frames(spin_dir, target=SPIN_DENSE, gap_degrees=None):
+    """Densify the stabilized spin_NNNN.jpg sequence in place to `target` frames.
+    Runs AFTER stabilization on purpose: locked/normalized frames (static backdrop
+    in studio/branded) give the flow a pure car-rotation morph instead of warping
+    a moving background (the old finalize path's ghosting). Wrap-around (last->first)
+    keeps the loop closed. Per-gap frame counts follow gap_degrees when known."""
+    import cv2
+    import numpy as np
+    frames_list = sorted(Path(spin_dir).glob("spin_*.jpg"))
+    n = len(frames_list)
+    if n < 2 or n >= target:
+        return n
+    images = []
+    ref_shape = None
+    for f in frames_list:
+        img = cv2.imread(str(f))
+        if img is None:
+            continue
+        if ref_shape is None:
+            ref_shape = img.shape[:2]
+        elif img.shape[:2] != ref_shape:
+            img = cv2.resize(img, (ref_shape[1], ref_shape[0]), interpolation=cv2.INTER_LANCZOS4)
+        images.append(img)
+    n = len(images)
+    if n < 2:
+        return n
+    if gap_degrees and len(gap_degrees) == n:
+        total_deg = sum(gap_degrees)
+        gap_frames = [max(1, round(target * d / total_deg)) for d in gap_degrees]
+        while sum(gap_frames) < target:
+            gap_frames[gap_frames.index(min(gap_frames))] += 1
+        while sum(gap_frames) > target:
+            gap_frames[gap_frames.index(max(gap_frames))] -= 1
+    else:
+        base, extra = target // n, target % n
+        gap_frames = [base + (1 if i < extra else 0) for i in range(n)]
+    # Write the dense sequence to a temp dir first, then swap frame-by-frame with
+    # os.replace — the live server may be streaming the current frames, and a
+    # delete-everything-first swap would leave the public spin broken on failure.
+    tmp_dir = Path(spin_dir) / f"_densify_tmp_{os.getpid()}"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    out_idx = 1
+    for i in range(n):
+        img_a, img_b = images[i], images[(i + 1) % n]
+        for j in range(gap_frames[i]):
+            t = j / gap_frames[i]
+            if 0 < t < 1:
+                try:
+                    blended = _interp_pair(img_a, img_b, t)
+                except Exception:
+                    blended = cv2.addWeighted(img_a, 1.0 - t, img_b, t, 0)
+            else:
+                blended = img_a
+            cv2.imwrite(str(tmp_dir / f"spin_{out_idx:04d}.jpg"), blended,
+                        [cv2.IMWRITE_JPEG_QUALITY, 92])
+            out_idx += 1
+    made = out_idx - 1
+    made = _swap_spin_frames(Path(spin_dir), tmp_dir) or made
+    print(f"[3D] optical-flow densified {n} -> {made} frames (closed 360 loop)")
+    return made
+
+
+def _swap_spin_frames(spin_dir, tmp_dir, retries=3):
+    """Swap a freshly-built spin sequence into place with per-file os.replace
+    (retry on Windows share violations while the live server streams a frame),
+    then drop leftover old frames beyond the new count. Returns the new count."""
+    import time as _time
+    new_frames = sorted(tmp_dir.glob("spin_*.jpg"))
+    for f in new_frames:
+        dst = spin_dir / f.name
+        for attempt in range(retries):
+            try:
+                os.replace(str(f), str(dst))
+                break
+            except PermissionError:
+                if attempt == retries - 1:
+                    raise
+                _time.sleep(0.3)
+    n_new = len(new_frames)
+    for old in sorted(spin_dir.glob("spin_*.jpg")):
+        try:
+            if int(old.stem.split("_")[1]) > n_new:
+                old.unlink()
+        except (ValueError, OSError):
+            pass
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return n_new
+
+
 # ── STEP A: the always-on 360 spin (works from ANY input) ────────────────────
-def build_spin(frames, vin, target=72, style=None, backdrop=None):
+def build_spin(frames, vin, target=72, style=None, backdrop=None, ordered=False):
     from PIL import Image, ImageOps
     spin_dir = STORAGE_DIR / vin / "spin"
     spin_dir.mkdir(parents=True, exist_ok=True)
     for old in spin_dir.glob("spin_*.jpg"):
         old.unlink()
+    # ALWAYS clear stale keyframes: a dense re-run (or video run) must never leave
+    # last build's _keys behind, or the generative upgrade would rebuild this VIN's
+    # spin from OLD photos.
+    shutil.rmtree(spin_dir / "_keys", ignore_errors=True)
     n = len(frames)
     if n == 0:
         return 0
@@ -110,22 +309,142 @@ def build_spin(frames, vin, target=72, style=None, backdrop=None):
         sel = [frames[i] for i in idx]
     else:
         sel = frames
+    # Sparse PHOTO sets (video frames are already time-ordered): put the shots in
+    # walkaround order BEFORE stabilizing — the stabilizer smooths the bbox track
+    # across the sequence, so a scrambled order corrupts the center/size lock.
+    gap_degrees = None
+    if not ordered and len(sel) < SPIN_DENSE:
+        sel, gap_degrees = order_photos_by_angle(sel)
     # STABILIZE into a smooth GLO3D-style turntable: lock the car centered at a
     # constant size so it rotates in place (raw handheld frames jitter/drift).
     if _stabilize_frames(sel, spin_dir, style=style, backdrop=backdrop):
         cnt = len(list(spin_dir.glob("spin_*.jpg")))
     else:
-        # fallback (no rembg, e.g. the light bundle): plain normalized frames
+        # fallback (no rembg, e.g. the light bundle): letterbox every frame onto one
+        # fixed canvas — mixed portrait/landscape uploads must not get stretched by
+        # the densify pass's uniform resize.
+        FB_W, FB_H = 1280, 854
         for i, f in enumerate(sel):
             try:
                 im = ImageOps.exif_transpose(Image.open(f)).convert("RGB")
-                if im.width > 1280:
-                    im = im.resize((1280, round(im.height * 1280 / im.width)), Image.LANCZOS)
-                im.save(spin_dir / f"spin_{i+1:04d}.jpg", "JPEG", quality=90)
+                s = min(FB_W / im.width, FB_H / im.height)
+                im = im.resize((max(1, round(im.width * s)), max(1, round(im.height * s))),
+                               Image.LANCZOS)
+                canvas = Image.new("RGB", (FB_W, FB_H), (246, 247, 249))
+                canvas.paste(im, ((FB_W - im.width) // 2, (FB_H - im.height) // 2))
+                canvas.save(spin_dir / f"spin_{i+1:04d}.jpg", "JPEG", quality=90)
             except Exception as e:
                 print(f"[3D] spin frame fail {f.name}: {e}")
         cnt = len(list(spin_dir.glob("spin_*.jpg")))
-    (spin_dir / "manifest.json").write_text(json.dumps({"count": cnt}), encoding="utf-8")
+    # Sparse set -> densify to a smooth CLOSED 360 (CarCutter Next-Gen parity):
+    # optical-flow interpolate the stabilized frames up to SPIN_DENSE, wrap included.
+    engine = "raw"
+    if 2 <= cnt < SPIN_DENSE:
+        # keep the stabilized keyframes + gap map so the generative upgrade
+        # (WAN first-last-frame arcs) can rebuild a premium spin afterwards
+        keys_dir = spin_dir / "_keys"
+        shutil.rmtree(keys_dir, ignore_errors=True)
+        keys_dir.mkdir(parents=True, exist_ok=True)
+        for i, f in enumerate(sorted(spin_dir.glob("spin_*.jpg"))):
+            shutil.copy(f, keys_dir / f"key_{i+1:04d}.jpg")
+        eff_style = (style or os.environ.get("LOTVUE_SPIN_STYLE", "natural")).lower()
+        (keys_dir / "gaps.json").write_text(json.dumps({
+            "gap_degrees": gap_degrees, "style": eff_style}), encoding="utf-8")
+        try:
+            cnt = interpolate_spin_frames(spin_dir, target=SPIN_DENSE, gap_degrees=gap_degrees)
+            engine = "optical-flow"
+        except Exception as e:
+            print(f"[3D] densify failed: {e}")
+    # manifest count must reflect what is actually on disk, whatever happened above
+    cnt = len(list(spin_dir.glob("spin_*.jpg")))
+    (spin_dir / "manifest.json").write_text(
+        json.dumps({"count": cnt, "engine": engine}), encoding="utf-8")
+    return cnt
+
+
+def generative_upgrade(vin, target=72):
+    """PREMIUM tier: replace the optical-flow spin with WAN 2.2 Fun-InP generative
+    arcs — true novel-view synthesis between each pair of real photos (the real
+    photos stay in as anchor frames). Requires the local ComfyUI (:8188); any
+    failure leaves the already-delivered flow spin untouched. Returns final count
+    or 0 if the upgrade didn't happen."""
+    spin_dir = STORAGE_DIR / vin / "spin"
+    keys_dir = spin_dir / "_keys"
+    keys = sorted(keys_dir.glob("key_*.jpg"))
+    n = len(keys)
+    if n < 2:
+        return 0
+    if os.environ.get("LOTVUE_SPIN_GEN", "1") != "1":
+        print("[3D] generative upgrade disabled (LOTVUE_SPIN_GEN=0)")
+        return 0
+    try:
+        sys.path.insert(0, str(BASE_DIR))
+        from wan_comfy_api import generate_wan_flf_frames, comfyui_up, FLF_PROMPT
+    except Exception as e:
+        print(f"[3D] generative upgrade unavailable: {e}")
+        return 0
+    if not comfyui_up():
+        print("[3D] generative upgrade skipped: ComfyUI :8188 not reachable")
+        return 0
+    try:
+        import cv2
+        meta = json.loads((keys_dir / "gaps.json").read_text(encoding="utf-8"))
+    except Exception:
+        meta = {}
+    gap_degrees = meta.get("gap_degrees")
+    style = meta.get("style", "natural")
+    if not (gap_degrees and len(gap_degrees) == n):
+        gap_degrees = [360.0 / n] * n
+    scene = ("a clean bright studio floor" if style in ("studio", "branded")
+             else "the dealership lot")
+    prompt = ("Camera smoothly orbiting around a parked car on " + scene +
+              ", the car stays perfectly still, seamless rotation, professional "
+              "automotive 360 photography, consistent lighting, high quality")
+    total_deg = sum(gap_degrees)
+    tween_budget = max(target - n, n)
+    ref = cv2.imread(str(keys[0]))
+    ref_h, ref_w = ref.shape[:2]
+    gen_dir = spin_dir / f"_gen_tmp_{os.getpid()}"
+    shutil.rmtree(gen_dir, ignore_errors=True)
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    out_idx = 1
+
+    def _emit(img):
+        nonlocal out_idx
+        if img.shape[:2] != (ref_h, ref_w):
+            img = cv2.resize(img, (ref_w, ref_h), interpolation=cv2.INTER_LANCZOS4)
+        cv2.imwrite(str(gen_dir / f"spin_{out_idx:04d}.jpg"), img,
+                    [cv2.IMWRITE_JPEG_QUALITY, 92])
+        out_idx += 1
+
+    for i in range(n):
+        need = max(2, round(tween_budget * gap_degrees[i] / total_deg))
+        length = 4 * ((need + 2 + 3) // 4) + 1          # 4k+1, >= need+2 endpoints
+        set_status(f"AI-synthesizing arc {i+1}/{n} (WAN first-last-frame)",
+                   36 + round(34 * i / n), spin_ready=True)
+        arc_dir = gen_dir / f"_arc{i}"
+        frames = generate_wan_flf_frames(str(keys[i]), str(keys[(i + 1) % n]),
+                                         str(arc_dir), prompt=prompt,
+                                         num_frames=length, seed=1000 + i)
+        if len(frames) < need + 2:
+            print(f"[3D] generative arc {i+1}/{n} failed ({len(frames)} frames) — keeping flow spin")
+            shutil.rmtree(gen_dir, ignore_errors=True)
+            return 0
+        _emit(cv2.imread(str(keys[i])))                  # real photo anchor
+        tweens = frames[1:-1]                            # drop endpoint dupes
+        idxs = [round(j * (len(tweens) - 1) / (need - 1)) for j in range(need)] if need > 1 else [0]
+        for j in idxs:
+            img = cv2.imread(tweens[j])
+            if img is not None:
+                _emit(img)
+        shutil.rmtree(arc_dir, ignore_errors=True)
+    # swap the premium sequence in frame-by-frame (os.replace, retry on share
+    # violations) — never leaves the public spin dir empty mid-swap
+    _swap_spin_frames(spin_dir, gen_dir)
+    cnt = len(list(spin_dir.glob("spin_*.jpg")))
+    (spin_dir / "manifest.json").write_text(
+        json.dumps({"count": cnt, "engine": "wan-flf", "keyframes": n}), encoding="utf-8")
+    print(f"[3D] generative upgrade complete: {n} photos -> {cnt}-frame WAN 360")
     return cnt
 
 
@@ -364,10 +683,42 @@ def train_brush(work, out_ply, steps):
     return out_ply
 
 
+def _acquire_vin_lock(vdir):
+    """One engine run per VIN: concurrent runs share _3dwork/spin/_keys and would
+    wipe each other mid-build. Returns the lock Path, or None if another LIVE run
+    holds it (a dead PID's stale lock is taken over)."""
+    lock = vdir / ".engine.lock"
+    try:
+        if lock.exists():
+            try:
+                other = int(lock.read_text(encoding="utf-8").strip() or "0")
+            except (ValueError, OSError):
+                other = 0
+            alive = False
+            if other and other != os.getpid():
+                try:
+                    os.kill(other, 0)
+                    alive = True
+                except OSError:
+                    alive = False
+            if alive:
+                return None
+        lock.write_text(str(os.getpid()), encoding="utf-8")
+        return lock
+    except OSError:
+        return lock  # lock bookkeeping must never block a build
+
+
 def run(args):
     global _VIN, _STATUS
     _VIN = args.vin.upper()
     vdir = STORAGE_DIR / _VIN
+    vdir.mkdir(parents=True, exist_ok=True)
+    lock = _acquire_vin_lock(vdir)
+    if lock is None:
+        # do NOT touch status.json — it belongs to the run that holds the lock
+        print(f"[3D] another build is already running for {_VIN} — exiting")
+        return False
     work = vdir / "_3dwork"
     images = work / "images"
     if work.exists():
@@ -383,27 +734,54 @@ def run(args):
     elif args.images:
         frames = copy_photos(args.images, images)
     else:
-        set_error("No video or photos provided"); return False
+        set_error("No video or photos provided")
+        lock.unlink(missing_ok=True)
+        return False
     print(f"[3D] {len(frames)} frames gathered")
     if len(frames) < 4:
-        set_error("Need a walkaround video or at least 4 photos."); return False
+        set_error("Need a walkaround video or at least 4 photos.")
+        lock.unlink(missing_ok=True)
+        return False
 
     # STEP A — always deliver a 360 spin (works from anything)
     set_status("Building 360 spin", 25)
     nspin = build_spin(frames, _VIN, style=(getattr(args, "style", "") or None),
-                       backdrop=(getattr(args, "backdrop", "") or None))
+                       backdrop=(getattr(args, "backdrop", "") or None),
+                       ordered=ordered)
     _STATE["spin_ready"] = nspin > 0
     _STATE["spin_frames"] = nspin
     _STATE["spin_url"] = f"/storage/{_VIN}/spin/"
     # web-friendly MP4 of the turntable (download / social) — best-effort
     if nspin > 0 and export_mp4(_VIN):
         _STATE["spin_mp4"] = f"/storage/{_VIN}/spin/spin.mp4"
-    set_status("360 spin ready — now attempting true 3D", 35, spin_ready=True, spin_frames=nspin)
+    set_status("360 spin ready", 35, spin_ready=True, spin_frames=nspin)
+
+    # PREMIUM upgrade for sparse photo sets: WAN first-last-frame arcs replace the
+    # optical-flow tweens with true generative novel views (real photos stay as
+    # anchors). The flow spin above is already live, so failure costs nothing.
+    if not ordered and (STORAGE_DIR / _VIN / "spin" / "_keys").exists():
+        try:
+            ngen = generative_upgrade(_VIN)
+            if ngen:
+                nspin = ngen
+                _STATE["spin_frames"] = ngen
+                _STATE["spin_engine"] = "wan-flf"
+                if export_mp4(_VIN):
+                    _STATE["spin_mp4"] = f"/storage/{_VIN}/spin/spin.mp4"
+        except Exception as e:
+            print(f"[3D] generative upgrade error (flow spin kept): {e}")
+    set_status("Spin complete — now attempting true 3D", 70, spin_ready=True, spin_frames=nspin)
 
     # STEP B — best-effort true 3D upgrade
     splat_ready = False
     note = ""
     try:
+        # COLMAP's acceptance gate requires >=20 registered frames — a <20-frame
+        # capture can NEVER pass it (proven across 16 solver strategies in rnd/).
+        # Skip the guaranteed failure instead of burning minutes of GPU on it.
+        if len(frames) < 20:
+            raise RuntimeError("too few frames for 3D reconstruction — "
+                               "not enough camera motion/overlap")
         model0 = colmap_poses(work, images, ordered)
         out_ply = vdir / "splat" / "scene.ply"
         train_brush(work, out_ply, args.steps)
@@ -420,6 +798,7 @@ def run(args):
     _STATE["viewer"] = f"/splat3d/{_VIN}"
     _STATE["note"] = note
     finish()
+    lock.unlink(missing_ok=True)
     return True
 
 

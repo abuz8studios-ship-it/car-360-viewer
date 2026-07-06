@@ -95,7 +95,16 @@ input:focus{outline:none;border-color:#2E75B6;}
 .cam-top{background:linear-gradient(rgba(0,0,0,0.55),transparent);padding:max(1rem, env(safe-area-inset-top)) 1rem 1.6rem;color:#fff;text-align:center;}
 .cam-top .angle{font-size:1.25rem;font-weight:800;}
 .cam-top .count{font-size:0.85rem;opacity:0.85;margin-top:0.15rem;}
-.silhouette{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:86%;opacity:0.5;pointer-events:none;}
+.silhouette{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:86%;opacity:0.55;pointer-events:none;transition:opacity 0.25s;}
+.silhouette.flip{transform:translate(-50%,-50%) scaleX(-1);}
+.silhouette.narrow{width:58%;}
+.silhouette.wide{width:96%;}
+.levelbar{position:absolute;top:calc(max(1rem, env(safe-area-inset-top)) + 4.2rem);left:50%;transform:translateX(-50%);width:120px;height:26px;pointer-events:none;}
+.levelbar .bubble-track{position:absolute;inset:0;border:2px solid rgba(255,255,255,0.55);border-radius:13px;}
+.levelbar .bubble{position:absolute;top:3px;left:50%;width:16px;height:16px;border-radius:50%;background:#E74C3C;transition:left 0.12s,background 0.2s;}
+.levelbar .bubble.good{background:#2ECC71;}
+.levelbar .tick{position:absolute;left:50%;top:-4px;width:2px;height:34px;background:rgba(255,255,255,0.55);}
+.leveltxt{position:absolute;top:calc(max(1rem, env(safe-area-inset-top)) + 6.2rem);width:100%;text-align:center;color:#fff;font-size:0.72rem;opacity:0.8;pointer-events:none;}
 .cam-bottom{background:linear-gradient(transparent,rgba(0,0,0,0.6));padding:1.4rem 1rem calc(1.4rem + env(safe-area-inset-bottom));display:flex;align-items:center;justify-content:space-between;pointer-events:auto;}
 .shutter{width:74px;height:74px;border-radius:50%;background:#fff;border:5px solid #2E75B6;cursor:pointer;}
 .shutter:active{transform:scale(0.92);}
@@ -158,6 +167,14 @@ a.link{color:#2E75B6;font-weight:700;text-decoration:none;}
     <button class="btn" id="extBtn" onclick="startCapture()">Start 360 capture (0/12)</button>
   </div>
   <div class="card">
+    <b>Or · Walkaround video</b>
+    <div class="hint">One slow circle around the car (30–90s). We extract the frames and build the spin — no photo positioning needed.</div>
+    <input type="file" id="vidFile" accept="video/*" capture="environment" style="display:none" onchange="uploadVideo(this)">
+    <button class="btn secondary" onclick="document.getElementById('vidFile').click()" id="vidBtn">🎥 Record / upload walkaround</button>
+    <div class="progressbar"><div id="vidProg"></div></div>
+    <div class="err" id="vidMsg"></div>
+  </div>
+  <div class="card">
     <b>2 · Interior + extras (optional)</b>
     <div class="hint">Dash, seats, trunk, engine bay.</div>
     <input type="file" id="intFile" accept="image/*" capture="environment" style="display:none" onchange="uploadInterior(this)">
@@ -189,10 +206,9 @@ a.link{color:#2E75B6;font-weight:700;text-decoration:none;}
 <!-- CAMERA -->
 <div id="camWrap">
   <video id="cam" autoplay playsinline muted></video>
-  <svg class="silhouette" viewBox="0 0 400 160" xmlns="http://www.w3.org/2000/svg">
-    <path d="M30 110 Q35 85 80 78 Q120 45 175 42 Q240 40 275 70 Q330 76 360 92 Q372 96 370 110 L355 112 A22 22 0 1 0 311 114 L130 114 A22 22 0 1 0 86 114 L32 112 Z"
-          fill="none" stroke="#FFFFFF" stroke-width="3" stroke-dasharray="10 7"/>
-  </svg>
+  <div id="ghost" class="silhouette"></div>
+  <div class="levelbar"><div class="bubble-track"></div><div class="tick"></div><div class="bubble" id="lvlBubble"></div></div>
+  <div class="leveltxt" id="lvlTxt">Hold the phone level</div>
   <div class="cam-overlay">
     <div class="cam-top">
       <div class="angle" id="angleName">Front</div>
@@ -218,7 +234,60 @@ a.link{color:#2E75B6;font-weight:700;text-decoration:none;}
 const ANGLES = __ANGLES__;
 let TOKEN = localStorage.getItem('lv_token') || '';
 let VIN = localStorage.getItem('lv_vin') || '';
-let extCount = 0, intCount = 0, camStream = null, scanReader = null;
+let extCount = 0, realShots = 0, intCount = 0, camStream = null, scanReader = null;
+
+// ── per-angle wireframe ghosts (the replicable-positioning guides) ──────────
+// Every car gets shot at the SAME 12 stops, each with its own outline: match
+// the car to the ghost and the capture is exactly repeatable across inventory.
+const S = 'fill="none" stroke="#FFFFFF" stroke-width="3" stroke-dasharray="10 7"';
+const GHOSTS = {
+  side: `<svg viewBox="0 0 400 160" xmlns="http://www.w3.org/2000/svg">
+    <path d="M30 110 Q35 85 80 78 Q120 45 175 42 Q240 40 275 70 Q330 76 360 92 Q372 96 370 110 L355 112 A22 22 0 1 0 311 114 L130 114 A22 22 0 1 0 86 114 L32 112 Z" ${S}/>
+    <path d="M120 76 Q150 52 185 50 L230 52 Q255 58 268 72" ${S} stroke-width="2" stroke-dasharray="6 5"/></svg>`,
+  front: `<svg viewBox="0 0 240 170" xmlns="http://www.w3.org/2000/svg">
+    <path d="M45 130 L45 95 Q47 70 62 62 L70 40 Q75 30 95 28 L145 28 Q165 30 170 40 L178 62 Q193 70 195 95 L195 130 Q195 140 185 140 L55 140 Q45 140 45 130 Z" ${S}/>
+    <path d="M74 44 L166 44 L172 62 L68 62 Z" ${S} stroke-width="2" stroke-dasharray="6 5"/>
+    <rect x="58" y="98" width="34" height="16" rx="8" ${S} stroke-width="2"/>
+    <rect x="148" y="98" width="34" height="16" rx="8" ${S} stroke-width="2"/>
+    <path d="M62 122 L178 122" ${S} stroke-width="2" stroke-dasharray="5 5"/>
+    <path d="M40 78 L30 82 L30 92 L42 90 M200 78 L210 82 L210 92 L198 90" ${S} stroke-width="2"/></svg>`,
+  rear: `<svg viewBox="0 0 240 170" xmlns="http://www.w3.org/2000/svg">
+    <path d="M45 130 L45 95 Q47 72 60 64 L68 42 Q74 32 95 30 L145 30 Q166 32 172 42 L180 64 Q193 72 195 95 L195 130 Q195 140 185 140 L55 140 Q45 140 45 130 Z" ${S}/>
+    <path d="M76 46 L164 46 L170 62 L70 62 Z" ${S} stroke-width="2" stroke-dasharray="6 5"/>
+    <path d="M56 96 L92 96 L92 112 L56 112 Z M148 96 L184 96 L184 112 L148 112 Z" ${S} stroke-width="2"/>
+    <path d="M96 120 L144 120" ${S} stroke-width="2"/></svg>`,
+  q34: `<svg viewBox="0 0 400 170" xmlns="http://www.w3.org/2000/svg">
+    <path d="M40 118 Q42 92 78 84 Q112 50 170 46 Q235 44 268 72 Q322 80 352 98 Q366 102 364 118 L348 121 A21 21 0 1 0 306 123 L146 123 A23 23 0 1 0 100 124 L42 120 Z" ${S}/>
+    <path d="M118 82 Q148 56 182 54 L228 56 Q252 62 264 74" ${S} stroke-width="2" stroke-dasharray="6 5"/>
+    <path d="M40 118 Q60 108 92 106 M40 106 L52 96" ${S} stroke-width="2"/></svg>`,
+};
+// angle index -> which ghost + mirror/size  (matches the ANGLES list order)
+const GUIDES = [
+  {g:'front'},               {g:'q34'},                {g:'side'},               {g:'q34',flip:1},
+  {g:'rear'},                {g:'q34'},                {g:'side',flip:1},        {g:'q34',flip:1},
+  {g:'front',cls:'narrow'},  {g:'rear',cls:'narrow'},  {g:'q34',cls:'wide'},     {g:'q34',flip:1,cls:'wide'},
+];
+
+// ── live level bubble (DeviceOrientation; iOS needs a permission tap) ───────
+let lvlOn = false;
+function startLevel(){
+  const go = () => { window.addEventListener('deviceorientation', onTilt); lvlOn = true; };
+  try{
+    if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission){
+      DeviceOrientationEvent.requestPermission().then(p => { if(p==='granted') go(); }).catch(()=>{});
+    } else { go(); }
+  }catch(_){}
+}
+function onTilt(e){
+  if (e.gamma === null) return;
+  // portrait hold: gamma = roll (left/right tilt). Level = |gamma| small.
+  const roll = Math.max(-30, Math.min(30, e.gamma));
+  const bubble = document.getElementById('lvlBubble');
+  bubble.style.left = `calc(50% + ${roll*1.6}px - 8px)`;
+  const good = Math.abs(roll) < 6;
+  bubble.classList.toggle('good', good);
+  document.getElementById('lvlTxt').textContent = good ? 'Level ✓' : 'Hold the phone level';
+}
 
 function show(id){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));document.getElementById(id).classList.add('active');}
 function authHeaders(extra){const h = extra || {};if (TOKEN) h['Authorization'] = 'Bearer ' + TOKEN;return h;}
@@ -271,7 +340,7 @@ async function createVehicle(){
     const d=await r.json();
     if(d.status!=='ok'&&!d.vin){err.textContent=d.detail||d.error||'Could not create vehicle';return;}
     VIN=v;localStorage.setItem('lv_vin',VIN);
-    extCount=0;intCount=0;updateHub();
+    extCount=0;realShots=0;intCount=0;updateHub();
     document.getElementById('hubTitle').textContent='Capture · '+VIN.slice(-6);
     show('s-hub');
   }catch(e){err.textContent='Failed: '+e.message;}
@@ -310,10 +379,12 @@ function updateHub(){
   document.getElementById('extBtn').textContent =
     extCount >= ANGLES.length ? `✓ Exterior complete (${extCount})` : `Start 360 capture (${extCount}/${ANGLES.length})`;
   document.getElementById('intBtn').textContent = `Add interior photo (${intCount})`;
-  document.getElementById('buildBtn').disabled = extCount < 6;
+  // 4 real WALKAROUND shots = the minimum for a true 360 (skips + beauty shots don't count)
+  document.getElementById('buildBtn').disabled = realShots < 4;
 }
 
 async function startCapture(){
+  if(!lvlOn) startLevel();   // BEFORE any await — iOS grants sensor permission only inside the tap
   try{
     camStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1920},height:{ideal:1080}}});
   }catch(e){alert('Camera blocked — allow camera access for this site.');return;}
@@ -325,6 +396,10 @@ function updateAngleUI(){
   const i = Math.min(extCount, ANGLES.length-1);
   document.getElementById('angleName').textContent = extCount>=ANGLES.length ? 'Extra shots' : ANGLES[i];
   document.getElementById('angleCount').textContent = `Photo ${extCount+1}${extCount>=ANGLES.length?'':' of '+ANGLES.length}`;
+  const gd = GUIDES[i] || {g:'side'};
+  const ghost = document.getElementById('ghost');
+  ghost.innerHTML = GHOSTS[gd.g];
+  ghost.className = 'silhouette' + (gd.flip ? ' flip' : '') + (gd.cls ? ' ' + gd.cls : '');
 }
 function skipAngle(){extCount++;updateAngleUI();updateHub();}
 function closeCapture(){
@@ -340,10 +415,32 @@ async function snap(){
   c.getContext('2d').drawImage(video,0,0);
   const blob=await new Promise(res=>c.toBlob(res,'image/jpeg',0.92));
   const idx=extCount;
-  extCount++;updateAngleUI();updateHub();
+  extCount++;
+  // Only the 8 walkaround stops feed the 360 loop. The low/wide beauty shots
+  // (stops 9-12) go to the GALLERY — mixing camera heights into the spin makes
+  // the rotation whip. realShots gates the build on true spin shots only.
+  const isSpinShot = idx < 8;
+  if(isSpinShot) realShots++;
+  updateAngleUI();updateHub();
   const t=document.createElement('img');t.src=URL.createObjectURL(blob);
   document.getElementById('extThumbs').appendChild(t);
-  uploadWithRetry('/api/upload/exterior', blob, idx);
+  if(isSpinShot){ uploadWithRetry('/api/upload/exterior', blob, idx); }
+  else{ uploadGallery(blob, idx); }
+}
+
+async function uploadGallery(blob, idx){
+  for(let attempt=0;attempt<5;attempt++){
+    try{
+      const fd=new FormData();
+      fd.append('vin',VIN);
+      fd.append('category','beauty');
+      fd.append('photo',blob,`${VIN}_beauty_${String(idx).padStart(2,'0')}.jpg`);
+      const r=await api('/api/upload/gallery',{method:'POST',body:fd});
+      if(r.ok) return true;
+    }catch(_){/* offline — retry */}
+    await new Promise(res=>setTimeout(res,1500*(attempt+1)));
+  }
+  return false;
 }
 
 async function uploadWithRetry(path, blob, idx, kind){
@@ -369,25 +466,81 @@ async function uploadInterior(inp){
   inp.value='';
 }
 
-// ── finalize ────────────────────────────────────────────────────────────────
+// ── walkaround video -> premium engine ─────────────────────────────────────
+async function jsonDetail(r){
+  // Cloudflare-fronted errors (413 etc.) are HTML, not JSON — never blow up on them
+  try{ return (await r.json()).detail || ('server said '+r.status); }
+  catch(_){ return r.status===413 ? 'file too large for the connection' : ('server said '+r.status); }
+}
+
+async function uploadVideo(inp){
+  if(!inp.files.length) return;
+  const f = inp.files[0]; inp.value='';
+  const msg=document.getElementById('vidMsg'); msg.textContent=''; msg.classList.remove('ok');
+  const bar=document.getElementById('vidProg');
+  // the public URL rides a Cloudflare tunnel that caps uploads at ~100MB
+  if(f.size > 95*1024*1024){ msg.textContent='Video over 95MB — trim to ~60s or lower the resolution and retry.'; return; }
+  document.getElementById('vidBtn').disabled=true;
+  msg.textContent='Uploading video…';
+  try{
+    const fd=new FormData();
+    fd.append('video', f, 'walkaround.mp4');
+    fd.append('style','natural');
+    const r=await api('/api/vehicle/'+VIN+'/generate-3d',{method:'POST',body:fd});
+    if(!r.ok){ throw new Error(await jsonDetail(r)); }
+    msg.textContent='Building the 360 from your video…';
+    const done = await pollBuild(bar);
+    if(done==='ok'){ document.getElementById('doneTitle').textContent='VIN '+VIN; show('s-done'); return; }
+    msg.textContent = done==='timeout' ? 'Still processing — check the dashboard in a few minutes.' : done;
+  }catch(e){ msg.textContent='Video build failed: '+e.message; }
+  document.getElementById('vidBtn').disabled=false;
+}
+
+// shared premium-build poller: 45 min window (WAN arcs are minutes each),
+// resolves 'ok' | 'timeout' | error text
+async function pollBuild(bar){
+  for(let i=0;i<675;i++){
+    await new Promise(res=>setTimeout(res,4000));
+    let s;
+    try{ s=await (await api('/api/vehicle/'+VIN+'/3d-status')).json(); }
+    catch(_){ continue; }   // network blip — keep polling
+    bar.style.width=Math.min(98, s.progress||0)+'%';
+    if(s.status==='error') return 'Build failed: '+(s.error||'unknown error');
+    if(s.status==='done' && !s.spin_ready) return 'Build finished without a spin — check the photos and retry.';
+    if(s.spin_ready && (s.status==='done'||s.progress>=100)){ bar.style.width='100%'; return 'ok'; }
+  }
+  return 'timeout';
+}
+
+// ── finalize (photos -> premium engine: stabilized + AI-densified 360) ──────
 async function finalize(){
   const msg=document.getElementById('buildMsg');msg.textContent='';msg.classList.remove('ok');
-  document.getElementById('buildBtn').disabled=true;
+  const btn=document.getElementById('buildBtn');
+  btn.disabled=true;
   try{
-    await api('/api/finalize/'+VIN,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const r=await api('/api/finalize/'+VIN+'?engine=pro',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    if(!r.ok){ throw new Error(await jsonDetail(r)); }
+    const mode=(await r.json()).engine||'classic';
     const bar=document.getElementById('buildProg');
-    for(let i=0;i<150;i++){
-      await new Promise(res=>setTimeout(res,4000));
-      const s=await (await api('/api/finalize-status/'+VIN)).json();
-      const pct=Math.min(95, Math.round((s.spin_frames||0)/36*100));
-      bar.style.width=(s.ready?100:pct)+'%';
-      if(s.ready){
-        document.getElementById('doneTitle').textContent='VIN '+VIN;
-        show('s-done');return;
+    if(mode==='pro'){
+      const done = await pollBuild(bar);
+      if(done==='ok'){ document.getElementById('doneTitle').textContent='VIN '+VIN; show('s-done'); return; }
+      msg.textContent = done==='timeout' ? 'Still processing — check the dashboard in a few minutes.' : done;
+    }else{
+      for(let i=0;i<220;i++){
+        await new Promise(res=>setTimeout(res,4000));
+        const s=await (await api('/api/finalize-status/'+VIN)).json();
+        const pct=Math.min(95, Math.round((s.spin_frames||0)/36*100));
+        bar.style.width=(s.ready?100:pct)+'%';
+        if(s.ready){
+          document.getElementById('doneTitle').textContent='VIN '+VIN;
+          show('s-done');return;
+        }
       }
+      msg.textContent='Still processing — check the dashboard in a minute.';
     }
-    msg.textContent='Still processing — check the dashboard in a minute.';
-  }catch(e){msg.textContent='Build failed: '+e.message;document.getElementById('buildBtn').disabled=false;}
+  }catch(e){msg.textContent='Build failed: '+e.message;}
+  btn.disabled=false;
 }
 
 function copyShare(){
@@ -396,9 +549,12 @@ function copyShare(){
 }
 function resetFlow(){
   VIN='';localStorage.removeItem('lv_vin');
+  extCount=0;realShots=0;intCount=0;
   document.getElementById('vin').value='';document.getElementById('decoded').textContent='';
   document.getElementById('extThumbs').innerHTML='';
   document.getElementById('buildProg').style.width='0%';
+  document.getElementById('vidProg').style.width='0%';
+  updateHub();
   show('s-vin');
 }
 

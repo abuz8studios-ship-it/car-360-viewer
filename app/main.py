@@ -595,6 +595,50 @@ def init_db():
 
 init_db()
 
+def ensure_owner_account():
+    """Boot-time self-heal for the owner login, driven entirely by app/.env.
+
+    The owner's users row reverted to a stale state across restarts twice
+    (2026-07-05, 2026-07-06) even though no code path in this app ever
+    UPDATEs password_hash — the DB file itself gets clobbered from outside
+    the server (external tooling working on file-level copies). So instead
+    of trusting the row, re-assert it from .env on every boot: set
+    LOTVUE_OWNER_EMAIL + LOTVUE_OWNER_PASSWORD_HASH (sha256 hex) there.
+    A clean shipped build regenerates .env without these keys
+    (make_clean_build.py), so no personal account ever leaves this machine.
+    """
+    email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    pw_hash = os.getenv("LOTVUE_OWNER_PASSWORD_HASH", "").strip().lower()
+    if not email or len(pw_hash) != 64:
+        return
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT id, password_hash FROM users WHERE email=?", (email,)).fetchone()
+    drift = False
+    if row is None:
+        conn.execute("""
+            INSERT INTO users (email, name, password_hash, plan, credits, created_at)
+            VALUES (?, ?, ?, 'dealership', -1, ?)
+        """, (email, os.getenv("LOTVUE_OWNER_NAME", "Owner"), pw_hash, datetime.now().isoformat()))
+        drift = True
+        print(f"[Auth] owner account was MISSING - recreated {email} from .env")
+    elif row["password_hash"] != pw_hash:
+        conn.execute("UPDATE users SET password_hash=? WHERE email=?", (pw_hash, email))
+        drift = True
+        print(f"[Auth] owner credential DRIFT detected (user id {row['id']}) - re-asserted from .env")
+    if drift:
+        try:
+            conn.execute("""
+                UPDATE users SET plan='dealership', plan_type='dealership',
+                                 credits=-1, is_subscribed=1 WHERE email=?
+            """, (email,))
+        except sqlite3.OperationalError:
+            pass  # plan_type/is_subscribed columns absent on a fresh schema
+    conn.commit()
+    conn.close()
+
+ensure_owner_account()
+
 def db_upsert_vehicle(vin, year="", make="", model="", ext_frames=0, int_count=0, watermark_mode="preview", user_email="",
                        trim_level="", engine="", transmission="", drivetrain="", fuel_type="", body_style="",
                        stock_number="", turntable_style="studio_shadow", job_id=""):
@@ -2523,7 +2567,7 @@ async def dashboard(request: Request):
         }}
     </script>
     <!-- Dealer Tools + Quick Start helper (window sticker, buyers guide, showroom, syndication) -->
-    <script src="/static/lv_dashboard_tools.js?v=20260612b" defer></script>
+    <script src="/static/lv_dashboard_tools.js?v=20260705a" defer></script>
 </body>
 </html>"""
     return HTMLResponse(html)
@@ -3801,26 +3845,44 @@ async def set_vehicle_video_url(
 # API — FINALIZE (run interpolation + background removal)
 # =============================================================================
 @app.post("/api/finalize/{vin}")
-async def finalize_vehicle(vin: str):
-    """Run frame interpolation after all photos uploaded."""
+async def finalize_vehicle(vin: str, engine: str = ""):
+    """Run frame interpolation after all photos uploaded.
+    engine=pro routes through the premium gaussian_3d engine instead (stabilized
+    turntable + optical-flow densify + WAN generative arcs) — the mobile guided
+    capture uses this; poll /api/vehicle/{vin}/3d-status for it."""
     vin = vin.upper()
     vehicle_dir = STORAGE_DIR / vin
-    
+
     if not vehicle_dir.exists():
         raise HTTPException(status_code=404, detail="Vehicle not found")
-    
+
     exterior_dir = vehicle_dir / "exterior"
     spin_dir = vehicle_dir / "spin"
-    
+
     if not exterior_dir.exists():
         raise HTTPException(status_code=400, detail="No exterior photos found")
-    
+
     # Count exterior frames
     frame_count = len(list(exterior_dir.glob("frame_*.jpg")))
-    
+
     if frame_count == 0:
         raise HTTPException(status_code=400, detail="No exterior frames found")
-    
+
+    if engine == "pro":
+        splat_dir = vehicle_dir / "splat"
+        splat_dir.mkdir(parents=True, exist_ok=True)
+        (splat_dir / "status.json").write_text(json.dumps({
+            "vin": vin, "status": "running", "step": "queued", "progress": 1}),
+            encoding="utf-8")
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).parent / "gaussian_3d.py"),
+             "--vin", vin, "--images", str(exterior_dir), "--style", "natural"],
+            cwd=str(Path(__file__).parent),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0))
+        return {"status": "started", "engine": "pro", "original_frames": frame_count,
+                "message": "Premium build running. Poll /api/vehicle/{vin}/3d-status."}
+
     spin_dir.mkdir(exist_ok=True)
     for old in spin_dir.glob("*.jpg"):
         old.unlink()
@@ -3836,12 +3898,25 @@ async def finalize_vehicle(vin: str):
             pass
         try:
             all_frames = sorted(exterior_dir.glob("frame_*.jpg"))
-            # Smart interpolation: if < 18 frames, interpolate up to 36; otherwise copy as-is
+            # Smart interpolation: if < 18 frames, interpolate up to 36; otherwise copy as-is.
+            # Pass the ORB angle manifest when the order step produced one, so gap
+            # spacing follows the estimated degrees instead of assuming even stops.
             if frame_count < 18:
-                interpolate_frames(exterior_dir, spin_dir, target_frames=36)
+                manifest = None
+                mpath = vehicle_dir / "manifest.json"
+                if mpath.exists():
+                    try:
+                        manifest = json.loads(mpath.read_text(encoding="utf-8"))
+                    except Exception:
+                        manifest = None
+                interpolate_frames(exterior_dir, spin_dir, target_frames=36, manifest=manifest)
             else:
                 for i, f in enumerate(all_frames):
                     shutil.copy(f, spin_dir / f"spin_{i+1:04d}.jpg")
+            # manifest keeps splat_viewer's spin fallback working for this path too
+            spin_count = len(list(spin_dir.glob("spin_*.jpg")))
+            (spin_dir / "manifest.json").write_text(
+                json.dumps({"count": spin_count, "engine": "optical-flow"}), encoding="utf-8")
 
             if sorted(spin_dir.glob("spin_*.jpg")):
                 generate_thumbnail(spin_dir, vehicle_dir / "thumbnail.jpg")
@@ -5722,7 +5797,18 @@ async def get_vehicle_viewer_data(vin: str):
 # =============================================================================
 @app.get("/view3d/{vin}")
 async def view3d(vin: str):
-    """Cinematic Three.js 360 viewer for a vehicle."""
+    """Honest 3D routing: TRUE gaussian-splat viewer when scene.ply exists,
+    else the real-photo 360 spin. A customer must only ever see the REAL
+    vehicle — never the procedural placeholder car (viewer3d.js legacy)."""
+    from fastapi.responses import RedirectResponse
+    vin_safe = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
+    if (STORAGE_DIR / vin_safe / "splat" / "scene.ply").exists():
+        return RedirectResponse(f"/splat3d/{vin_safe}", status_code=302)
+    if (STORAGE_DIR / vin_safe).exists() or db_get_vehicle(vin_safe):
+        return RedirectResponse(f"/view/{vin_safe}", status_code=302)
+    raise HTTPException(status_code=404, detail="Vehicle not found")
+    # ── legacy cinematic viewer below is intentionally unreachable: it rendered
+    # a procedural box-car (viewer3d.js) instead of the real vehicle. ──
     info = db_get_vehicle(vin)
     if not info:
         raise HTTPException(status_code=404, detail="Vehicle not found")
@@ -8177,6 +8263,12 @@ register_glo3d(app)
 
 from f_control import register_control
 register_control(app)
+
+try:
+    from h_dealer_import import register_dealer_import
+    register_dealer_import(app)
+except Exception as _h_err:
+    print(f"[H-Import] dealer importer not loaded: {_h_err}")
 
 
 # =============================================================================

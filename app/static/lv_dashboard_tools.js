@@ -22,6 +22,15 @@
   .lvd-btn.pri{background:${P};color:#fff;border-color:${P}}
   .lvd-note{font-size:12px;color:${MUT};margin-top:10px}
   .lvd-link{color:${P};font-weight:600;word-break:break-all}
+  .lvd-inv{max-height:250px;overflow:auto;margin-top:8px;border:1px solid #EDF1F6;border-radius:10px;padding:6px;display:none;background:#FBFCFE}
+  .lvd-inv.on{display:block}
+  .lvd-row{display:flex;align-items:center;gap:8px;padding:7px 8px;border:1px solid #DDE5EE;border-radius:8px;margin-bottom:6px;background:#fff}
+  .lvd-row-main{flex:1;min-width:0}
+  .lvd-row-t{font:600 12.5px sans-serif;color:${INK};white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .lvd-row-m{font-size:11.5px;color:${MUT}}
+  .lvd-imp{flex:none;background:${P};color:#fff;border:none;border-radius:7px;padding:7px 10px;font:700 11.5px sans-serif;cursor:pointer}
+  .lvd-imp:disabled{opacity:.55;cursor:default}
+  .lvd-row-s{font-size:11.5px;margin-top:3px;color:${INK};word-break:break-word}
   `;
   document.head.appendChild(css);
 
@@ -47,6 +56,14 @@
     '<a class="lvd-btn" id="lvd-guide" target="_blank">FTC Buyers Guide</a>' +
     '<a class="lvd-btn" id="lvd-commercial" target="_blank">AI Commercial</a>' +
     '</div>' +
+    '<div class="lvd-sec">Import from dealer site</div>' +
+    '<select class="lvd-sel" id="lvd-dlr" style="margin-bottom:8px">' +
+    '<option value="drivesmartwc">Drive Smart Auto Sales (drivesmartwc.com)</option>' +
+    '<option value="unlimitedag">Unlimited Auto Group (unlimitedag.com)</option>' +
+    '</select>' +
+    '<button class="lvd-btn pri" id="lvd-loadinv" style="width:100%">Load inventory</button>' +
+    '<div class="lvd-note" id="lvd-invmsg" style="margin-top:6px"></div>' +
+    '<div class="lvd-inv" id="lvd-invlist"></div>' +
     '<div class="lvd-sec">Your storefront & syndication</div>' +
     '<div class="lvd-grid">' +
     '<a class="lvd-btn" id="lvd-showroom" target="_blank">My Showroom</a>' +
@@ -82,6 +99,78 @@
     document.getElementById('lvd-commercial').href = '/ai-commercial?vin=' + vin;
     document.getElementById('lvd-intel').href = '/api/intel/' + vin + '/aggregate';
   }
+
+  /* ── Import from dealer site: inventory pick-list + one-click Import + 3D ── */
+  function invMsg(t) { document.getElementById('lvd-invmsg').textContent = t; }
+
+  function importVin(dealerKey, vin, btn, statusEl) {
+    btn.disabled = true; btn.textContent = 'Importing…';
+    statusEl.textContent = 'Downloading photos, classifying exterior/interior, queuing 3D…';
+    fetch('/api/import/' + encodeURIComponent(dealerKey) + '/' + encodeURIComponent(vin),
+      { method: 'POST', credentials: 'same-origin' })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        var j = res.j || {};
+        if (!res.ok || j.error) {
+          statusEl.textContent = '⚠ ' + (j.error || j.detail || 'Import failed');
+          btn.disabled = false; btn.textContent = 'Import + 3D'; return;
+        }
+        var c = j.classification || {};
+        var parts = [(j.photos_saved || 0) + ' photos'];
+        if (c.exterior != null) parts.push(c.exterior + ' ext · ' + (c.interior || 0) + ' int · ' + (c.detail || 0) + ' detail');
+        parts.push(j.build_queued ? '3D build queued ✓' : ('no build — ' + (j.build_skip_reason || 'too few exterior shots')));
+        statusEl.textContent = '';
+        statusEl.appendChild(document.createTextNode(parts.join(' · ') + ' — '));
+        var a = document.createElement('a');
+        a.className = 'lvd-link'; a.target = '_blank';
+        a.href = '/view/' + encodeURIComponent(j.vin || vin);
+        a.textContent = 'Open /view/' + (j.vin || vin);
+        statusEl.appendChild(a);
+        btn.textContent = 'Imported ✓';
+      })
+      .catch(function (e) {
+        statusEl.textContent = '⚠ ' + e;
+        btn.disabled = false; btn.textContent = 'Import + 3D';
+      });
+  }
+
+  document.getElementById('lvd-loadinv').onclick = function () {
+    var dealerKey = document.getElementById('lvd-dlr').value;
+    var list = document.getElementById('lvd-invlist');
+    var loadBtn = document.getElementById('lvd-loadinv');
+    loadBtn.disabled = true; invMsg('Loading live inventory from ' + dealerKey + '…');
+    list.classList.remove('on'); list.innerHTML = '';
+    fetch('/api/import/' + encodeURIComponent(dealerKey) + '/inventory', { credentials: 'same-origin' })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        loadBtn.disabled = false;
+        var j = res.j || {};
+        if (!res.ok || j.error) { invMsg('⚠ ' + (j.error || j.detail || 'Inventory load failed')); return; }
+        var inv = j.inventory || [];
+        invMsg(inv.length + ' vehicles live on ' + dealerKey + ' — pick one to import.');
+        if (!inv.length) return;
+        inv.forEach(function (v) {
+          if (!v.vin) return;
+          var row = document.createElement('div'); row.className = 'lvd-row';
+          var main = document.createElement('div'); main.className = 'lvd-row-main';
+          var t = document.createElement('div'); t.className = 'lvd-row-t';
+          t.textContent = v.title || v.vin;
+          var m = document.createElement('div'); m.className = 'lvd-row-m';
+          m.textContent = (v.price ? '$' + v.price : 'price n/a') +
+            ' · ' + (v.photo_count != null ? v.photo_count + ' photos' : 'photos n/a') +
+            ' · ' + v.vin.slice(-8);
+          var s = document.createElement('div'); s.className = 'lvd-row-s';
+          main.appendChild(t); main.appendChild(m); main.appendChild(s);
+          var btn = document.createElement('button');
+          btn.className = 'lvd-imp'; btn.textContent = 'Import + 3D';
+          btn.onclick = function () { importVin(dealerKey, v.vin, btn, s); };
+          row.appendChild(main); row.appendChild(btn);
+          list.appendChild(row);
+        });
+        list.classList.add('on');
+      })
+      .catch(function (e) { loadBtn.disabled = false; invMsg('⚠ ' + e); });
+  };
 
   fetch('/api/vehicles', { credentials: 'same-origin' }).then(function (r) { return r.json(); })
     .then(function (d) {
