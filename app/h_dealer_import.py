@@ -126,34 +126,43 @@ def _store_cache(dealer, items):
 
 # ── drivesmartwc scraper ────────────────────────────────────────────────────
 def _scrape_drivesmartwc(s):
+    # DealerCenter "inv-scripts-v2" flow (site migrated ~2026-08): every
+    # /inventory/ page load embeds a SIGNED serviceUrl valid only verbatim —
+    # any query tampering returns 401. Paging = reload the WP page with
+    # ?pager=12&page_no=N and pull that page's fresh signed URL.
     site = DEALERS["drivesmartwc"]["site"]
-    inv_html = s.get(site + "/inventory/", timeout=TIMEOUT).text
-    m = re.search(r'"serviceUrl"\s*:\s*"([^"]+)"', inv_html)
-    if not m:
-        raise RuntimeError("drivesmartwc: serviceUrl not found in inventory HTML")
-    service_url = m.group(1).replace("\\/", "/")
-
-    vehicles, total, page = [], None, 0
-    headers = {"Referer": site + "/inventory/", "X-Requested-With": "XMLHttpRequest"}
-    while page < 40:
-        r = s.post(site + "/wp-admin/admin-ajax.php",
-                   data={"action": "dws_inventory_service",
-                         "requestType": "get_service_url_for_page",
-                         "serviceUrl": service_url,
-                         "newPageNumber": str(page)},
-                   headers=headers, timeout=TIMEOUT)
+    headers = {"Referer": site + "/inventory/",
+               "Accept": "application/json, text/javascript, */*; q=0.01",
+               "X-Requested-With": "XMLHttpRequest"}
+    vehicles, seen_ids, total, page_no = [], set(), None, 1
+    while page_no <= 40:
+        inv_html = s.get(f"{site}/inventory/?pager=12&page_no={page_no}",
+                         timeout=TIMEOUT).text
+        m = re.search(r'id="DWS_Async_Vehicle_Listing_Settings[^"]*">\s*(\{.*?\})\s*</script>',
+                      inv_html, re.S)
+        if not m:
+            raise RuntimeError("drivesmartwc: DWS settings block not found (site changed again?)")
+        service_url = json.loads(m.group(1))["serviceUrl"]
+        r = s.get(site + service_url, headers=headers, timeout=TIMEOUT)
+        if getattr(r, "status_code", 0) != 200:
+            raise RuntimeError(f"drivesmartwc: inv service HTTP {r.status_code} (page {page_no})")
+        body = r.text
+        mj = re.match(r'^\s*[\w$.]+\((.*)\)\s*;?\s*$', body, re.S)  # optional JSONP wrap
         try:
-            data = json.loads(r.text)
+            data = json.loads(mj.group(1) if mj else body)
         except ValueError:
-            raise RuntimeError(f"drivesmartwc: page {page} returned non-JSON (HTTP {r.status_code})")
+            raise RuntimeError(f"drivesmartwc: page {page_no} returned non-JSON")
         batch = data.get("Vehicles") or []
         total = data.get("TotalRecordCount", total)
-        if not batch:
+        fresh = [v for v in batch if v.get("Vin") and v["Vin"] not in seen_ids]
+        if not fresh:
             break
-        vehicles.extend(batch)
-        page += 1
+        for v in fresh:
+            seen_ids.add(v["Vin"])
+        vehicles.extend(fresh)
         if total is not None and len(vehicles) >= total:
             break
+        page_no += 1
         time.sleep(0.3)  # politeness
 
     items = []
