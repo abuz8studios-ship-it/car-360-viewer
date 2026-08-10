@@ -16,8 +16,8 @@ BUNDLE_APP = Path(r"E:\ABU\360Car\dist\LotVue360_standalone\app")
 DB = BUNDLE_APP / "vehicles.db"
 
 # ---- master account (the only account in a fresh install) ----
-MASTER_EMAIL = "admin@lotvue360.app"
-MASTER_PASS = "Abuz809!"
+MASTER_EMAIL = "ahmad@abuz8ai.com"
+MASTER_PASS = "***REMOVED***"
 MASTER_NAME = "Master Admin"
 MASTER_DEALER = "mylot"
 
