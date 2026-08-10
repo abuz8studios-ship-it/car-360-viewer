@@ -1,0 +1,15 @@
+{
+  "appId": "com.abuz8.lotvue",
+  "appName": "LotVue Pro",
+  "webDir": "www",
+  "server": {
+    "url": "https://lotvue.abuz8ai.com/mobile",
+    "cleartext": true,
+    "allowNavigation": ["lotvue.abuz8ai.com", "*.abuz8ai.com", "192.168.*", "127.0.0.1"]
+  },
+  "plugins": {
+    "SplashScreen": { "launchShowDuration": 1200, "backgroundColor": "#0a1226" },
+    "PushNotifications": { "presentationOptions": ["badge", "sound", "alert"] }
+  },
+  "android": { "allowMixedContent": true }
+}

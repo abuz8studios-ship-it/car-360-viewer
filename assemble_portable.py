@@ -19,7 +19,8 @@ if not (DIST / "LotVue360.exe").exists():
     raise SystemExit(f"Standalone build not found at {DIST}. Run the PyInstaller build first.")
 
 # what NOT to ship (cache, build artifacts, the dev launcher's own specs/logs)
-SKIP_DIRS = {"__pycache__", "app_profile", "backups", "ai_studio_cache"}
+SKIP_DIRS = {"__pycache__", "app_profile", "backups", "ai_studio_cache",
+             "storage", "vehicles", "target", "_3dwork"}  # data ships empty; clean build recreates
 SKIP_SUFFIX = {".log", ".spec", ".pyc"}
 SKIP_NAMES = {"desktop_launch.log", "standalone.log", "standalone_stdio.log",
               "desktop_stdio.log", "server_stdout.log", "server_stderr.log",

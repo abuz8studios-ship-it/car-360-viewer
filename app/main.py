@@ -8267,6 +8267,9 @@ register_control(app)
 from viewer_api import register_viewer
 register_viewer(app)
 
+from crm_api import register_crm
+register_crm(app)
+
 try:
     from h_dealer_import import register_dealer_import
     register_dealer_import(app)

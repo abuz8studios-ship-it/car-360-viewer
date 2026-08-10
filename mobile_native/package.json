@@ -1,0 +1,23 @@
+{
+  "name": "lotvue-capture",
+  "version": "1.0.0",
+  "description": "LotVue Pro - dealer capture app (iOS/Android wrapper of the LotVue PWA)",
+  "private": true,
+  "scripts": {
+    "sync": "cap sync",
+    "android": "cap open android",
+    "build:aab": "cd android && gradlew bundleRelease"
+  },
+  "dependencies": {
+    "@capacitor/android": "6.2.1",
+    "@capacitor/app": "6.0.3",
+    "@capacitor/camera": "6.1.3",
+    "@capacitor/core": "6.2.1",
+    "@capacitor/ios": "6.2.1",
+    "@capacitor/push-notifications": "6.0.5",
+    "@capacitor/splash-screen": "6.0.4"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "6.2.1"
+  }
+}
