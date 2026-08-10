@@ -39,6 +39,9 @@ PUBLIC_PREFIXES = (
 
 # Prefix-match public for GET ONLY (read-only viewer data; writes stay gated)
 PUBLIC_GET_PREFIXES = (
+    "/vdp/",                     # buyer-facing 3D vehicle detail page
+    "/vehicles/",                # spin frames / ply / glb assets for the viewer
+    "/api/viewer/",              # unified viewer manifest (read)
     "/api/hotspots/",            # viewer hotspot overlay (read)
     "/api/pano-hotspots/",       # interior-360 feature pins (read)
     "/api/backgrounds",          # viewer background thumbnails (read)
