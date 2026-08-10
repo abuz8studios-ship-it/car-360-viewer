@@ -8,13 +8,14 @@ from pathlib import Path
 from fastapi import HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
-STORAGE = Path(__file__).parent / "vehicles"
+STORAGE_ROOTS = (Path(__file__).parent / "storage", Path(__file__).parent / "vehicles")
 
 def _vehicle_dir(vin: str) -> Path:
-    d = STORAGE / vin
-    if not d.exists():
-        raise HTTPException(404, f"unknown vin {vin}")
-    return d
+    for root in STORAGE_ROOTS:
+        d = root / vin
+        if d.exists():
+            return d
+    raise HTTPException(404, f"unknown vin {vin}")
 
 def _spin_frames(d: Path, vin: str):
     spin = d / "spin"
@@ -22,23 +23,22 @@ def _spin_frames(d: Path, vin: str):
         return []
     frames = sorted(p.name for p in spin.iterdir()
                     if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"))
-    return [f"/vehicles/{vin}/spin/{n}" for n in frames]
+    return [f"/storage/{vin}/spin/{n}" for n in frames]
 
 def build_manifest(vin: str) -> dict:
     d = _vehicle_dir(vin)
     man = {"vin": vin, "spin_frames": _spin_frames(d, vin)}
-    ply = d / "model.ply"
-    if not ply.exists():
-        ply = d / "3d" / "model.ply"
-    if ply.exists() and ply.stat().st_size > 100_000:
-        man["splat_url"] = f"/vehicles/{vin}/{ply.relative_to(d).as_posix()}"
+    for cand in (d / "splat" / "scene.ply", d / "model.ply", d / "3d" / "model.ply"):
+        if cand.exists() and cand.stat().st_size > 100_000:
+            man["splat_url"] = f"/storage/{vin}/{cand.relative_to(d).as_posix()}"
+            break
     glb = d / "model.glb"
     if glb.exists():
-        man["glb_url"] = f"/vehicles/{vin}/model.glb"
+        man["glb_url"] = f"/storage/{vin}/model.glb"
         man["paint"] = ["#0b1f3a", "#7a0d16", "#101010", "#c9ccd2", "#f2f3f5"]
     interior = d / "interior.jpg"
     if interior.exists():
-        man["interior_url"] = f"/vehicles/{vin}/interior.jpg"
+        man["interior_url"] = f"/storage/{vin}/interior.jpg"
     hs = d / "hotspots.json"
     if hs.exists():
         try:
