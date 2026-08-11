@@ -59,7 +59,7 @@ VDP_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
  body{{margin:0;background:#0a1226;color:#e2eaf8;font-family:-apple-system,'Segoe UI',Roboto,sans-serif}}
  .wrap{{max-width:1100px;margin:0 auto;padding:18px}}
- lotvue-viewer{{height:62vh;min-height:380px}}
+ lotvue-spin{{display:block;height:64vh;min-height:400px}}
  h1{{font-size:22px;margin:14px 0 4px}} .sub{{color:#8ea6d4;font-size:13px}}
  .row{{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}}
  .row a{{background:rgba(90,140,255,.2);border:1px solid rgba(120,165,255,.45);color:#dfe8ff;
@@ -70,7 +70,7 @@ VDP_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
    color:#e6eeff;border-radius:8px;padding:10px 12px;font-size:14px}}
  #log div{{margin:8px 0;font-size:13.5px;line-height:1.5}} #log .q{{color:#9fb8e8}}
 </style></head><body><div class="wrap">
-<lotvue-viewer vin="{vin}" tier="auto"></lotvue-viewer>
+<lotvue-spin vin="{vin}"></lotvue-spin>
 <h1>{title}</h1><div class="sub">{sub}</div>
 <div class="row">
  <a href="/api/leadmagnet/book-test-drive?vin={vin}">Book a test drive</a>
@@ -79,7 +79,7 @@ VDP_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 </div>
 <div id="bdc"><div id="log"><div>Ask me anything about this vehicle — I only answer from its real specs.</div></div>
  <input id="q" placeholder="e.g. Does it have AWD? What's the mileage?" autocomplete="off"></div>
-<script type="module">import '/static/lotvue_viewer.js';</script>
+<script type="module">import '/static/lotvue_spin.js';</script>
 <script>
 const vin={vin_js};
 document.getElementById('q').addEventListener('keydown', async e => {{
@@ -116,9 +116,9 @@ def register_viewer(app):
         return ('<!DOCTYPE html><html><head><meta charset="utf-8">'
                 '<meta name="viewport" content="width=device-width,initial-scale=1">'
                 '<style>html,body{margin:0;height:100%;background:#0a1226}'
-                'lotvue-viewer{height:100%}</style></head><body>'
-                f'<lotvue-viewer vin="{vin}" tier="auto"></lotvue-viewer>'
-                '<script type="module">import "/static/lotvue_viewer.js";</script>'
+                'lotvue-spin{display:block;height:100%}</style></head><body>'
+                f'<lotvue-spin vin="{vin}"></lotvue-spin>'
+                '<script type="module">import "/static/lotvue_spin.js";</script>'
                 '</body></html>')
 
     print("[Viewer-API] registered: /api/viewer/{vin}/manifest, /vdp/{vin}, /embed/{vin} (3-tier unified viewer)")
