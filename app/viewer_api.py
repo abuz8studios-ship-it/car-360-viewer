@@ -18,12 +18,16 @@ def _vehicle_dir(vin: str) -> Path:
     raise HTTPException(404, f"unknown vin {vin}")
 
 def _spin_frames(d: Path, vin: str):
-    spin = d / "spin"
+    # polished set wins when present (borders + dealer banner stripped,
+    # locked-off framing, non-orbit frames removed)
+    spin = d / "spin_hd"
+    if not spin.exists():
+        spin = d / "spin"
     if not spin.exists():
         return []
     frames = sorted(p.name for p in spin.iterdir()
                     if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"))
-    return [f"/storage/{vin}/spin/{n}" for n in frames]
+    return [f"/storage/{vin}/{spin.name}/{n}" for n in frames]
 
 def build_manifest(vin: str) -> dict:
     d = _vehicle_dir(vin)
