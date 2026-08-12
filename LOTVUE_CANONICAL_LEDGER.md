@@ -21,7 +21,7 @@
 | 8 | iOS app | BLOCKED | — | YES: Mac/cloud build |
 | 9 | AI bg replacement | DONE 08-12 | app/studio.py, --probe pixel-verified shadow | no |
 | 10 | Generative mesh (standard) | KILLED 08-11 | 68/118 blob GLBs quarantined. DO NOT RESUME | intentional |
-| 11 | Quality gate validate_video.py | DONE 08-12 | 316 lines; ORB-continuity is the discriminator (aspect-spread + bg-motion measured NON-discriminating: DS8097 spread 0.822, bg 0.154). CLI: DSREAL01 raw PASS / DS8097 FAIL 4/8 weak pairs. Live: /api/upload 422 capture_rejected (DS8097 photos) + 200 gate PASS (real walkaround video, 36 frames). Wired both branches, force=1 override | no |
+| 11 | Quality gate validate_video.py | DONE 08-12 | 316 lines; ORB-continuity is the discriminator (aspect-spread + bg-motion measured NON-discriminating: DS8097 spread 0.822, bg 0.154). CLI: DSREAL01 raw PASS / DS8097 FAIL 4/8 weak pairs. Live: /api/upload 422 capture_rejected (DS8097 photos) + 200 gate PASS (real walkaround video, 36 frames). Wired both branches, force=1 override. ALSO wired into /api/vehicle/{vin}/generate-3d photo+video branches (live 422 probed) — the exact route that fed COLMAP 2/N. UI surfaces reasons: /capture gatePanel + /mobile showGateReasons, both with explicit Upload-anyway override (served live, grep=2 each) | no |
 | 12 | Bg asset pack | DONE 08-12 | Disk truth: 40 bgs 1920x1080 in static/backgrounds; studio.py was reading EMPTY static/studio_bg (gradient fallback) — load_bg now falls back to full library. All 40 rendered vs WDDEJ7EB9CA029569 full-res: halo 0.00% (metric injection-validated) + visual pass. NOTE: gradient backdrops, not photo scenes — photoreal pack = upgrade path | no |
 | 13 | Hotspot/damage layer | DONE 08-12 | DB migration close_up; POST/GET carry condition_type/severity/note/close_up (400 without severity); viewer manifest merges DB rows (frame-resolved); /vdp/{vin}/damage-report printable, public 200, headless-Edge screenshot inspected | no |
 | 14 | Google Vehicle Listings feed | DONE 08-12 | /api/feeds/google-vehicle-listings.xml public 200; rebuilt to published spec (fetched 08-12): +g:vin +dealership_name/address +trim, brand→make, color→exterior_color, XML-escaped, unsellable rows skipped; validator 155/155 items pass required attrs | no |
@@ -30,6 +30,7 @@
 | 17 | Stripe checkout | NOT DONE | key expired | YES: refresh key |
 | 18 | Pricing page abuz8ai.com | NOT DONE | needs #17 | no |
 | 19 | DriveSmart written permission | NOT DONE | — | YES: owner obtains |
+| 20 | 60-SECOND STRANGER-DEALER TEST | PASSED 08-12 (all non-owner-gated steps) | Fresh account dealer60@ → register+login 200 → dashboard 200 (410KB, capture links) → real walkaround upload: gate PASS, 36 frames → order+interpolate 200 → /vdp/<vin> 200 LOCAL+PUBLIC with 360 viewer (screenshot) + real title from DB fallback (viewer_api meta.json→DB) → set-price 200 → vehicle appeared in Google feed, validator 156/156. Bad-capture path: 422 with reasons on same route. Test data cleaned after evidence. REMAINING: payment step = Stripe owner gate (#17→#18) | payment step only |
 
 ## OWNER GATES (Cowork cannot do these)
 - iOS build (Mac or cloud build service)
@@ -40,6 +41,6 @@
 - ~~FB Marketplace partner application~~ resolved: no dealer API exists since 2023 — assisted-posting MVP is the ceiling
 
 ## NEXT ACTION (one sentence)
-Surface the gate's structured 422 reasons in the /mobile capture UI (API already
-returns them) and run the full 60-second stranger-dealer test end-to-end on a
-fresh account, then close the remaining owner-gated Stripe/pricing step.
+Owner refreshes the Stripe key, then wire checkout + pricing page (#17→#18) —
+the ONLY remaining step between a stranger dealer and paid signup; everything
+else in the 60-second test passed on 08-12 with live evidence (row 20).

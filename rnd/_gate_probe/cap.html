@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LotVue Pro — Upload</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html,body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh;}
+  .header{display:flex;align-items:center;justify-content:space-between;padding:0.8rem 1.2rem;background:#161b22;border-bottom:1px solid #21262d;}
+  .logo{font-size:1.1rem;font-weight:800;} .logo span{color:#58a6ff;}
+  .back{color:#8b949e;text-decoration:none;font-size:0.85rem;}
+  .back:hover{color:#e6edf3;}
+  .container{max-width:720px;margin:0 auto;padding:1.5rem 1rem;}
+  .heic-warn{background:#341a00;border:1px solid #3d2e00;color:#d29922;padding:0.7rem 1rem;border-radius:8px;margin-bottom:1rem;font-size:0.85rem;}
+  .card{background:#161b22;border:1px solid #21262d;border-radius:12px;padding:1.25rem;margin-bottom:1rem;}
+  .card h2{font-size:1.05rem;font-weight:700;margin-bottom:0.25rem;color:#e6edf3;}
+  .subtitle{color:#8b949e;font-size:0.85rem;margin-bottom:1rem;}
+  .fg{margin-bottom:0.8rem;}
+  .fg label{display:block;font-size:0.78rem;color:#8b949e;margin-bottom:0.3rem;font-weight:600;}
+  .fg input{width:100%;padding:0.55rem 0.8rem;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;font-size:0.95rem;outline:none;}
+  .fg input:focus{border-color:#58a6ff;box-shadow:0 0 0 3px rgba(88,166,255,0.12);}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;}
+  .dropzone{border:2px dashed #30363d;border-radius:12px;padding:2rem;text-align:center;cursor:pointer;transition:all .2s;}
+  .dropzone:hover,.dropzone.dragover{border-color:#58a6ff;background:#0d1117;}
+  .dropzone .dz-icon{font-size:2.2rem;margin-bottom:0.4rem;}
+  .dropzone .dz-text{color:#c9d1d9;font-size:0.95rem;}
+  .dropzone .dz-hint{color:#8b949e;font-size:0.8rem;margin-top:0.3rem;}
+  .preview-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(72px,1fr));gap:0.4rem;margin-top:0.8rem;}
+  .preview-item{aspect-ratio:1;border-radius:6px;overflow:hidden;border:1px solid #21262d;}
+  .preview-item img{width:100%;height:100%;object-fit:cover;}
+  .file-count{color:#58a6ff;font-weight:700;font-size:0.9rem;margin-top:0.4rem;}
+  .progress-wrap{margin-top:1rem;display:none;}
+  .progress-bar{height:6px;background:#21262d;border-radius:3px;overflow:hidden;}
+  .progress-fill{height:100%;background:linear-gradient(90deg,#238636,#3fb950);width:0%;transition:width .3s;}
+  .progress-text{display:flex;justify-content:space-between;margin-top:0.4rem;font-size:0.85rem;color:#8b949e;}
+  .btn-row{display:flex;gap:0.6rem;margin-top:1rem;}
+  .btn{padding:0.55rem 1.1rem;border-radius:8px;font-weight:700;font-size:0.9rem;cursor:pointer;border:none;transition:all .15s;}
+  .btn-primary{background:#238636;color:#fff;} .btn-primary:hover{background:#2ea043;}
+  .btn-primary:disabled{opacity:0.5;cursor:not-allowed;}
+  .btn-secondary{background:#21262d;color:#c9d1d9;border:1px solid #30363d;}
+  .btn-secondary:hover{background:#30363d;}
+  .type-selector{display:grid;grid-template-columns:1fr 1fr;gap:0.6rem;margin-bottom:1rem;}
+  .type-card{border:1px solid #30363d;border-radius:10px;padding:1rem;text-align:center;cursor:pointer;transition:all .15s;}
+  .type-card:hover{border-color:#58a6ff;}
+  .type-card.selected{border-color:#58a6ff;background:#0d1117;}
+  .type-card .label{font-weight:700;color:#e6edf3;font-size:0.9rem;}
+  .type-card .desc{color:#8b949e;font-size:0.75rem;margin-top:0.15rem;}
+  @media(max-width:600px){.row2{grid-template-columns:1fr;} .type-selector{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">LotVue<span>360</span></div>
+    <a href="/" class="back">&larr; Dashboard</a>
+  </div>
+  <div class="container">
+    
+
+    <div class="card" id="step1">
+      <h2>Upload Media</h2>
+      <p class="subtitle">Select photos or a walkaround video. Photos work best.</p>
+      <div class="type-selector">
+        <div class="type-card selected" id="typePhotos" onclick="selectType('photos')">
+          <div class="label">&#128247; Photos</div>
+          <div class="desc">4+ JPG / PNG</div>
+        </div>
+        <div class="type-card" id="typeVideo" onclick="selectType('video')">
+          <div class="label">&#127909; Video</div>
+          <div class="desc">MP4 walkaround</div>
+        </div>
+      </div>
+
+      <div id="photosSection">
+        <div class="dropzone" id="photoDZ" onclick="document.getElementById('photoInput').click()">
+          <div class="dz-icon">&#128206;</div>
+          <div class="dz-text">Drop exterior photos here or click to browse</div>
+          <div class="dz-hint">Minimum 4 photos · JPG / PNG · Max 30 MB each</div>
+        </div>
+        <input type="file" id="photoInput" accept="image/*" multiple style="display:none">
+        <div id="photoCount" class="file-count"></div>
+        <div class="preview-grid" id="photoPreviewGrid"></div>
+      </div>
+
+      <div id="videoSection" style="display:none;">
+        <div class="dropzone" id="videoDZ" onclick="document.getElementById('videoInput').click()">
+          <div class="dz-icon">&#127909;</div>
+          <div class="dz-text">Drop walkaround video here or click to browse</div>
+          <div class="dz-hint">MP4 / MOV — up to 500 MB</div>
+        </div>
+        <input type="file" id="videoInput" accept="video/*" style="display:none">
+        <div id="videoCount" class="file-count"></div>
+      </div>
+    </div>
+
+    <div class="card" id="step2">
+      <h2>Processing</h2>
+      <p class="subtitle">Ordering photos, generating frames, and building the viewer.</p>
+      <div class="progress-wrap" id="progressWrap" style="display:block;">
+        <div class="progress-bar"><div class="progress-fill" id="progressBar"></div></div>
+        <div class="progress-text">
+          <span id="progressLabel">Preparing...</span>
+          <span id="progressPct">0%</span>
+        </div>
+      </div>
+      <div class="btn-row" id="actionRow">
+        <button class="btn btn-secondary" onclick="resetUpload()">Cancel</button>
+        <button class="btn btn-primary" id="submitBtn" onclick="startProcess()">Create 360 Viewer</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let photoFiles = [];
+    let videoFile = null;
+    let uploadType = 'photos';
+
+    function selectType(t) {
+      uploadType = t;
+      document.getElementById('typePhotos').classList.toggle('selected', t === 'photos');
+      document.getElementById('typeVideo').classList.toggle('selected', t === 'video');
+      document.getElementById('photosSection').style.display = t === 'photos' ? '' : 'none';
+      document.getElementById('videoSection').style.display = t === 'video' ? '' : 'none';
+    }
+
+    function setupDZ(dzId, inputId, onFiles) {
+      const dz = document.getElementById(dzId);
+      dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
+      dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
+      dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('dragover'); onFiles(Array.from(e.dataTransfer.files)); });
+      document.getElementById(inputId).addEventListener('change', e => onFiles(Array.from(e.target.files)));
+    }
+
+    function showPreviews(files, gridId, countId, label) {
+      const grid = document.getElementById(gridId);
+      grid.innerHTML = '';
+      files.forEach(f => {
+        if (!f.type.startsWith('image/')) return;
+        const div = document.createElement('div'); div.className = 'preview-item';
+        const img = document.createElement('img'); img.src = URL.createObjectURL(f);
+        div.appendChild(img); grid.appendChild(div);
+      });
+      document.getElementById(countId).textContent = files.length + ' ' + label + ' selected';
+    }
+
+    setupDZ('photoDZ', 'photoInput', files => {
+      photoFiles = files.filter(f => f.type.startsWith('image/'));
+      showPreviews(photoFiles, 'photoPreviewGrid', 'photoCount', 'photo(s)');
+    });
+    setupDZ('videoDZ', 'videoInput', files => {
+      const f = files.find(f => f.type.startsWith('video/'));
+      if (f) { videoFile = f; document.getElementById('videoCount').textContent = f.name + ' (' + (f.size/1024/1024).toFixed(1) + ' MB)'; }
+    });
+
+    function setProgress(pct, label) {
+      document.getElementById('progressBar').style.width = pct + '%';
+      document.getElementById('progressLabel').textContent = label;
+      document.getElementById('progressPct').textContent = pct + '%';
+    }
+
+    function resetUpload() {
+      photoFiles = []; videoFile = null;
+      document.getElementById('photoInput').value = '';
+      document.getElementById('videoInput').value = '';
+      document.getElementById('photoCount').textContent = '';
+      document.getElementById('videoCount').textContent = '';
+      document.getElementById('photoPreviewGrid').innerHTML = '';
+      setProgress(0, 'Preparing...');
+      document.getElementById('submitBtn').disabled = false;
+    }
+
+    function showGatePanel(gate) {
+      let el = document.getElementById('gatePanel');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'gatePanel';
+        el.style.cssText = 'margin:12px 0;padding:12px 14px;border:1px solid #e6a23c;background:#fdf6ec;color:#7a4d00;border-radius:8px;font-size:14px;text-align:left';
+        const btn = document.getElementById('submitBtn');
+        btn.parentNode.insertBefore(el, btn);
+      }
+      const reasons = (gate && gate.reasons) || [];
+      el.innerHTML = '<b>Capture quality check failed:</b><ul style="margin:6px 0 8px;padding-left:18px">' +
+        reasons.map(x => '<li>' + String(x).replace(/</g,'&lt;') + '</li>').join('') +
+        '</ul>Fix the capture and retry, or <button type="button" id="gateForceBtn" style="margin-left:4px">Upload anyway</button>';
+      document.getElementById('gateForceBtn').onclick = () => { el.remove(); startProcess(true); };
+    }
+
+    async function gateAwareUpload(fd, force) {
+      if (force) fd.append('force', '1');
+      const r = await fetch('/api/upload', { method: 'POST', body: fd });
+      let d = null;
+      try { d = await r.json(); } catch(e) { d = {}; }
+      if (r.status === 422 && d.detail && d.detail.gate) {
+        showGatePanel(d.detail.gate);
+        return null;
+      }
+      if (!r.ok) {
+        const det = d.detail;
+        throw new Error(typeof det === 'string' ? det : (det && JSON.stringify(det)) || 'Upload failed');
+      }
+      return d;
+    }
+
+    async function startProcess(force) {
+      const hasPhotos = uploadType === 'photos' && photoFiles.length >= 4;
+      const hasVideo = uploadType === 'video' && videoFile;
+      if (!hasPhotos && !hasVideo) {
+        alert('Please select at least 4 photos or a video.');
+        return;
+      }
+
+      const btn = document.getElementById('submitBtn');
+      btn.disabled = true;
+
+      try {
+        let jobId = '';
+        let vin = '';
+        let d = null;
+
+        if (hasPhotos) {
+          setProgress(10, 'Uploading photos...');
+          const fd = new FormData();
+          photoFiles.forEach(f => fd.append('photos', f));
+          d = await gateAwareUpload(fd, force);
+        } else {
+          setProgress(10, 'Uploading video...');
+          const fd = new FormData();
+          fd.append('video', videoFile);
+          d = await gateAwareUpload(fd, force);
+        }
+        if (!d) { setProgress(0, 'Capture rejected — see reasons above'); btn.disabled = false; return; }
+        jobId = d.job_id; vin = d.vin;
+
+        setProgress(40, 'Ordering photos...');
+        const r1 = await fetch('/api/process/' + jobId + '/order', { method: 'POST' });
+        if (!r1.ok) throw new Error('Ordering failed');
+
+        setProgress(70, 'Generating frames...');
+        const r2 = await fetch('/api/process/' + jobId + '/interpolate', { method: 'POST' });
+        if (!r2.ok) throw new Error('Interpolation failed');
+
+        setProgress(100, 'Building viewer...');
+        setTimeout(() => window.location.href = '/viewer/' + jobId, 400);
+      } catch(e) {
+        alert('Error: ' + e.message);
+        btn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
