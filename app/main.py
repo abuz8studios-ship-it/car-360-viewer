@@ -2933,7 +2933,39 @@ async def capture_page():
       document.getElementById('submitBtn').disabled = false;
     }}
 
-    async function startProcess() {{
+    function showGatePanel(gate) {{
+      let el = document.getElementById('gatePanel');
+      if (!el) {{
+        el = document.createElement('div');
+        el.id = 'gatePanel';
+        el.style.cssText = 'margin:12px 0;padding:12px 14px;border:1px solid #e6a23c;background:#fdf6ec;color:#7a4d00;border-radius:8px;font-size:14px;text-align:left';
+        const btn = document.getElementById('submitBtn');
+        btn.parentNode.insertBefore(el, btn);
+      }}
+      const reasons = (gate && gate.reasons) || [];
+      el.innerHTML = '<b>Capture quality check failed:</b><ul style="margin:6px 0 8px;padding-left:18px">' +
+        reasons.map(x => '<li>' + String(x).replace(/</g,'&lt;') + '</li>').join('') +
+        '</ul>Fix the capture and retry, or <button type="button" id="gateForceBtn" style="margin-left:4px">Upload anyway</button>';
+      document.getElementById('gateForceBtn').onclick = () => {{ el.remove(); startProcess(true); }};
+    }}
+
+    async function gateAwareUpload(fd, force) {{
+      if (force) fd.append('force', '1');
+      const r = await fetch('/api/upload', {{ method: 'POST', body: fd }});
+      let d = null;
+      try {{ d = await r.json(); }} catch(e) {{ d = {{}}; }}
+      if (r.status === 422 && d.detail && d.detail.gate) {{
+        showGatePanel(d.detail.gate);
+        return null;
+      }}
+      if (!r.ok) {{
+        const det = d.detail;
+        throw new Error(typeof det === 'string' ? det : (det && JSON.stringify(det)) || 'Upload failed');
+      }}
+      return d;
+    }}
+
+    async function startProcess(force) {{
       const hasPhotos = uploadType === 'photos' && photoFiles.length >= 4;
       const hasVideo = uploadType === 'video' && videoFile;
       if (!hasPhotos && !hasVideo) {{
@@ -2947,24 +2979,21 @@ async def capture_page():
       try {{
         let jobId = '';
         let vin = '';
+        let d = null;
 
         if (hasPhotos) {{
           setProgress(10, 'Uploading photos...');
           const fd = new FormData();
           photoFiles.forEach(f => fd.append('photos', f));
-          const r = await fetch('/api/upload', {{ method: 'POST', body: fd }});
-          if (!r.ok) throw new Error((await r.json()).detail || 'Upload failed');
-          const d = await r.json();
-          jobId = d.job_id; vin = d.vin;
+          d = await gateAwareUpload(fd, force);
         }} else {{
           setProgress(10, 'Uploading video...');
           const fd = new FormData();
           fd.append('video', videoFile);
-          const r = await fetch('/api/upload', {{ method: 'POST', body: fd }});
-          if (!r.ok) throw new Error((await r.json()).detail || 'Upload failed');
-          const d = await r.json();
-          jobId = d.job_id; vin = d.vin;
+          d = await gateAwareUpload(fd, force);
         }}
+        if (!d) {{ setProgress(0, 'Capture rejected — see reasons above'); btn.disabled = false; return; }}
+        jobId = d.job_id; vin = d.vin;
 
         setProgress(40, 'Ordering photos...');
         const r1 = await fetch('/api/process/' + jobId + '/order', {{ method: 'POST' }});
@@ -8010,7 +8039,10 @@ async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
                       photos: Optional[List[UploadFile]] = File(None),
                       steps: str = Form("7000"),
                       style: str = Form("natural"),
-                      backdrop: str = Form("light")):
+                      backdrop: str = Form("light"),
+                      force: str = Form("")):  # "1" bypasses the capture quality gate
+    from validate_video import validate_dir as _gate_dir, \
+        validate_video_file as _gate_video, gate_summary as _gate_sum
     # Accept any vehicle ID (real VIN or freeform) — sanitize to a safe folder name.
     vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
     if not vin:
@@ -8049,6 +8081,14 @@ async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
                 continue
         if saved < 4:
             raise HTTPException(status_code=400, detail="Upload at least 4 readable photos.")
+        # ── P0 QUALITY GATE — the exact input class that caused COLMAP 2/N ────
+        gate = _gate_dir(pdir)
+        if gate["verdict"] == "FAIL" and force != "1":
+            shutil.rmtree(pdir, ignore_errors=True)
+            raise HTTPException(status_code=422, detail={
+                "error": "capture_rejected", "gate": _gate_sum(gate)})
+        if gate["verdict"] == "FAIL":
+            print(f"[gate] FORCED past FAIL for {vin} (photos): {gate['reasons']}")
         mode_args = ["--images", str(pdir)]
     elif video is not None and getattr(video, "filename", ""):
         walk = vdir / "walkaround.mp4"
@@ -8057,6 +8097,18 @@ async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
             raise HTTPException(status_code=413, detail="Walkaround video too large")
         with open(walk, "wb") as f:
             f.write(content)
+        # ── P0 QUALITY GATE — reject before COLMAP/Brush burn GPU-hours ───────
+        try:
+            gate = _gate_video(walk)
+        except Exception as e:
+            gate = {"verdict": "FAIL", "reasons": [f"unreadable video: {e}"],
+                    "frames": 0, "checks": {}}
+        if gate["verdict"] == "FAIL" and force != "1":
+            walk.unlink(missing_ok=True)
+            raise HTTPException(status_code=422, detail={
+                "error": "capture_rejected", "gate": _gate_sum(gate)})
+        if gate["verdict"] == "FAIL":
+            print(f"[gate] FORCED past FAIL for {vin} (video): {gate['reasons']}")
         mode_args = ["--video", str(walk)]
     else:
         raise HTTPException(status_code=400, detail="Upload a walkaround video or 4+ photos.")
@@ -8068,7 +8120,8 @@ async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
          "--steps", str(steps_i), "--style", style, "--backdrop", backdrop],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(BASE_DIR))
     return {"status": "started", "vin": vin, "style": style, "backdrop": backdrop,
-            "status_url": f"/api/vehicle/{vin}/3d-status", "viewer": f"/splat3d/{vin}"}
+            "status_url": f"/api/vehicle/{vin}/3d-status", "viewer": f"/splat3d/{vin}",
+            "gate": _gate_sum(gate)}
 
 
 # ── Dealer branding assets (for the "branded" turntable style) ───────────────

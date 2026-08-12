@@ -93,6 +93,19 @@ def build_manifest(vin: str) -> dict:
             man["vehicle"] = json.loads(meta.read_text("utf-8"))
         except Exception:
             pass
+    if not man.get("vehicle"):
+        # upload flow writes the DB row, not meta.json — fall back so a fresh
+        # dealer's first vehicle gets a real title on /vdp, not a bare VIN
+        try:
+            conn = sqlite3.connect(str(DB_PATH))
+            conn.row_factory = sqlite3.Row
+            r = conn.execute("SELECT year, make, model, price, mileage "
+                             "FROM vehicles WHERE vin=?", (vin.upper(),)).fetchone()
+            conn.close()
+            if r:
+                man["vehicle"] = {k: r[k] for k in r.keys() if r[k]}
+        except Exception:
+            pass
     return man
 
 VDP_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">

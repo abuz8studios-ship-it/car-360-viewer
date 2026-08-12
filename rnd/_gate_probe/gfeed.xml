@@ -4,7 +4,7 @@
     <title>LotVue Motors Vehicle Inventory</title>
     <link>https://lotvue.abuz8ai.com</link>
     <description>Vehicle listings feed for Google vehicle ads</description>
-    <!-- 155 items emitted, 38 rows skipped (missing price or photos) -->
+    <!-- 155 items emitted, 37 rows skipped (missing price or photos) -->
     <item>
       <g:id>5TDGZRBH4NS569420</g:id>
       <g:vin>5TDGZRBH4NS569420</g:vin>

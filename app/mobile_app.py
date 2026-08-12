@@ -473,20 +473,41 @@ async function jsonDetail(r){
   catch(_){ return r.status===413 ? 'file too large for the connection' : ('server said '+r.status); }
 }
 
-async function uploadVideo(inp){
-  if(!inp.files.length) return;
-  const f = inp.files[0]; inp.value='';
+// Render the quality gate's structured reasons + an explicit override path.
+// The gate is the front door: bad captures get told WHY, not just "failed".
+function showGateReasons(el, gate, retryFn){
+  const reasons = (gate && gate.reasons) || [];
+  el.classList.remove('ok');
+  el.innerHTML = '<b>Capture check failed:</b><ul style="margin:6px 0 8px;padding-left:18px">' +
+    reasons.map(x=>'<li>'+String(x).replace(/</g,'&lt;')+'</li>').join('') +
+    '</ul><button class="btn secondary" style="margin-top:4px" id="gateForceBtn">Upload anyway</button>';
+  document.getElementById('gateForceBtn').onclick = ()=>{ el.textContent=''; retryFn(); };
+}
+
+async function uploadVideo(inp, fileOverride, force){
+  if(!fileOverride && !inp.files.length) return;
+  const f = fileOverride || inp.files[0]; if(inp) inp.value='';
   const msg=document.getElementById('vidMsg'); msg.textContent=''; msg.classList.remove('ok');
   const bar=document.getElementById('vidProg');
   // the public URL rides a Cloudflare tunnel that caps uploads at ~100MB
   if(f.size > 95*1024*1024){ msg.textContent='Video over 95MB — trim to ~60s or lower the resolution and retry.'; return; }
   document.getElementById('vidBtn').disabled=true;
-  msg.textContent='Uploading video…';
+  msg.textContent= force ? 'Uploading video (quality check overridden)…' : 'Uploading video…';
   try{
     const fd=new FormData();
     fd.append('video', f, 'walkaround.mp4');
     fd.append('style','natural');
+    if(force) fd.append('force','1');
     const r=await api('/api/vehicle/'+VIN+'/generate-3d',{method:'POST',body:fd});
+    if(r.status===422){
+      let d=null; try{ d=(await r.json()).detail; }catch(_){}
+      if(d && d.gate){
+        showGateReasons(msg, d.gate, ()=>uploadVideo(null, f, true));
+        document.getElementById('vidBtn').disabled=false;
+        return;
+      }
+      throw new Error((d && d.error) || 'capture rejected');
+    }
     if(!r.ok){ throw new Error(await jsonDetail(r)); }
     msg.textContent='Building the 360 from your video…';
     const done = await pollBuild(bar);
