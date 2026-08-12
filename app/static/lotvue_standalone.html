@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LOTVUE Pro 360° Viewer — 2022 Mercedes-Benz GLE</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            color: white;
+        }
+        .header { text-align: center; margin-bottom: 30px; }
+        .header h1 { font-size: 2.5rem; margin-bottom: 10px; }
+        .header p { opacity: 0.8; }
+        .viewer-container {
+            background: rgba(255,255,255,0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            width: 100%;
+            max-width: 1200px;
+        }
+        .viewer-content {
+            position: relative; background: #000;
+            border-radius: 15px; overflow: hidden;
+            aspect-ratio: 16/9;
+        }
+        .exterior-viewer {
+            width: 100%; height: 100%; position: relative;
+            cursor: grab;
+        }
+        .exterior-viewer:active { cursor: grabbing; }
+        .frame {
+            position: absolute; top: 0; left: 0;
+            width: 100%; height: 100%;
+            object-fit: contain; user-select: none;
+        }
+        .controls {
+            position: absolute; bottom: 20px; left: 50%;
+            transform: translateX(-50%);
+            display: flex; gap: 10px; z-index: 100;
+        }
+        .control-btn {
+            padding: 10px 20px; border: none;
+            background: rgba(255,255,255,0.2);
+            color: white; border-radius: 20px;
+            cursor: pointer; font-size: 0.9rem;
+            backdrop-filter: blur(5px);
+        }
+        .control-btn:hover { background: rgba(255,255,255,0.3); }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🚗 2022 Mercedes-Benz GLE 450 4MATIC</h1>
+        <p>Drag to rotate • Scroll to zoom • ,299 • 23,054 miles</p>
+    </div>
+    
+    <div class="viewer-container">
+        <div class="viewer-content">
+            <div id="exterior-viewer" class="exterior-viewer">
+                <img class="frame" src="https://imagescf.dealercenter.net/600/450/202405-eebd227a11234bb2a807b45b6e3069d6/202601-206fe9a91da3402ea3933cbe482e2e02.jpg">
+            </div>
+            <div class="controls">
+                <button class="control-btn" onclick="prev()">◀</button>
+                <button class="control-btn" onclick="autoRotate()">⏯ Auto</button>
+                <button class="control-btn" onclick="next()">▶</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const viewer = document.getElementById('exterior-viewer');
+        let angle = 0;
+        let autoRotateInterval = null;
+        
+        // Simulate 360 rotation with same image (demo)
+        viewer.addEventListener('mousedown', (e) => {
+            let startX = e.clientX;
+            let startAngle = angle;
+            
+            const onMouseMove = (e) => {
+                const deltaX = e.clientX - startX;
+                angle = startAngle + deltaX * 0.5;
+                updateViewer();
+            };
+            
+            const onMouseUp = () => {
+                document.removeEventListener('mousemove', onMouseMove);
+                document.removeEventListener('mouseup', onMouseUp);
+            };
+            
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('mouseup', onMouseUp);
+        });
+        
+        function updateViewer() {
+            viewer.style.transform = otateY(deg);
+        }
+        
+        function prev() { angle -= 90; updateViewer(); }
+        function next() { angle += 90; updateViewer(); }
+        function autoRotate() {
+            if (autoRotateInterval) {
+                clearInterval(autoRotateInterval);
+                autoRotateInterval = null;
+            } else {
+                autoRotateInterval = setInterval(() => {
+                    angle += 2;
+                    updateViewer();
+                }, 50);
+            }
+        }
+    </script>
+</body>
+</html>

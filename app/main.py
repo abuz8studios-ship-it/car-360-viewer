@@ -415,6 +415,12 @@ def init_db():
             hotspot_y REAL DEFAULT 0.5
         )
     """)
+    # migrations: damage layer (condition_type/severity/note) + optional close-up
+    hs_cols = {r[1] for r in conn.execute("PRAGMA table_info(hotspots)")}
+    for col, ddl in (("condition_type", "TEXT DEFAULT ''"), ("severity", "TEXT DEFAULT ''"),
+                     ("note", "TEXT DEFAULT ''"), ("close_up", "TEXT DEFAULT ''")):
+        if col not in hs_cols:
+            conn.execute(f"ALTER TABLE hotspots ADD COLUMN {col} {ddl}")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS dealers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3574,10 +3580,12 @@ async def upload_media(
     make: str = Form(""),
     model: str = Form(""),
     color: str = Form(""),
+    force: str = Form(""),  # "1" bypasses the capture quality gate (logged)
     video: Optional[UploadFile] = File(None),
     photos: Optional[List[UploadFile]] = File(None),
 ):
     import uuid
+    from validate_video import validate_dir, validate_video_file, gate_summary
     job_id = str(uuid.uuid4())
 
     # Auto-generate VIN if not provided
@@ -3630,9 +3638,20 @@ async def upload_media(
             img.save(save_path, "JPEG", quality=95)
             photo_count += 1
 
+        # ── P0 QUALITY GATE (Spyne validate-video parity) ────────────────────
+        gate = validate_dir(raw_dir)
+        if gate["verdict"] == "FAIL" and force != "1":
+            for f in raw_dir.glob("frame_*.jpg"):
+                f.unlink()
+            raise HTTPException(status_code=422, detail={
+                "error": "capture_rejected", "gate": gate_summary(gate)})
+        if gate["verdict"] == "FAIL":
+            print(f"[gate] FORCED past FAIL for {vin}: {gate['reasons']}")
+
         db_upsert_vehicle(vin, year, make, model, photo_count, 0, job_id=job_id)
 
-        return {"job_id": job_id, "photo_count": photo_count, "status": "uploaded", "vin": vin}
+        return {"job_id": job_id, "photo_count": photo_count, "status": "uploaded",
+                "vin": vin, "gate": gate_summary(gate)}
 
     # ── Video branch ─────────────────────────────────────────────────────────
     if not video:
@@ -3647,6 +3666,20 @@ async def upload_media(
     with open(video_path, "wb") as f:
         f.write(content)
 
+    # ── P0 QUALITY GATE — runs BEFORE the expensive extract+matting pipeline ─
+    try:
+        gate = validate_video_file(video_path)
+    except Exception as e:
+        gate = {"verdict": "FAIL", "reasons": [f"unreadable video: {e}"],
+                "frames": 0, "checks": {}}
+    if gate["verdict"] == "FAIL" and force != "1":
+        if video_path.exists():
+            video_path.unlink()
+        raise HTTPException(status_code=422, detail={
+            "error": "capture_rejected", "gate": gate_summary(gate)})
+    if gate["verdict"] == "FAIL":
+        print(f"[gate] FORCED past FAIL for {vin}: {gate['reasons']}")
+
     try:
         num_extracted = extract_frames(video_path, exterior_dir, NUM_EXTERIOR_FRAMES)
     except Exception as e:
@@ -3660,7 +3693,8 @@ async def upload_media(
     generate_thumbnail(exterior_dir, vehicle_dir / "thumbnail.jpg")
     db_upsert_vehicle(vin, year, make, model, num_extracted, 0, job_id=job_id)
 
-    return {"job_id": job_id, "vin": vin, "frames_extracted": num_extracted, "status": "uploaded"}
+    return {"job_id": job_id, "vin": vin, "frames_extracted": num_extracted,
+            "status": "uploaded", "gate": gate_summary(gate)}
 
 
 # =============================================================================
@@ -4009,35 +4043,62 @@ async def add_hotspot(
     photo_filename: str = Form(...),
     tag: str = Form(...),
     x: str = Form("0.5"),
-    y: str = Form("0.5")
+    y: str = Form("0.5"),
+    note: str = Form(""),
+    condition_type: str = Form(""),   # "" = feature; scratch|dent|chip|rust|crack|other = damage
+    severity: str = Form(""),         # minor|moderate|major (damage only)
+    photo: Optional[UploadFile] = File(None),  # optional close-up of the spot
 ):
-    """Add a hotspot to a photo."""
+    """Add a hotspot to a spin frame. Damage hotspots carry condition_type +
+    severity and surface in the printable report at /vdp/{vin}/damage-report."""
     vin = vin.upper()
+    if condition_type and severity not in ("minor", "moderate", "major"):
+        raise HTTPException(status_code=400,
+                            detail="damage hotspot needs severity: minor|moderate|major")
+    close_up = ""
+    if photo is not None:
+        raw = await photo.read()
+        if len(raw) > MAX_PHOTO_MB * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"Photo too large (max {MAX_PHOTO_MB}MB)")
+        hs_dir = STORAGE_DIR / vin / "hotspot_photos"
+        hs_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Cannot process photo: {e}")
+        import uuid as _uuid
+        close_up = f"hs_{_uuid.uuid4().hex[:10]}.jpg"
+        img.save(hs_dir / close_up, "JPEG", quality=90)
     conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.execute(
-        "INSERT INTO hotspots (vin, photo_filename, tag, hotspot_x, hotspot_y) VALUES (?, ?, ?, ?, ?)",
-        (vin, photo_filename, tag, float(x), float(y))
+        "INSERT INTO hotspots (vin, photo_filename, tag, hotspot_x, hotspot_y, "
+        "condition_type, severity, note, close_up) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (vin, photo_filename, tag, float(x), float(y), condition_type, severity, note, close_up)
     )
     conn.commit()
     hotspot_id = cursor.lastrowid
     conn.close()
-    return {"status": "ok", "id": hotspot_id}
+    return {"status": "ok", "id": hotspot_id, "close_up": close_up}
 
 
 @app.get("/api/hotspots/{vin}")
 async def get_hotspots(vin: str):
-    """Get all hotspots for a vehicle."""
+    """Get all hotspots for a vehicle (public read — viewer + damage report)."""
     vin = vin.upper()
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     cursor = conn.execute(
-        "SELECT id, photo_filename, tag, hotspot_x, hotspot_y FROM hotspots WHERE vin = ?",
+        "SELECT id, photo_filename, tag, hotspot_x, hotspot_y, "
+        "condition_type, severity, note, close_up FROM hotspots WHERE vin = ?",
         (vin,)
     )
     rows = cursor.fetchall()
     conn.close()
     return [
-        {"id": r["id"], "photo": r["photo_filename"], "tag": r["tag"], "x": r["hotspot_x"], "y": r["hotspot_y"]}
+        {"id": r["id"], "photo": r["photo_filename"], "tag": r["tag"],
+         "x": r["hotspot_x"], "y": r["hotspot_y"],
+         "condition_type": r["condition_type"] or "", "severity": r["severity"] or "",
+         "note": r["note"] or "", "close_up": r["close_up"] or ""}
         for r in rows
     ]
 

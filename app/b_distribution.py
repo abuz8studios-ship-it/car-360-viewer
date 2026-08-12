@@ -315,40 +315,64 @@ async def fb_catalog_csv():
 @router.get("/api/feeds/google-vehicle-listings.xml")
 async def google_vehicle_feed():
     """Google Vehicle Listings feed (Merchant Center 'vehicle ads' XML).
-    Register at Merchant Center → vehicle ads program, point it at this URL."""
+    Register at Merchant Center → vehicle ads program, point it at this URL.
+
+    Emits every REQUIRED attribute per the published spec
+    (developers.google.com/vehicle-listings/reference/feed-specification,
+    fetched 2026-08-12): vin, store_code, dealership_name, dealership_address,
+    price, condition, make, model, trim (where available), year, mileage.
+    Rows with no price or no photo are SKIPPED — Google disapproves them and
+    partial items drag down feed quality score."""
+    from xml.sax.saxutils import escape
     conn = _db()
     rows = conn.execute("SELECT * FROM vehicles WHERE exterior_frames > 0 OR price != ''").fetchall()
     conn.close()
     base = _public_base()
     store_code = os.getenv("LOTVUE_GOOGLE_STORE_CODE", "lotvue-demo")
-    items = []
+    dealer_name = os.getenv("LOTVUE_DEALER_NAME", "LotVue Motors")
+    dealer_addr = ", ".join(x for x in (
+        os.getenv("LOTVUE_DEALER_ADDR1", ""), os.getenv("LOTVUE_DEALER_CITY", ""),
+        os.getenv("LOTVUE_DEALER_REGION", ""), os.getenv("LOTVUE_DEALER_POSTAL", ""),
+        os.getenv("LOTVUE_DEALER_COUNTRY", "US")) if x)
+    items, skipped = [], 0
     for v in rows:
-        title = f"{v['year']} {v['make']} {v['model']} {v['trim_level'] or ''}".strip()
         photos = _photo_urls(v["vin"], limit=10)
-        price_val = str(v["price"] or "0").replace("$", "").replace(",", "")
-        imgs = "\n".join(f"      <g:additional_image_link>{u}</g:additional_image_link>" for u in photos[1:])
+        price_val = str(v["price"] or "").replace("$", "").replace(",", "").strip()
+        if not photos or not price_val or price_val == "0":
+            skipped += 1
+            continue
+        e = lambda s: escape(str(s or ""))
+        title = e(f"{v['year']} {v['make']} {v['model']} {v['trim_level'] or ''}".strip())
+        trim = f"\n      <g:trim>{e(v['trim_level'])}</g:trim>" if v["trim_level"] else ""
+        color = (f"\n      <g:exterior_color>{e(v['color'])}</g:exterior_color>"
+                 if v["color"] else "")
+        imgs = "\n".join(f"      <g:additional_image_link>{e(u)}</g:additional_image_link>"
+                         for u in photos[1:])
         items.append(f"""    <item>
-      <g:id>{v['vin']}</g:id>
+      <g:id>{e(v['vin'])}</g:id>
+      <g:vin>{e(v['vin'])}</g:vin>
       <title>{title}</title>
-      <link>{base}/view/{v['vin']}</link>
-      <g:store_code>{store_code}</g:store_code>
-      <g:price>{price_val} USD</g:price>
+      <link>{e(base)}/view/{e(v['vin'])}</link>
+      <g:store_code>{e(store_code)}</g:store_code>
+      <g:dealership_name>{e(dealer_name)}</g:dealership_name>
+      <g:dealership_address>{e(dealer_addr)}</g:dealership_address>
+      <g:price>{e(price_val)} USD</g:price>
       <g:condition>used</g:condition>
-      <g:brand>{v['make'] or ''}</g:brand>
-      <g:model>{v['model'] or ''}</g:model>
-      <g:year>{v['year'] or ''}</g:year>
-      <g:mileage>{v['mileage'] or '0'} miles</g:mileage>
-      <g:color>{v['color'] or ''}</g:color>
-      <g:vehicle_fulfillment option="in_store" store_code="{store_code}"/>
-      <g:image_link>{photos[0] if photos else ''}</g:image_link>
+      <g:make>{e(v['make'])}</g:make>
+      <g:model>{e(v['model'])}</g:model>{trim}
+      <g:year>{e(v['year'])}</g:year>
+      <g:mileage>{e(v['mileage'] or '0')} miles</g:mileage>{color}
+      <g:vehicle_fulfillment option="in_store" store_code="{e(store_code)}"/>
+      <g:image_link>{e(photos[0])}</g:image_link>
 {imgs}
     </item>""")
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
   <channel>
-    <title>LotVue360 Vehicle Inventory</title>
-    <link>{base}</link>
+    <title>{escape(dealer_name)} Vehicle Inventory</title>
+    <link>{escape(base)}</link>
     <description>Vehicle listings feed for Google vehicle ads</description>
+    <!-- {len(items)} items emitted, {skipped} rows skipped (missing price or photos) -->
 {chr(10).join(items)}
   </channel>
 </rss>"""

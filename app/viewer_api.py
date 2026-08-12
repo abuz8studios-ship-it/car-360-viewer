@@ -4,11 +4,31 @@ Serves the per-vehicle render manifest that <lotvue-viewer> consumes, and the
 embeddable VDP page. One manifest, three tiers: spin / splat / glb.
 """
 import json
+import sqlite3
 from pathlib import Path
 from fastapi import HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 STORAGE_ROOTS = (Path(__file__).parent / "storage", Path(__file__).parent / "vehicles")
+DB_PATH = Path(__file__).parent / "vehicles.db"
+
+SEV_ORDER = {"major": 0, "moderate": 1, "minor": 2}
+
+
+def _db_hotspots(vin: str):
+    """Dealer-placed hotspots (feature + damage) from the DB — the same rows
+    /api/hotspot writes. Returns [] on any error so the viewer never breaks."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, photo_filename, tag, hotspot_x, hotspot_y, condition_type,"
+            " severity, note, close_up FROM hotspots WHERE vin=?", (vin.upper(),)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 def _vehicle_dir(vin: str) -> Path:
     for root in STORAGE_ROOTS:
@@ -49,6 +69,24 @@ def build_manifest(vin: str) -> dict:
             man["hotspots"] = json.loads(hs.read_text("utf-8"))
         except Exception:
             pass
+    # merge dealer-placed DB hotspots (feature pins + damage layer)
+    db_hs = _db_hotspots(vin)
+    if db_hs:
+        frame_names = [u.rsplit("/", 1)[-1] for u in man["spin_frames"]]
+        merged = list(man.get("hotspots", []))
+        for h in db_hs:
+            try:
+                frame = frame_names.index(h["photo_filename"])
+            except ValueError:
+                frame = 0
+            body = h["note"] or ""
+            if h["condition_type"]:
+                body = f"[{h['severity'] or 'noted'} {h['condition_type']}] {body}".strip()
+            merged.append({"frame": frame, "u": h["hotspot_x"], "v": h["hotspot_y"],
+                           "label": h["tag"], "body": body,
+                           "damage": bool(h["condition_type"]),
+                           "severity": h["severity"] or ""})
+        man["hotspots"] = merged
     meta = d / "meta.json"
     if meta.exists():
         try:
@@ -80,6 +118,7 @@ VDP_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
  <a href="/api/leadmagnet/book-test-drive?vin={vin}">Book a test drive</a>
  <a href="/api/leadmagnet/{vin}/price-advisor">Price advisor</a>
  <a href="/api/leadmagnet/request-history?vin={vin}">Vehicle history</a>
+ <a href="/vdp/{vin}/damage-report">Condition report</a>
 </div>
 <div id="bdc"><div id="log"><div>Ask me anything about this vehicle — I only answer from its real specs.</div></div>
  <input id="q" placeholder="e.g. Does it have AWD? What's the mileage?" autocomplete="off"></div>
@@ -114,6 +153,66 @@ def register_viewer(app):
         bits = [str(v[k]) for k in ("trim", "mileage", "price") if v.get(k)]
         return VDP_HTML.format(vin=vin, vin_js=json.dumps(vin), title=title,
                                sub=" · ".join(bits) or "LotVue Pro 3D listing")
+
+    @app.get("/vdp/{vin}/damage-report", response_class=HTMLResponse)
+    async def damage_report(vin: str):
+        """Printable condition/damage summary — damage-tagged hotspots with
+        severity, notes, close-ups, and dot-marked frames. Public read."""
+        man = build_manifest(vin)
+        v = man.get("vehicle", {})
+        title = " ".join(str(v.get(k, "")) for k in ("year", "make", "model")).strip() or f"VIN {vin}"
+        rows = [h for h in _db_hotspots(vin) if h["condition_type"]]
+        rows.sort(key=lambda h: SEV_ORDER.get(h["severity"], 3))
+        frames = man.get("spin_frames", [])
+        counts = {s: sum(1 for h in rows if h["severity"] == s)
+                  for s in ("major", "moderate", "minor")}
+        chips = " ".join(f'<span class="chip {s}">{counts[s]} {s}</span>'
+                         for s in ("major", "moderate", "minor") if counts[s])
+        items = []
+        for i, h in enumerate(rows, 1):
+            frame_url = ""
+            for u in frames:
+                if u.endswith("/" + h["photo_filename"]):
+                    frame_url = u
+                    break
+            img = (f'<div class="shot"><img src="{frame_url}" alt="frame">'
+                   f'<span class="dot" style="left:{h["hotspot_x"]*100:.1f}%;'
+                   f'top:{h["hotspot_y"]*100:.1f}%"></span></div>') if frame_url else ""
+            close = (f'<img class="close" src="/storage/{vin}/hotspot_photos/{h["close_up"]}" '
+                     'alt="close-up">') if h["close_up"] else ""
+            note = (h["note"] or "").replace("<", "&lt;")
+            items.append(
+                f'<div class="item"><div class="head"><b>#{i} {h["tag"]}</b>'
+                f'<span class="chip {h["severity"]}">{h["severity"]} {h["condition_type"]}</span></div>'
+                f'{img}{close}<p>{note}</p></div>')
+        body = "".join(items) or ('<p class="clean">No damage recorded. Every hotspot on '
+                                  'this vehicle is a feature callout — nothing tagged as '
+                                  'scratch, dent, chip, rust or crack.</p>')
+        return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Condition report — {title}</title><style>
+ body{{margin:0;background:#fff;color:#16202e;font-family:-apple-system,'Segoe UI',Roboto,sans-serif}}
+ .wrap{{max-width:820px;margin:0 auto;padding:28px 22px}}
+ h1{{font-size:22px;margin:0 0 2px}} .sub{{color:#5c6c82;font-size:13px;margin-bottom:14px}}
+ .chip{{display:inline-block;border-radius:20px;padding:2px 10px;font-size:12px;font-weight:600;
+   margin-left:8px;color:#fff;background:#8a97a8;text-transform:uppercase}}
+ .chip.major{{background:#c0392b}} .chip.moderate{{background:#d68910}} .chip.minor{{background:#7d8ea5}}
+ .item{{border:1px solid #dde4ee;border-radius:10px;padding:14px;margin:14px 0;page-break-inside:avoid}}
+ .head{{display:flex;align-items:center;justify-content:space-between}}
+ .shot{{position:relative;margin-top:10px}} .shot img{{width:100%;border-radius:8px;display:block}}
+ .dot{{position:absolute;width:22px;height:22px;border-radius:50%;border:3px solid #e74c3c;
+   background:rgba(231,76,60,.25);transform:translate(-50%,-50%)}}
+ img.close{{max-width:280px;border-radius:8px;margin-top:10px;display:block}}
+ .clean{{color:#3f9142;font-size:15px;border:1px solid #cfe6d0;background:#f2faf2;
+   border-radius:10px;padding:16px}}
+ .print{{margin:16px 0}} @media print{{.print{{display:none}}}}
+ p{{font-size:14px;line-height:1.5;color:#39485c}}
+</style></head><body><div class="wrap">
+<h1>Condition report — {title}</h1>
+<div class="sub">VIN {vin} · generated by LotVue Pro {chips}</div>
+<button class="print" onclick="window.print()">Print / save as PDF</button>
+{body}
+</div></body></html>"""
 
     @app.get("/embed/{vin}", response_class=HTMLResponse)
     async def embed_page(vin: str):
