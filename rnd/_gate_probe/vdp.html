@@ -1,0 +1,44 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>2012 MERCEDES-BENZ CL-CLASS — LotVue Pro</title>
+<style>
+ body{margin:0;background:#0a1226;color:#e2eaf8;font-family:-apple-system,'Segoe UI',Roboto,sans-serif}
+ .wrap{max-width:1100px;margin:0 auto;padding:18px}
+ lotvue-spin{display:block;height:64vh;min-height:400px}
+ h1{font-size:22px;margin:14px 0 4px} .sub{color:#8ea6d4;font-size:13px}
+ .row{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
+ .row a{background:rgba(90,140,255,.2);border:1px solid rgba(120,165,255,.45);color:#dfe8ff;
+   text-decoration:none;border-radius:9px;padding:9px 16px;font-size:13.5px}
+ #bdc{margin-top:18px;background:rgba(255,255,255,.05);border:1px solid rgba(150,180,235,.16);
+   border-radius:12px;padding:14px}
+ #bdc input{width:100%;box-sizing:border-box;background:rgba(10,18,40,.8);border:1px solid rgba(120,165,255,.35);
+   color:#e6eeff;border-radius:8px;padding:10px 12px;font-size:14px}
+ #log div{margin:8px 0;font-size:13.5px;line-height:1.5} #log .q{color:#9fb8e8}
+</style></head><body><div class="wrap">
+<lotvue-spin vin="WDDEJ7EB9CA029569"></lotvue-spin>
+<h1>2012 MERCEDES-BENZ CL-CLASS</h1><div class="sub">66407 · 40999</div>
+<div class="row">
+ <a href="/api/leadmagnet/book-test-drive?vin=WDDEJ7EB9CA029569">Book a test drive</a>
+ <a href="/api/leadmagnet/WDDEJ7EB9CA029569/price-advisor">Price advisor</a>
+ <a href="/api/leadmagnet/request-history?vin=WDDEJ7EB9CA029569">Vehicle history</a>
+ <a href="/vdp/WDDEJ7EB9CA029569/damage-report">Condition report</a>
+</div>
+<div id="bdc"><div id="log"><div>Ask me anything about this vehicle — I only answer from its real specs.</div></div>
+ <input id="q" placeholder="e.g. Does it have AWD? What's the mileage?" autocomplete="off"></div>
+<script type="module">import '/static/lotvue_spin.js';</script>
+<script>
+const vin="WDDEJ7EB9CA029569";
+document.getElementById('q').addEventListener('keydown', async e => {
+  if (e.key !== 'Enter' || !e.target.value.trim()) return;
+  const q = e.target.value.trim(); e.target.value = '';
+  const log = document.getElementById('log');
+  log.insertAdjacentHTML('beforeend', '<div class="q">You: ' + q.replace(/</g,'&lt;') + '</div>');
+  try {
+    const r = await fetch('/api/chat/' + vin, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({message: q})});
+    const j = await r.json();
+    log.insertAdjacentHTML('beforeend', '<div>' + (j.reply || j.response || j.answer || 'One moment…').replace(/</g,'&lt;') + '</div>');
+  } catch (err) { log.insertAdjacentHTML('beforeend', '<div>Connection hiccup — try again.</div>'); }
+  log.scrollTop = log.scrollHeight;
+});
+</script></div></body></html>

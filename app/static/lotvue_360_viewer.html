@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LOTVUE Pro — 360° Interactive Vehicle Viewer</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:20px;color:white}
+.header{text-align:center;margin-bottom:30px}
+.header h1{font-size:2.2rem;margin-bottom:10px}
+.header p{opacity:.8;font-size:1.1rem}
+.viewer-container{background:rgba(255,255,255,.05);backdrop-filter:blur(10px);border-radius:20px;padding:30px;width:100%;max-width:1200px}
+.viewer-content{position:relative;background:#000;border-radius:15px;overflow:hidden;aspect-ratio:16/9}
+.car-container{width:100%;height:100%;position:relative;cursor:grab;transition:transform .1s ease}
+.car-container:active{cursor:grabbing}
+.car-img{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%) rotateY(0deg);width:80%;max-width:600px;user-select:none;pointer-events:none}
+.controls{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);display:flex;gap:10px;z-index:100}
+.btn{padding:10px 20px;border:none;background:rgba(255,255,255,.2);color:white;border-radius:20px;cursor:pointer;font-size:.9rem;backdrop-filter:blur(5px);transition:background .2s}
+.btn:hover{background:rgba(255,255,255,.3)}
+.info{position:absolute;top:15px;left:15px;background:rgba(0,0,0,.7);padding:10px 15px;border-radius:10px;font-size:.85rem;backdrop-filter:blur(5px)}
+.angle-display{position:absolute;top:15px;right:15px;background:rgba(0,0,0,.7);padding:10px 15px;border-radius:10px;font-size:.85rem;font-family:monospace;backdrop-filter:blur(5px)}
+</style>
+</head>
+<body>
+<div class="header">
+<h1>🚗 2022 Mercedes-Benz GLE 450 4MATIC</h1>
+<p>Drag to rotate • Scroll to zoom • $50,299 • 23,054 miles</p>
+</div>
+<div class="viewer-container">
+<div class="viewer-content">
+<div class="info">LOTVUE Pro — 360° Interactive Viewer</div>
+<div class="angle-display" id="angle">0°</div>
+<div class="car-container" id="carContainer">
+<img src="https://imagescf.dealercenter.net/600/450/202405-eebd227a11234bb2a807b45b6e3069d6/202601-206fe9a91da3402ea3933cbe482e2e02.jpg" class="car-img" id="carImg" alt="Mercedes-Benz GLE">
+</div>
+<div class="controls">
+<button class="btn" onclick="prev()">◀ Previous</button>
+<button class="btn" onclick="toggleAuto()">⏯ Auto Rotate</button>
+<button class="btn" onclick="next()">Next ▶</button>
+<button class="btn" onclick="reset()">↺ Reset</button>
+</div>
+</div>
+</div>
+<script>
+const container=document.getElementById('carContainer');
+const img=document.getElementById('carImg');
+const angleDisplay=document.getElementById('angle');
+let angle=0,autoRotate=false,interval=null,isDragging=false,startX=0,startAngle=0;
+container.addEventListener('mousedown',e=>{isDragging=true;startX=e.clientX;startAngle=angle;container.style.cursor='grabbing'});
+window.addEventListener('mousemove',e=>{if(!isDragging)return;const dx=e.clientX-startX;angle=startAngle+dx*0.5;update()});
+window.addEventListener('mouseup',()=>{isDragging=false;container.style.cursor='grab'});
+container.addEventListener('wheel',e=>{e.preventDefault();angle+=e.deltaY>0?5:-5;update()},{passive:false});
+container.addEventListener('touchstart',e=>{isDragging=true;startX=e.touches[0].clientX;startAngle=angle},{passive:true});
+container.addEventListener('touchmove',e=>{if(!isDragging)return;const dx=e.touches[0].clientX-startX;angle=startAngle+dx*0.5;update()},{passive:true});
+container.addEventListener('touchend',()=>{isDragging=false});
+function update(){
+angle=((angle%360)+360)%360;
+img.style.transform=`translate(-50%,-50%) rotateY(${angle}deg) scale(${getZoom()})`;
+img.style.filter=`hue-rotate(${angle*0.3}deg) brightness(${1+Math.sin(angle*Math.PI/180)*0.1})`;
+angleDisplay.textContent=Math.round(angle)+'°';
+}
+function getZoom(){
+const delta=Math.abs(angle-startAngle);
+return 1+Math.min(delta/360,0.3);
+}
+function prev(){angle-=90;update()}
+function next(){angle+=90;update()}
+function reset(){angle=0;update()}
+function toggleAuto(){
+if(autoRotate){clearInterval(interval);autoRotate=false}
+else{autoRotate=true;interval=setInterval(()=>{angle=(angle+2)%360;update()},50)}
+}
+document.addEventListener('keydown',e=>{
+if(e.key==='ArrowLeft')prev();
+if(e.key==='ArrowRight')next();
+if(e.key===' '){e.preventDefault();toggleAuto()}
+});
+update();
+</script>
+</body>
+</html>

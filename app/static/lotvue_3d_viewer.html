@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LOTVUE Pro — Interactive 3D Vehicle Viewer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+        
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .header p {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+        
+        .viewer-container {
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            width: 100%;
+            max-width: 1200px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        
+        .viewer-tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .tab-btn {
+            flex: 1;
+            padding: 12px 20px;
+            border: none;
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        
+        .tab-btn:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        
+        .tab-btn.active {
+            background: white;
+            color: #667eea;
+        }
+        
+        .viewer-content {
+            position: relative;
+            background: #1a1a2e;
+            border-radius: 15px;
+            overflow: hidden;
+            aspect-ratio: 16/9;
+        }
+        
+        /* Exterior 360° Viewer */
+        .exterior-viewer {
+            width: 100%;
+            height: 100%;
+            position: relative;
+            cursor: grab;
+        }
+        
+        .exterior-viewer:active {
+            cursor: grabbing;
+        }
+        
+        .frame {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            user-select: none;
+            -webkit-user-drag: none;
+        }
+        
+        /* Interior Panorama Viewer */
+        .panorama-container {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+        
+        .panorama-wrapper {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+        
+        .panorama-wrapper canvas {
+            width: 100%;
+            height: 100%;
+        }
+        
+        .panorama-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        
+        .panorama-controls {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            display: flex;
+            gap: 10px;
+            z-index: 100;
+        }
+        
+        .controls-btn {
+            width: 40px;
+            height: 40px;
+            border: none;
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 1.2rem;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(5px);
+        }
+        
+        .controls-btn:hover {
+            background: rgba(255,255,255,0.4);
+            transform: scale(1.1);
+        }
+        
+        .scene-selector {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            display: flex;
+            gap: 10px;
+            z-index: 100;
+        }
+        
+        .scene-btn {
+            padding: 8px 16px;
+            border: none;
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(5px);
+        }
+        
+        .scene-btn:hover {
+            background: rgba(255,255,255,0.4);
+        }
+        
+        /* Loading State */
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 1.2rem;
+            text-align: center;
+        }
+        
+        .loading-spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid rgba(255,255,255,0.3);
+            border-top: 4px solid white;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        /* Hotspots */
+        .hotspot {
+            position: absolute;
+            width: 30px;
+            height: 30px;
+            background: rgba(255,255,255,0.9);
+            border: 3px solid #667eea;
+            border-radius: 50%;
+            cursor: pointer;
+            z-index: 100;
+            transition: all 0.3s ease;
+        }
+        
+        .hotspot:hover {
+            transform: scale(1.2);
+            background: #667eea;
+        }
+        
+        .hotspot::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 10px;
+            height: 10px;
+            background: #667eea;
+            border-radius: 50%;
+        }
+        
+        /* Info Panel */
+        .info-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0,0,0,0.8);
+            color: white;
+            padding: 15px 20px;
+            border-radius: 10px;
+            max-width: 300px;
+            z-index: 100;
+            backdrop-filter: blur(10px);
+        }
+        
+        .info-panel h3 {
+            margin-bottom: 10px;
+            font-size: 1.1rem;
+        }
+        
+        .info-panel p {
+            font-size: 0.9rem;
+            line-height: 1.6;
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 1.8rem;
+            }
+            
+            .viewer-container {
+                padding: 15px;
+            }
+            
+            .tab-btn {
+                padding: 10px 15px;
+                font-size: 0.9rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🚗 LOTVUE Pro — Interactive 3D Viewer</h1>
+        <p>Drag to rotate • Scroll to zoom • Double-click to reset</p>
+    </div>
+    
+    <div class="viewer-container">
+        <div class="viewer-tabs">
+            <button class="tab-btn active" data-view="exterior">Exterior 360°</button>
+            <button class="tab-btn" data-view="interior">Interior 360°</button>
+        </div>
+        
+        <div class="viewer-content">
+            <!-- Exterior 360° Viewer -->
+            <div id="exterior-viewer" class="exterior-viewer" data-lotvue-exterior>
+                <div class="loading" id="exterior-loading">
+                    <div class="loading-spinner"></div>
+                    <div>Loading exterior frames...</div>
+                </div>
+                <!-- Frames will be injected here -->
+            </div>
+            
+            <!-- Interior Panorama Viewer -->
+            <div id="interior-viewer" class="panorama-container" data-lotvue-panorama style="display: none;">
+                <div class="panorama-wrapper" id="panorama-canvas">
+                    <div class="loading" id="panorama-loading">
+                        <div class="loading-spinner"></div>
+                        <div>Loading interior panorama...</div>
+                    </div>
+                </div>
+                <div class="panorama-controls">
+                    <button class="controls-btn" data-action="reset" title="Reset View">⟳</button>
+                    <button class="controls-btn" data-action="fullscreen" title="Fullscreen">⛶</button>
+                    <button class="controls-btn" data-action="info" title="Info">ℹ</button>
+                </div>
+                <div class="scene-selector">
+                    <button class="scene-btn" data-scene="interior">Interior</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="lotvue_exterior_3d_viewer.js"></script>
+    <script src="lotvue_interior_360_panorama.js"></script>
+    <script>
+        // Tab switching
+        document.querySelectorAll('.tab-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const view = btn.dataset.view;
+                
+                // Update active tab
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                
+                // Show/hide viewers
+                document.getElementById('exterior-viewer').style.display = view === 'exterior' ? 'block' : 'none';
+                document.getElementById('interior-viewer').style.display = view === 'interior' ? 'block' : 'none';
+                
+                // Load appropriate viewer
+                if (view === 'exterior') {
+                    initExteriorViewer();
+                } else {
+                    initInteriorViewer();
+                }
+            });
+        });
+        
+        // Initialize exterior viewer with sample frames
+        function initExteriorViewer() {
+            const container = document.getElementById('exterior-viewer');
+            const loading = document.getElementById('exterior-loading');
+            
+            // Simulate loading frames (replace with actual frame images)
+            for (let i = 0; i < 36; i++) {
+                const img = document.createElement('img');
+                img.className = 'frame';
+                img.dataset.frame = i;
+                img.src = `https://via.placeholder.com/800x450/667eea/ffffff?text=Frame+${i+1}`;
+                img.style.display = i === 0 ? 'block' : 'none';
+                container.appendChild(img);
+            }
+            
+            // Initialize viewer
+            const viewer = new LotVueExteriorViewer(
+                'exterior-viewer',
+                '.frame'
+            );
+            
+            // Hide loading
+            setTimeout(() => {
+                loading.style.display = 'none';
+            }, 500);
+        }
+        
+        // Initialize interior viewer
+        function initInteriorViewer() {
+            const container = document.getElementById('interior-viewer');
+            const loading = document.getElementById('panorama-loading');
+            
+            // Simulate loading panorama (replace with actual equirectangular image)
+            const panoramaUrl = 'https://via.placeholder.com/1920x960/764ba2/ffffff?text=Interior+360°+Panorama';
+            
+            // Initialize panorama
+            const panorama = new LotVueInteriorPanorama('interior-viewer');
+            panorama.loadPanorama(panoramaUrl, {
+                title: 'Interior 360° View',
+                firstScene: 'interior',
+                scenes: {
+                    interior: {
+                        title: 'Interior 360°',
+                        type: 'equirectangular',
+                        panorama: panoramaUrl
+                    }
+                }
+            });
+            
+            // Add sample hotspots
+            panorama.addHotSpot({
+                pitch: 0,
+                yaw: 0,
+                text: 'Dashboard',
+                targetScene: null
+            });
+            
+            panorama.addHotSpot({
+                pitch: 0,
+                yaw: 180,
+                text: 'Rear Seats',
+                targetScene: null
+            });
+            
+            // Hide loading
+            setTimeout(() => {
+                loading.style.display = 'none';
+            }, 500);
+        }
+        
+        // Initialize with exterior view by default
+        initExteriorViewer();
+    </script>
+</body>
+</html>
