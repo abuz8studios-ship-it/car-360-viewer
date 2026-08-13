@@ -116,12 +116,16 @@ def _orb_inliers(path_a, path_b):
     pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(da, db, k=2)
     good = [m for p in pairs if len(p) == 2
             for m, n_ in [p] if m.distance < 0.75 * n_.distance]
-    if len(good) < 8:
+    if len(good) < 12:
         return len(good)
     pa = np.float32([ka[m.queryIdx].pt for m in good])
     pb = np.float32([kb[m.trainIdx].pt for m in good])
-    _, mask = cv2.findFundamentalMat(pa, pb, cv2.FM_RANSAC, 3.0, 0.99)
-    return int(mask.sum()) if mask is not None else 0
+    try:
+        _, mask = cv2.findFundamentalMat(pa, pb, cv2.FM_RANSAC, 3.0, 0.99)
+        return int(mask.sum()) if mask is not None else 0
+    except cv2.error:
+        # degenerate geometry (few/collinear matches) — count raw good matches
+        return len(good)
 
 
 def continuity_check(pair_list):
@@ -166,10 +170,19 @@ def analyze_set(files, sample=SAMPLE, pair_list=None):
     if n < 4:
         return {"verdict": "FAIL", "reasons": [f"only {n} frames — need at least 4"],
                 "frames": n, "checks": {}}
-    if pair_list is None:
-        pidx = sorted(set(min(n - 2, int(i * n / 8)) for i in range(8)))
-        pair_list = [(files[i], files[i + 1]) for i in pidx]
-    cont = continuity_check(pair_list)
+    # Guided PHOTO batches (Glo3D-style, <=24 discrete shots) are a legitimate
+    # spin input — adjacent shots are ~15-45deg apart, so the video-continuity
+    # bar cannot apply. Dense sets (>24 frames) claim walkaround density and
+    # must pass it (DS8097's 72 frames is exactly the case that must FAIL).
+    guided_photo_set = pair_list is None and n <= 24
+    if guided_photo_set:
+        cont = {"pair_inliers": [], "weak_pairs": 0, "weak_ratio": 0.0,
+                "ok": True, "skipped": "guided photo set (<=24 shots)"}
+    else:
+        if pair_list is None:
+            pidx = sorted(set(min(n - 2, int(i * n / 8)) for i in range(8)))
+            pair_list = [(files[i], files[i + 1]) for i in pidx]
+        cont = continuity_check(pair_list)
     idx = sorted(set(min(n - 1, int(i * n / min(sample, n))) for i in range(min(sample, n))))
     per, grays, masks = [], [], []
     for i in idx:
@@ -223,9 +236,12 @@ def analyze_set(files, sample=SAMPLE, pair_list=None):
                        "fast). This is the input signature that broke 3D "
                        "reconstruction (COLMAP registered 2/N frames) — recapture "
                        "as one slow continuous video.")
+    if guided_photo_set:
+        checks["continuity"] = cont["skipped"]
     return {"verdict": "PASS" if not reasons else "FAIL", "reasons": reasons,
             "frames": n, "checks": checks,
-            "splat_eligible": (not reasons) and bg_motion >= BG_MOTION_MIN and cont["ok"],
+            "splat_eligible": (not reasons) and bg_motion >= BG_MOTION_MIN
+                              and cont["ok"] and not guided_photo_set,
             "per_frame": per}
 
 
