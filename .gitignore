@@ -88,3 +88,4 @@ Thumbs.db
 .vscode/
 .idea/
 node_modules/
+installer/*.exe
