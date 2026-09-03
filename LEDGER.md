@@ -72,3 +72,5 @@ SPYNE API SURFACE MAPPED (docs.spyne.ai, live 2026-08-12): validate-video (check
   NOT YET BUILT on our side. This is the next module: app/validate_video.py.
 NEXT: (1) validate_video.py gate, (2) studio_bg asset pack, (3) full-set batch one VIN,
   (4) wire studio tier into viewer_api manifest, (5) plate blur, (6) hotspots.
+
+2026-09-02 | Server restarted (was 502 since ≥08-12; StartApp task Disabled) via start_server.bat; Stripe key live-tested 401 Expired; SMTP 535 BadCredentials; Select Auto 2021 Camaro free-sample spin rendered (7 angles, storage\SELECTAUTO24218105\studio_spin) | probe: local /api/health 200, public 200 | no commit (server state + storage output, not source)
