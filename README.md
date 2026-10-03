@@ -6,7 +6,7 @@ Built by Ahmad Odeh / ABUZ8 LLC (Dayton, Ohio). Product price remains **undecide
 
 ## Current engineering and release status
 
-The cross-platform PyInstaller workflow has produced Windows x64, Intel macOS x64, and Apple Silicon macOS arm64 ZIP artifacts. The release code passed in [GitHub Actions run 37132549158](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37132549158): it checked each ZIP's checksum, manifest, FFmpeg/FFprobe hashes and notices, and secret/model exclusions, then passed native installer/runtime smoke tests and uploaded the artifacts. These are 30-day Actions artifacts; no tag-triggered GitHub Release has been published. A push to this session branch triggers the matrix, and only a `v*` tag publishes a release. The workflow can also be run manually after it is present on the default branch.
+The cross-platform PyInstaller workflow has produced Windows x64, Intel macOS x64, and Apple Silicon macOS arm64 ZIP artifacts. The release code passed in [GitHub Actions run 37133573332](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37133573332): it checked each ZIP's checksum, manifest, FFmpeg/FFprobe hashes and notices, and secret/model exclusions, then passed native installer/runtime smoke tests and uploaded the artifacts. These are 30-day Actions artifacts; no tag-triggered GitHub Release has been published. A push to this session branch triggers the matrix, and only a `v*` tag publishes a release. The workflow can also be run manually after it is present on the default branch.
 
 The installers are per-user, keep writable data outside read-only bundle resources, include the Python runtime, declared core dependencies, FFmpeg/FFprobe, and the generated 40-background catalog. RemBG/ONNX runtime libraries are included, but **no background-removal checkpoint is selected or bundled by default**; operators must verify a model's commercial terms and explicitly enable it before weights are fetched. CUDA/ComfyUI/WAN model weights, COLMAP/Brush, paid service credentials, dealership/provider approvals, signatures, and notarization are not bundled.
 
@@ -27,7 +27,7 @@ Synthetic route tests verify representative behavior (including tenant isolation
 
 ## Install a desktop build from GitHub
 
-1. Open **Actions → Desktop releases**, choose a successful run on this branch (a verified run is [37132549158](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37132549158)), and download the matching ZIP plus `.sha256` sidecar from its **Artifacts** section. No tag-triggered GitHub Release has been published yet.
+1. Open **Actions → Desktop releases**, choose a successful run on this branch (a verified run is [37133573332](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37133573332)), and download the matching ZIP plus `.sha256` sidecar from its **Artifacts** section. No tag-triggered GitHub Release has been published yet.
 2. Choose the artifact matching the computer:
    - `LotVue360-windows-x64.zip`
    - `LotVue360-macOS-x64.zip` (Intel)
