@@ -10,6 +10,11 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 APP_ROOT = Path(SPECPATH).resolve()
+PROJECT_ROOT = APP_ROOT.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from scripts.build_desktop import _is_onnxruntime_test_data
+
 ICON_PNG = APP_ROOT / "static" / "desktop" / "lotvue.png"
 ICON_ICO = APP_ROOT / "static" / "desktop" / "lotvue.ico"
 
@@ -45,6 +50,11 @@ for package in PACKAGES:
     if importlib.util.find_spec(package) is None:
         raise RuntimeError(f"Desktop build dependency is missing: {package}")
     package_data, package_binaries, package_imports = collect_all(package)
+    if package == "onnxruntime":
+        package_data = [
+            item for item in package_data
+            if not _is_onnxruntime_test_data(item[0])
+        ]
     datas += package_data
     binaries += package_binaries
     hiddenimports += package_imports

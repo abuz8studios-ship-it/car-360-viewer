@@ -33,21 +33,26 @@ USER_DATA_SUFFIXES = (
     ".sqlite", ".sqlite-journal", ".sqlite-shm", ".sqlite-wal", ".sqlite3",
 )
 SECRET_SUFFIXES = (".jks", ".key", ".keystore", ".p12", ".pem", ".pfx")
+CODE_SUFFIXES = {
+    ".bat", ".c", ".cc", ".cmd", ".cpp", ".css", ".go", ".h", ".hpp",
+    ".html", ".java", ".js", ".jsx", ".mjs", ".pyo", ".py", ".pyc",
+    ".ps1", ".rs", ".sh", ".ts", ".tsx",
+}
 
 
-def _is_sensitive_path_part(part: str) -> bool:
+def _is_sensitive_path_part(part: str, *, is_file: bool) -> bool:
     lowered = part.lower()
     if lowered == ".env.example":
         return False
     if lowered in SECRET_NAMES | DATABASE_NAMES:
         return True
+    source_code = Path(lowered).suffix in CODE_SUFFIXES
     return (
         lowered == ".env"
         or lowered.startswith(".env.")
         or ".env." in lowered
         or lowered.endswith(".env")
-        or "secret" in lowered
-        or "credential" in lowered
+        or (is_file and not source_code and ("secret" in lowered or "credential" in lowered))
         or lowered.endswith(SECRET_SUFFIXES)
         or ".bak-" in lowered
     )
@@ -235,7 +240,11 @@ def verify_desktop_artifact(
             # root-level installer payload must not smuggle in a model or user secret.
             for name in file_entries:
                 path = PurePosixPath(name)
-                if any(_is_sensitive_path_part(part) for part in path.parts) or name.lower().endswith(USER_DATA_SUFFIXES):
+                sensitive_parts = any(
+                    _is_sensitive_path_part(part, is_file=index == len(path.parts) - 1)
+                    for index, part in enumerate(path.parts)
+                )
+                if sensitive_parts or name.lower().endswith(USER_DATA_SUFFIXES):
                     raise ArtifactVerificationError(f"User secret, log, or database was packaged: {name}")
                 if path.suffix.lower() in MODEL_SUFFIXES:
                     raise ArtifactVerificationError(f"Model weights must not be bundled: {name}")
