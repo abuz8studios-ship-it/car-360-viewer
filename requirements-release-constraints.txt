@@ -10,7 +10,9 @@ certifi==2026.7.22
 cffi==2.1.1
 charset-normalizer==3.5.2
 click==8.5.0
-cryptography==50.0.2
+# cryptography 49+ dropped Intel macOS wheels; retain the latest universal2 wheel there.
+cryptography==48.0.1; sys_platform == "darwin" and platform_machine == "x86_64"
+cryptography==50.0.2; sys_platform != "darwin" or platform_machine != "x86_64"
 curl_cffi==0.16.3
 docutils==0.23
 ecdsa==0.19.2

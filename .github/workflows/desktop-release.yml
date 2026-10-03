@@ -84,12 +84,24 @@ jobs:
           status=${PIPESTATUS[0]}
           set -e
           if [[ $status -ne 0 ]]; then
-            tail -n 40 .desktop-pip-install.log
-            while IFS= read -r line; do
-              line=${line//$'\r'/}
-              escaped=$(printf '%s' "$line" | sed 's/%/%25/g')
-              echo "::error title=Desktop dependency install log::$escaped"
-            done < <(tail -n 30 .desktop-pip-install.log)
+            tail -n 80 .desktop-pip-install.log
+            python - .desktop-pip-install.log <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          pattern = re.compile(
+              r"error:|failed|no matching distribution|could not|resolutionimpossible|rust|"
+              r"subprocess-exited-with-error|build failed",
+              re.IGNORECASE,
+          )
+          details = [line.strip() for line in lines if pattern.search(line)]
+          details = details[-8:] if details else lines[-12:]
+          message = " | ".join(details)[-7000:]
+          message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error title=Desktop dependency install failure::{message}")
+          PY
             exit "$status"
           fi
           rm -f .desktop-pip-install.log
@@ -103,12 +115,24 @@ jobs:
           status=${PIPESTATUS[0]}
           set -e
           if [[ $status -ne 0 ]]; then
-            tail -n 50 .desktop-build.log
-            while IFS= read -r line; do
-              line=${line//$'\r'/}
-              escaped=$(printf '%s' "$line" | sed 's/%/%25/g')
-              echo "::error title=Desktop build log::$escaped"
-            done < <(tail -n 30 .desktop-build.log)
+            tail -n 80 .desktop-build.log
+            python - .desktop-build.log <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          pattern = re.compile(
+              r"error:|failed|no matching distribution|could not|module not found|"
+              r"traceback|exception|subprocess-exited-with-error",
+              re.IGNORECASE,
+          )
+          details = [line.strip() for line in lines if pattern.search(line)]
+          details = details[-8:] if details else lines[-12:]
+          message = " | ".join(details)[-7000:]
+          message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error title=Desktop build failure::{message}")
+          PY
             exit "$status"
           fi
           rm -f .desktop-build.log
@@ -116,22 +140,45 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          $archive = Get-ChildItem dist/desktop-release/LotVue360-windows-x64.zip
-          $extract = Join-Path $env:RUNNER_TEMP 'lotvue-desktop-smoke'
+          $ErrorActionPreference = 'Stop'
+          $phase = 'initializing smoke test'
           $data = Join-Path $env:RUNNER_TEMP 'lotvue-desktop-smoke-data'
-          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $extract -Force
-          $installer = Join-Path $extract 'LotVue360/Install-LotVue360.ps1'
-          & $installer -NoLaunch
-          $installRoot = Join-Path $env:LOCALAPPDATA 'Programs/LotVue360'
-          if (-not (Test-Path -LiteralPath $installRoot)) { throw 'Windows installer did not create the per-user app directory.' }
-          $env:LOTVUE_DATA_DIR = $data
-          $exe = Join-Path $installRoot 'LotVue360.exe'
-          & $exe --self-test
-          if ($LASTEXITCODE -ne 0) { throw "Installed Windows app smoke test failed with exit code $LASTEXITCODE" }
-          $uninstaller = Join-Path $env:LOCALAPPDATA 'Programs/LotVue360/Uninstall-LotVue360.ps1'
-          & $uninstaller
-          if (Test-Path -LiteralPath $installRoot) { throw 'Windows app files remain after uninstall.' }
-          if (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'LotVue360'))) { throw 'Uninstaller unexpectedly removed per-user data.' }
+          try {
+            $phase = 'locating and extracting release archive'
+            $archive = Get-Item -LiteralPath 'dist/desktop-release/LotVue360-windows-x64.zip'
+            $extract = Join-Path $env:RUNNER_TEMP 'lotvue-desktop-smoke'
+            Expand-Archive -LiteralPath $archive.FullName -DestinationPath $extract -Force
+
+            $phase = 'running per-user installer'
+            $installer = Join-Path $extract 'LotVue360/Install-LotVue360.ps1'
+            & $installer -NoLaunch
+            $installRoot = Join-Path $env:LOCALAPPDATA 'Programs/LotVue360'
+            if (-not (Test-Path -LiteralPath $installRoot)) { throw 'Windows installer did not create the per-user app directory.' }
+
+            $phase = 'running frozen application self-test'
+            $env:LOTVUE_DATA_DIR = $data
+            $exe = Join-Path $installRoot 'LotVue360.exe'
+            & $exe --self-test
+            if ($LASTEXITCODE -ne 0) { throw "Installed Windows app smoke test failed with exit code $LASTEXITCODE" }
+
+            $phase = 'running uninstaller and checking data retention'
+            $uninstaller = Join-Path $installRoot 'Uninstall-LotVue360.ps1'
+            & $uninstaller
+            if (Test-Path -LiteralPath $installRoot) { throw 'Windows app files remain after uninstall.' }
+            if (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'LotVue360'))) { throw 'Uninstaller unexpectedly removed per-user data.' }
+          } catch {
+            $details = @("phase=$phase", $_.Exception.ToString())
+            foreach ($logName in @('desktop_launch.log', 'desktop_stdio.log')) {
+              $logPath = Join-Path $data $logName
+              if (Test-Path -LiteralPath $logPath) {
+                $details += "--- $logName (tail) ---"
+                $details += (Get-Content -LiteralPath $logPath -Tail 50) -join "`n"
+              }
+            }
+            $message = ($details -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows desktop smoke diagnostic::$message"
+            throw
+          }
       - name: Smoke-test macOS installer and frozen runtime
         if: matrix.platform == 'macos'
         shell: bash
