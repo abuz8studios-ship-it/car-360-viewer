@@ -8827,6 +8827,7 @@ def public_url_page():
 # =============================================================================
 def _run_photo_studio_job(
     vin: str, background: str, upscale: bool, kind: str, max_photos: int,
+    require_background_removal: bool = False,
 ) -> None:
     """Run the shared PhotoProcessor into a staged directory and publish atomically."""
     stage_dir = None
@@ -8843,9 +8844,11 @@ def _run_photo_studio_job(
             vin, kind, "running", step="processing", progress=5, total=total,
         )
         stage_dir = Path(tempfile.mkdtemp(prefix=".studio-stage-", dir=vehicle_dir))
-        results = PhotoProcessor(background_name=background, upscale=upscale).process_batch(
-            str(exterior_dir), str(stage_dir), max_photos=max_photos,
-        )
+        results = PhotoProcessor(
+            background_name=background,
+            upscale=upscale,
+            require_background_removal=require_background_removal,
+        ).process_batch(str(exterior_dir), str(stage_dir), max_photos=max_photos)
         succeeded = sum(result.get("status") == "ok" for result in results)
         degraded = sum(result.get("status") == "degraded" for result in results)
         failed = sum(result.get("status") == "error" for result in results)
@@ -8914,7 +8917,7 @@ def _queue_photo_studio_job(
     )
     submission = _submit_background_job(
         f"{kind}:{vin}", _run_photo_studio_job,
-        vin, background, upscale, kind, max_photos,
+        vin, background, upscale, kind, max_photos, require_rembg,
     )
     if submission == "busy":
         _write_pipeline_job(
