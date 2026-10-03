@@ -38,14 +38,20 @@ jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 keyring==25.7.0
 lazy-loader==0.6
-llvmlite==0.50.0
+# PyPI no longer publishes Intel macOS llvmlite wheels after 0.45.1.
+llvmlite==0.45.1; sys_platform == "darwin" and platform_machine == "x86_64"
+llvmlite==0.50.0; sys_platform != "darwin" or platform_machine != "x86_64"
 markdown-it-py==4.2.0
 mdurl==0.1.2
 more-itertools==11.1.0
 networkx==3.6.1
 nh3==0.3.7
-numba==0.68.0
-numpy==2.4.6
+# Numba 0.62.1 is the latest Intel macOS wheel compatible with llvmlite 0.45.1.
+numba==0.62.1; sys_platform == "darwin" and platform_machine == "x86_64"
+numba==0.68.0; sys_platform != "darwin" or platform_machine != "x86_64"
+# Numba 0.62.1 requires NumPy <2.4; 2.3.5 retains CPython 3.11 Intel macOS wheels.
+numpy==2.3.5; sys_platform == "darwin" and platform_machine == "x86_64"
+numpy==2.4.6; sys_platform != "darwin" or platform_machine != "x86_64"
 # ONNX Runtime 1.23.2 is the last release with a CPython 3.11 Intel macOS wheel.
 onnxruntime==1.23.2; sys_platform == "darwin" and platform_machine == "x86_64"
 onnxruntime==1.30.0; sys_platform != "darwin" or platform_machine != "x86_64"

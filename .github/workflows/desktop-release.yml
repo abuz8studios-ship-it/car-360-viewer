@@ -158,8 +158,11 @@ jobs:
             $phase = 'running frozen application self-test'
             $env:LOTVUE_DATA_DIR = $data
             $exe = Join-Path $installRoot 'LotVue360.exe'
-            & $exe --self-test
-            if ($LASTEXITCODE -ne 0) { throw "Installed Windows app smoke test failed with exit code $LASTEXITCODE" }
+            $process = Start-Process -FilePath $exe -ArgumentList '--self-test' -WorkingDirectory $installRoot -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "Installed Windows app smoke test failed with exit code $($process.ExitCode)" }
+            $smokeLog = Join-Path $data 'desktop_launch.log'
+            if (-not (Test-Path -LiteralPath $smokeLog)) { throw 'Windows app self-test did not create its launcher log.' }
+            if (-not (Select-String -LiteralPath $smokeLog -Pattern 'packaged self-test passed:' -Quiet)) { throw 'Windows app launcher log did not record a passing self-test.' }
 
             $phase = 'running uninstaller and checking data retention'
             $uninstaller = Join-Path $installRoot 'Uninstall-LotVue360.ps1'
@@ -168,11 +171,20 @@ jobs:
             if (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'LotVue360'))) { throw 'Uninstaller unexpectedly removed per-user data.' }
           } catch {
             $details = @("phase=$phase", $_.Exception.ToString())
-            foreach ($logName in @('desktop_launch.log', 'desktop_stdio.log')) {
-              $logPath = Join-Path $data $logName
+            $logPaths = @(
+              (Join-Path $data 'desktop_launch.log'),
+              (Join-Path $data 'desktop_stdio.log'),
+              (Join-Path $env:LOCALAPPDATA 'LotVue360/desktop_launch.log'),
+              (Join-Path $env:LOCALAPPDATA 'LotVue360/desktop_stdio.log')
+            ) | Select-Object -Unique
+            foreach ($logPath in $logPaths) {
               if (Test-Path -LiteralPath $logPath) {
-                $details += "--- $logName (tail) ---"
-                $details += (Get-Content -LiteralPath $logPath -Tail 50) -join "`n"
+                $details += "--- $logPath (tail) ---"
+                try {
+                  $details += (Get-Content -LiteralPath $logPath -Tail 50) -join "`n"
+                } catch {
+                  $details += "Could not read smoke log: $($_.Exception.Message)"
+                }
               }
             }
             $message = ($details -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
