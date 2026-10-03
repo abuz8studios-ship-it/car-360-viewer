@@ -1,16 +1,17 @@
-"""
-LotVue Pro — AI Background Studio (Module 11)
-Background removal and premium showroom scene replacement.
+"""Background removal and scene rendering for Dealer Studio.
 
-All paths are portable and rooted at the app directory by default. Operators may
-set LOTVUE_STORAGE_DIR / LOTVUE_SCENES_DIR to use external storage. Uploaded and
-stored images are bounded before inference/compositing to keep memory predictable.
+Packaged backdrops use deterministic local compositing. AI scene generation is
+available only through an owner-supplied ComfyUI API-format workflow; it is never
+silently substituted for the local renderer. Paths are portable by default and
+images are bounded before inference/compositing.
 """
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -186,6 +187,12 @@ def composite_on_scene(
     scene = None
     final = None
     try:
+        alpha = vehicle.getchannel("A")
+        try:
+            if alpha.getextrema() in {(0, 0), (255, 255)}:
+                raise ValueError("A transparent vehicle cut-out is required for local compositing")
+        finally:
+            alpha.close()
         size = vehicle.size
         scene_slug = scene_asset_slug(scene_id)
         scene_path = background_asset_path(scene_slug, SCENES_DIR) if scene_slug else None
@@ -276,23 +283,259 @@ def process_vehicle_photos(
     }
 
 
+LOTVUE_COMFYUI_SCENE_WORKFLOW_ENV = "LOTVUE_COMFYUI_SCENE_WORKFLOW"
+LOTVUE_COMFYUI_SCENE_TIMEOUT_ENV = "LOTVUE_COMFYUI_SCENE_TIMEOUT"
+_COMFY_SCENE_MAX_WORKFLOW_BYTES = 1024 * 1024
+_COMFY_SCENE_MAX_NODES = 500
+_COMFY_SCENE_MAX_FILE_BYTES = 30 * 1024 * 1024
+_COMFY_SCENE_IMAGE_TOKEN = "__LOTVUE_INPUT_IMAGE__"
+_COMFY_SCENE_PROMPT_TOKEN = "__LOTVUE_SCENE_PROMPT__"
+_COMFY_SCENE_NEGATIVE_TOKEN = "__LOTVUE_NEGATIVE_PROMPT__"
+_COMFY_SCENE_PREFIX_TOKEN = "__LOTVUE_OUTPUT_PREFIX__"
+
+
+class ComfyUIWorkflowConfigurationError(RuntimeError):
+    """The owner has not supplied a valid ComfyUI API-format scene workflow."""
+
+
+def _count_workflow_tokens(value, counts: dict[str, int]) -> None:
+    if isinstance(value, str):
+        for token in counts:
+            counts[token] += value.count(token)
+    elif isinstance(value, dict):
+        for child in value.values():
+            _count_workflow_tokens(child, counts)
+    elif isinstance(value, list):
+        for child in value:
+            _count_workflow_tokens(child, counts)
+
+
+def _replace_workflow_tokens(value, replacements: dict[str, str]):
+    if isinstance(value, str):
+        for token, replacement in replacements.items():
+            value = value.replace(token, replacement)
+        return value
+    if isinstance(value, dict):
+        return {key: _replace_workflow_tokens(child, replacements) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_replace_workflow_tokens(child, replacements) for child in value]
+    return value
+
+
+def _load_comfyui_scene_workflow() -> tuple[dict, int]:
+    configured = os.environ.get(LOTVUE_COMFYUI_SCENE_WORKFLOW_ENV, "").strip()
+    if not configured:
+        raise ComfyUIWorkflowConfigurationError(
+            f"Set {LOTVUE_COMFYUI_SCENE_WORKFLOW_ENV} to an owner-supplied ComfyUI API workflow"
+        )
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    try:
+        if not path.is_file():
+            raise ComfyUIWorkflowConfigurationError("Configured ComfyUI workflow is missing or too large")
+        with path.open("rb") as stream:
+            raw = stream.read(_COMFY_SCENE_MAX_WORKFLOW_BYTES + 1)
+        if not raw or len(raw) > _COMFY_SCENE_MAX_WORKFLOW_BYTES:
+            raise ComfyUIWorkflowConfigurationError("Configured ComfyUI workflow is missing or too large")
+        workflow = json.loads(raw)
+    except ComfyUIWorkflowConfigurationError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise ComfyUIWorkflowConfigurationError("Configured ComfyUI workflow could not be read") from exc
+
+    if not isinstance(workflow, dict) or not 1 <= len(workflow) <= _COMFY_SCENE_MAX_NODES:
+        raise ComfyUIWorkflowConfigurationError("ComfyUI workflow must be an API-format node graph")
+    for node_id, node in workflow.items():
+        if (
+            not isinstance(node_id, str)
+            or not node_id
+            or not isinstance(node, dict)
+            or not isinstance(node.get("class_type"), str)
+            or not isinstance(node.get("inputs"), dict)
+        ):
+            raise ComfyUIWorkflowConfigurationError("ComfyUI workflow must be an API-format node graph")
+
+    tokens = {
+        _COMFY_SCENE_IMAGE_TOKEN: 0,
+        _COMFY_SCENE_PROMPT_TOKEN: 0,
+        _COMFY_SCENE_NEGATIVE_TOKEN: 0,
+        _COMFY_SCENE_PREFIX_TOKEN: 0,
+    }
+    _count_workflow_tokens(workflow, tokens)
+    if (
+        tokens[_COMFY_SCENE_IMAGE_TOKEN] != 1
+        or tokens[_COMFY_SCENE_PROMPT_TOKEN] != 1
+        or tokens[_COMFY_SCENE_PREFIX_TOKEN] != 1
+        or tokens[_COMFY_SCENE_NEGATIVE_TOKEN] > 1
+    ):
+        raise ComfyUIWorkflowConfigurationError(
+            "Workflow must contain one input-image, scene-prompt, and output-prefix token; negative prompt is optional"
+        )
+    return workflow, tokens[_COMFY_SCENE_NEGATIVE_TOKEN]
+
+
+def comfyui_scene_workflow_configured() -> bool:
+    """Report valid local workflow configuration without contacting ComfyUI."""
+    try:
+        _load_comfyui_scene_workflow()
+    except ComfyUIWorkflowConfigurationError:
+        return False
+    return True
+
+
+def _scene_generation_prompt(scene_id: str) -> tuple[str, str]:
+    description = PREMIUM_SCENES[scene_id]["description"]
+    positive = (
+        "Create a photorealistic automotive listing environment for the scene: "
+        f"{description}. Replace or generate only the setting around the supplied vehicle. "
+        "Keep the vehicle recognizable and do not add people, extra cars, logos, signage, or text."
+    )
+    negative = "extra vehicles, people, text, watermark, changed body shape, distorted wheels, altered badges"
+    return positive, negative
+
+
+def _remove_comfy_temp(path: Path | None, root: Path | None) -> None:
+    if path is None or root is None:
+        return
+    try:
+        if path.is_symlink() or not path.is_file():
+            return
+        resolved = path.resolve(strict=True)
+        if resolved.is_relative_to(root.resolve()):
+            resolved.unlink(missing_ok=True)
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+
 def generate_scene_with_comfyui(
     vehicle_png: str,
     scene_id: str,
     output_path: Optional[str] = None,
 ) -> str:
-    """Probe ComfyUI and use the bounded local compositor as the current fallback."""
+    """Run an explicitly configured ComfyUI API workflow; never fake an AI fallback.
+
+    The owner supplies the graph through ``LOTVUE_COMFYUI_SCENE_WORKFLOW``. It
+    must contain one each of the input-image, scene-prompt, and output-prefix
+    tokens documented in the installation guide. A local deterministic
+    composite remains a separate explicit engine choice.
+    """
     if scene_id not in PREMIUM_SCENES:
         raise ValueError(f"Unknown scene: {scene_id}")
-    import requests
+    workflow_template, has_negative = _load_comfyui_scene_workflow()
 
-    comfy_url = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
+    from . import upscale as comfyui
+
+    source_path = Path(vehicle_png).expanduser()
+    source_resolved = source_path.resolve(strict=True)
+    if not source_resolved.is_file() or source_path.is_symlink():
+        raise ValueError("Vehicle image must be a regular, non-symlink file")
+    target = Path(output_path) if output_path else source_path.with_name(
+        f"{source_path.stem}_{scene_id}.jpg"
+    )
+    if target.resolve(strict=False) == source_resolved:
+        raise ValueError("ComfyUI output must not overwrite the vehicle image")
+
+    input_root = Path(comfyui.COMFY_INPUT_DIR).expanduser().resolve()
+    output_root = Path(comfyui.COMFY_OUTPUT_DIR).expanduser().resolve()
+    target_resolved = target.resolve(strict=False)
+    if target_resolved.is_relative_to(input_root) or target_resolved.is_relative_to(output_root):
+        raise ValueError("ComfyUI scene output must remain outside its managed input/output folders")
+    input_root.mkdir(parents=True, exist_ok=True)
+    upload_source = input_root / f"_lotvue_scene_source_{uuid.uuid4().hex}.png"
+    staged_input = None
+    generated_output = None
+    output_prefix = f"lotvue_scene_{uuid.uuid4().hex}"
+    temporary_output = None
     try:
-        response = requests.get(f"{comfy_url}/system_stats", timeout=3)
-        response.raise_for_status()
-    except requests.RequestException:
-        return composite_on_scene(vehicle_png, scene_id, output_path)
+        bounded_vehicle = _open_bounded_image(source_resolved, "RGBA")
+        try:
+            bounded_vehicle.save(upload_source, "PNG", optimize=True)
+        finally:
+            bounded_vehicle.close()
+        if upload_source.stat().st_size > _COMFY_SCENE_MAX_FILE_BYTES:
+            raise ValueError("Vehicle image exceeds the ComfyUI scene input byte limit")
 
-    # TODO: Wire inpainting into a real ComfyUI workflow; current successful probe
-    # still uses the deterministic local composite until that workflow is configured.
-    return composite_on_scene(vehicle_png, scene_id, output_path)
+        staged_name = comfyui.stage_image(str(upload_source))
+        if (
+            not isinstance(staged_name, str)
+            or staged_name in {".", ".."}
+            or len(staged_name) > 255
+            or re.fullmatch(r"[A-Za-z0-9_.-]+", staged_name) is None
+        ):
+            raise RuntimeError("ComfyUI input staging returned an invalid filename")
+        staged_input = input_root / staged_name
+        if (
+            not staged_input.is_file()
+            or staged_input.is_symlink()
+            or not staged_input.resolve(strict=True).is_relative_to(input_root)
+        ):
+            raise RuntimeError("ComfyUI input image was not staged")
+
+        positive_prompt, negative_prompt = _scene_generation_prompt(scene_id)
+        replacements = {
+            _COMFY_SCENE_IMAGE_TOKEN: staged_name,
+            _COMFY_SCENE_PROMPT_TOKEN: positive_prompt,
+            _COMFY_SCENE_PREFIX_TOKEN: output_prefix,
+        }
+        if has_negative:
+            replacements[_COMFY_SCENE_NEGATIVE_TOKEN] = negative_prompt
+        workflow = _replace_workflow_tokens(workflow_template, replacements)
+        if any(
+            token in json.dumps(workflow, ensure_ascii=False)
+            for token in (
+                _COMFY_SCENE_IMAGE_TOKEN,
+                _COMFY_SCENE_PROMPT_TOKEN,
+                _COMFY_SCENE_NEGATIVE_TOKEN,
+                _COMFY_SCENE_PREFIX_TOKEN,
+            )
+        ):
+            raise ComfyUIWorkflowConfigurationError("ComfyUI workflow contains an unresolved LotVue token")
+
+        timeout = _bounded_int(LOTVUE_COMFYUI_SCENE_TIMEOUT_ENV, 300, 10, 1800)
+        generated_output = Path(comfyui.submit_and_wait(workflow, timeout=timeout))
+        resolved_generated = generated_output.resolve(strict=True)
+        if (
+            not resolved_generated.is_relative_to(output_root)
+            or not resolved_generated.is_file()
+            or not resolved_generated.name.startswith(output_prefix)
+            or generated_output.is_symlink()
+        ):
+            raise RuntimeError("ComfyUI returned an unexpected output file")
+        if resolved_generated.stat().st_size > _COMFY_SCENE_MAX_FILE_BYTES:
+            raise ValueError("ComfyUI scene output exceeds the configured byte limit")
+
+        with Image.open(resolved_generated) as generated:
+            width, height = generated.size
+            if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+                raise ValueError("ComfyUI scene output exceeds the configured pixel limit")
+            generated.thumbnail(
+                (MAX_PROCESSING_EDGE, MAX_PROCESSING_EDGE), Image.Resampling.LANCZOS
+            )
+            oriented = ImageOps.exif_transpose(generated)
+            try:
+                final = oriented.convert("RGB")
+            finally:
+                if oriented is not generated:
+                    oriented.close()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary_output = target.with_name(f".{target.stem}.{uuid.uuid4().hex}.tmp.jpg")
+            final.save(temporary_output, "JPEG", quality=92, optimize=True, progressive=True)
+            os.replace(temporary_output, target)
+        finally:
+            final.close()
+        return str(target)
+    finally:
+        _remove_comfy_temp(upload_source, input_root)
+        if staged_input != upload_source:
+            _remove_comfy_temp(staged_input, input_root)
+        _remove_comfy_temp(generated_output, output_root)
+        if generated_output is None and output_root.is_dir():
+            for possible_output in output_root.glob(f"{output_prefix}*"):
+                _remove_comfy_temp(possible_output, output_root)
+        if temporary_output is not None:
+            try:
+                temporary_output.unlink(missing_ok=True)
+            except OSError:
+                pass

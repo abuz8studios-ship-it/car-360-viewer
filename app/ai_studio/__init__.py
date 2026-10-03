@@ -1,7 +1,7 @@
-"""
-LotVue Pro AI Photo Studio
-Transforms raw dealer lot photos into studio-quality automotive imagery.
-Pipeline: Background Removal → Background Swap → Enhancement → Plate Blur → Upscale
-Uses local GPU (RTX 5090) via rembg + ComfyUI. Zero cloud cost.
+"""Photo-processing components shared by Dealer Studio workflows.
+
+The pipeline combines local image operations with optional operator-configured
+rembg and ComfyUI services. Model rights, hardware, credentials, and visual
+quality are installation-specific and are not certified by this package.
 """
 from .photo_processor import PhotoProcessor

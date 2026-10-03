@@ -38,7 +38,7 @@ STUDIO_HTML = r"""<!doctype html>
     .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid var(--blue);background:var(--blue);color:#fff;text-decoration:none;padding:9px 13px;border-radius:9px;font-weight:700;font-size:13px;cursor:pointer}.btn.secondary{color:var(--blue);background:#fff}.btn:disabled{opacity:.55;cursor:wait}
     .small{font-size:12px;color:var(--muted)}.notice{border-radius:10px;padding:11px 12px;font-size:13px;margin-top:12px;background:#edf4fc;color:#21496f}.notice.warn{background:#fff5e6;color:#80500b}.notice.bad{background:#fff0f0;color:#873030}
     .cap-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.cap{border:1px solid var(--line);border-radius:11px;padding:12px;background:#fff}.cap-top{display:flex;justify-content:space-between;gap:8px;align-items:center}.state{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.45px;border-radius:999px;padding:4px 7px;white-space:nowrap}.state.ready{background:#e8f5ee;color:var(--green)}.state.degraded,.state.setup_required,.state.owner_action_required,.state.not_configured{background:#fff3dd;color:var(--amber)}.state.error{background:#ffeaea;color:var(--red)}.state.configured{background:#edf4fc;color:#345b80}
-    .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metric{background:#f6f8fb;border-radius:9px;padding:10px}.metric b{display:block;font-size:17px}.metric span{font-size:11px;color:var(--muted)}
+    .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:9px}.metric{background:#f6f8fb;border-radius:9px;padding:10px}.metric b{display:block;font-size:17px}.metric span{font-size:11px;color:var(--muted)}
     .vehicle-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}.vehicle-vin{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted)}.job{border-top:1px solid var(--line);padding:9px 0;display:flex;justify-content:space-between;gap:12px;font-size:13px}.job:first-child{border-top:0}.job b{font-weight:700}.hidden{display:none!important}
     @media(max-width:800px){.span8,.span4{grid-column:span 12}.cap-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metrics{grid-template-columns:repeat(2,1fr)}}@media(max-width:500px){main{padding:20px 13px 42px}.row{grid-template-columns:1fr}.cap-grid{grid-template-columns:1fr}h1{font-size:25px}}
   </style>
@@ -67,7 +67,7 @@ const $=id=>document.getElementById(id);let activeVin='';let polling=null;
 function node(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e;}
 async function getJson(url,options={}){const response=await fetch(url,{credentials:'same-origin',...options});let data={};try{data=await response.json();}catch(_){}if(!response.ok)throw new Error(data.detail||('Request failed ('+response.status+')'));return data;}
 function renderCapabilityCard(item){const card=node('article','cap');const top=node('div','cap-top');top.append(node('h3','',item.label));const state=node('span','state '+item.status,item.status.replaceAll('_',' '));top.append(state);card.append(top);card.append(node('p','small',item.detail));return card;}
-async function loadHealth(){const box=$('capabilities');box.replaceChildren(node('div','small','Checking local configuration…'));try{const data=await getJson('/api/system/health');box.replaceChildren();Object.values(data.subsystems).forEach(item=>box.append(renderCapabilityCard(item)));const m=data.limits||{};$('resourceCaps').replaceChildren();[[m.spin_frames,'360 frames / spin'],[m.viewer_frames,'viewer frame cap'],[m.photo_batch_mb+' MiB','photo batch cap'],[m.background_workers+' / '+m.background_jobs,'workers / admitted jobs']].forEach(([v,l])=>{const d=node('div','metric');d.append(node('b','',String(v)));d.append(node('span','',l));$('resourceCaps').append(d);});$('probeMode').textContent=data.external_services_contacted?'Probe performed':'Local configuration snapshot · no external services contacted';}catch(e){box.replaceChildren(node('div','notice bad',e.message));}}
+async function loadHealth(){const box=$('capabilities');box.replaceChildren(node('div','small','Checking local configuration…'));try{const data=await getJson('/api/system/health');box.replaceChildren();Object.values(data.subsystems).forEach(item=>box.append(renderCapabilityCard(item)));const m=data.limits||{};$('resourceCaps').replaceChildren();[[m.spin_frames,'360 frames / spin'],[m.viewer_frames,'viewer frame cap'],[m.photo_batch_mb+' MiB','photo batch cap'],[m.background_workers+' / '+m.background_jobs,'workers / admitted jobs'],[m.comfyui_scene_generation_jobs,'ComfyUI scenes / process']].forEach(([v,l])=>{const d=node('div','metric');d.append(node('b','',String(v)));d.append(node('span','',l));$('resourceCaps').append(d);});$('probeMode').textContent=data.external_services_contacted?'Probe performed':'Local configuration snapshot · no external services contacted';}catch(e){box.replaceChildren(node('div','notice bad',e.message));}}
 async function loadBackgrounds(){try{const data=await getJson('/api/backgrounds');const select=$('backgroundSelect');select.replaceChildren();data.filter(x=>x.slug!=='none').forEach(bg=>{const opt=node('option','',bg.name);opt.value=bg.slug;select.append(opt);});}catch(_){}}
 async function loadVehicles(){const select=$('vehicleSelect');try{const rows=await getJson('/api/vehicles');select.replaceChildren(node('option','','Select a vehicle…'));rows.forEach(v=>{const label=[v.year,v.make,v.model].filter(Boolean).join(' ')||'Vehicle';const opt=node('option','',label+' · '+v.vin);opt.value=v.vin;select.append(opt);});if(!rows.length)select.replaceChildren(node('option','','No vehicles yet — capture one to begin'));if(location.hash.startsWith('#vin=')){const wanted=decodeURIComponent(location.hash.slice(5));select.value=wanted;}if(select.value)await selectVehicle();}catch(e){select.replaceChildren(node('option','',e.message));}}
 function appendAction(container,label,description){const row=node('div','job');row.append(node('span','',label));row.append(node('b','',description));container.append(row);}
@@ -151,6 +151,11 @@ def build_system_health(main_module) -> dict:
     except Exception:
         rembg_package_installed = rembg_model_selected = rembg_license_acknowledged = False
     comfy_configured = bool(os.getenv("COMFYUI_URL", "").strip())
+    try:
+        from ai_studio.background_studio import comfyui_scene_workflow_configured
+        comfy_scene_workflow_ready = comfyui_scene_workflow_configured()
+    except Exception:
+        comfy_scene_workflow_ready = False
     stripe_key_ready = bool(getattr(main_module, "STRIPE_KEY", ""))
     stripe_webhook_ready = bool(getattr(main_module, "STRIPE_WEBHOOK_SECRET", ""))
     feed_ready = _google_feed_configuration_ready()
@@ -216,6 +221,15 @@ def build_system_health(main_module) -> dict:
             "label": "ComfyUI 4x upscale",
             "status": "not_configured" if not comfy_configured else "setup_required",
             "detail": "Configuration presence only; endpoint/model reachability is not probed. A requested upscale falls back to labeled Lanczos 2x when unavailable.",
+        },
+        "comfyui_scene_generation": {
+            "label": "ComfyUI scene generation",
+            "status": "configured" if comfy_scene_workflow_ready else "setup_required",
+            "detail": (
+                "The owner-supplied API workflow file passes structural checks; endpoint, custom nodes, model weights, and generated-image quality are not verified."
+                if comfy_scene_workflow_ready else
+                "Optional: provide a ComfyUI API-format scene workflow with the documented LotVue tokens; no workflow or model is bundled."
+            ),
         },
         "ai_video": {
             "label": "AI video commercials",
@@ -285,11 +299,13 @@ def build_system_health(main_module) -> dict:
             "image_pixels": int(main_module.MAX_UPLOAD_IMAGE_PIXELS),
             "background_workers": int(main_module._BACKGROUND_WORKERS),
             "background_jobs": int(main_module._BACKGROUND_MAX_JOBS),
+            "comfyui_scene_generation_jobs": int(getattr(main_module, "_COMFYUI_SCENE_MAX_JOBS", 1)),
             "vehicle_media_entries": 300,
         },
         "runtime": {
             "heic_available": bool(main_module.HEIC_SUPPORTED),
             "rembg_available": rembg_ready,
+            "comfyui_scene_workflow_configured": comfy_scene_workflow_ready,
             "cuda_available": cuda_ready,
             "torch_available": torch_ready,
             "ffmpeg_available": ffmpeg_ready,

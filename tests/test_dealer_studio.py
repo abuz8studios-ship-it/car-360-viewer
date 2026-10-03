@@ -402,6 +402,7 @@ def test_studio_vehicle_routes_are_tenant_scoped_and_health_is_non_probing(monke
     monkeypatch.setattr(rembg_runtime, "package_available", lambda: True)
     monkeypatch.delenv("LOTVUE_REMBG_MODEL", raising=False)
     monkeypatch.delenv("LOTVUE_REMBG_LICENSE_ACCEPTED", raising=False)
+    monkeypatch.delenv("LOTVUE_COMFYUI_SCENE_WORKFLOW", raising=False)
     for suffix in ("plan", "jobs", "run"):
         path = f"/api/studio/vehicles/{VIN}/{suffix}"
         assert _private_vehicle_scope(path) == VIN
@@ -412,7 +413,10 @@ def test_studio_vehicle_routes_are_tenant_scoped_and_health_is_non_probing(monke
     assert payload["limits"]["spin_frames"] == 36
     assert payload["limits"]["viewer_frames"] == 120
     assert payload["limits"]["vehicle_media_entries"] == 300
+    assert payload["limits"]["comfyui_scene_generation_jobs"] == 1
     assert payload["subsystems"]["billing"]["status"] == "owner_action_required"
     assert payload["subsystems"]["background_removal"]["status"] == "setup_required"
     assert "no model is selected" in payload["subsystems"]["background_removal"]["detail"]
+    assert payload["subsystems"]["comfyui_scene_generation"]["status"] == "setup_required"
+    assert payload["runtime"]["comfyui_scene_workflow_configured"] is False
     assert "pricing_approved" in payload["runtime"]

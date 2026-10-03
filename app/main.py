@@ -242,6 +242,8 @@ _BACKGROUND_EXECUTOR = ThreadPoolExecutor(
 _BACKGROUND_JOB_SLOTS = threading.BoundedSemaphore(_BACKGROUND_MAX_JOBS)
 _BACKGROUND_JOBS_LOCK = threading.Lock()
 _BACKGROUND_JOB_KEYS: set[str] = set()
+_COMFYUI_SCENE_MAX_JOBS = 1
+_COMFYUI_SCENE_JOB_SLOTS = threading.BoundedSemaphore(_COMFYUI_SCENE_MAX_JOBS)
 
 
 def _write_gaussian_status(vin: str, payload: dict) -> None:
@@ -9031,10 +9033,17 @@ def _comfyui_is_available() -> bool:
 
 @app.get("/api/comfyui/status")
 async def comfyui_status(request: Request):
-    """Probe the server-side ComfyUI service; browsers never contact localhost."""
+    """Probe ComfyUI server-side and report owner-configured scene workflow state."""
+    from ai_studio.background_studio import comfyui_scene_workflow_configured
+
     await run_in_threadpool(_authenticated_user_email, request)
     available = await run_in_threadpool(_comfyui_is_available)
-    return {"available": available}
+    workflow_configured = await run_in_threadpool(comfyui_scene_workflow_configured)
+    return {
+        "available": available,
+        "scene_workflow_configured": workflow_configured,
+        "scene_generation_available": available and workflow_configured,
+    }
 
 
 @app.get("/ai-commercial")
@@ -10386,25 +10395,71 @@ async def remove_bg_endpoint(file: UploadFile = File(...)):
 
 @app.post("/api/photo/composite")
 async def composite_endpoint(request: Request):
-    """Composite an image only when it is inside the caller's vehicle storage."""
-    from ai_studio.background_studio import PREMIUM_SCENES, composite_on_scene
+    """Run an explicit local composite or configured ComfyUI scene workflow."""
+    from ai_studio.background_studio import (
+        PREMIUM_SCENES,
+        ComfyUIWorkflowConfigurationError,
+        composite_on_scene,
+        generate_scene_with_comfyui,
+    )
 
     body = await _read_json_object_limited(request, 8192)
     image_ref = body.get("image_path")
     scene_id = body.get("scene", "clean-studio")
+    engine = body.get("engine", "local")
     if not isinstance(image_ref, str) or not image_ref or len(image_ref) > 2048:
         raise HTTPException(status_code=400, detail="image_path required")
     if not isinstance(scene_id, str) or scene_id not in PREMIUM_SCENES:
         raise HTTPException(status_code=400, detail="Unknown background scene")
+    if not isinstance(engine, str) or engine not in {"local", "comfyui"}:
+        raise HTTPException(status_code=400, detail="engine must be 'local' or 'comfyui'")
 
     vin, image_path = await run_in_threadpool(_resolve_vehicle_image_ref, image_ref)
     await run_in_threadpool(_require_vehicle_owner, request, vin)
     output_dir = await run_in_threadpool(
         _ensure_safe_vehicle_subdir, vin, "studio", create=True
     )
-    output_path = output_dir / f"{image_path.stem}_{scene_id}.jpg"
-    await run_in_threadpool(composite_on_scene, str(image_path), scene_id, str(output_path))
-    return {"status": "ok", "output": f"/storage/{vin}/studio/{output_path.name}"}
+    output_suffix = "_comfyui" if engine == "comfyui" else ""
+    output_path = output_dir / f"{image_path.stem}_{scene_id}{output_suffix}.jpg"
+    renderer = generate_scene_with_comfyui if engine == "comfyui" else composite_on_scene
+    scene_slot_acquired = False
+    if engine == "comfyui":
+        scene_slot_acquired = _COMFYUI_SCENE_JOB_SLOTS.acquire(blocking=False)
+        if not scene_slot_acquired:
+            raise HTTPException(
+                status_code=429,
+                detail="ComfyUI scene-generation capacity is full; retry later.",
+                headers={"Retry-After": "30"},
+            )
+    try:
+        await run_in_threadpool(renderer, str(image_path), scene_id, str(output_path))
+    except ComfyUIWorkflowConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="ComfyUI scene generation timed out; no generated output was published.",
+        ) from exc
+    except (RuntimeError, OSError) as exc:
+        if engine == "comfyui":
+            raise HTTPException(
+                status_code=503,
+                detail="ComfyUI scene generation failed; no generated output was published.",
+            ) from exc
+        raise HTTPException(status_code=422, detail="Could not composite this image") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Could not process this image") from exc
+    finally:
+        if scene_slot_acquired:
+            _COMFYUI_SCENE_JOB_SLOTS.release()
+
+    return {
+        "status": "ok",
+        "engine": "comfyui_workflow" if engine == "comfyui" else "local_image_composite",
+        "ai_generated": engine == "comfyui",
+        "review_required": engine == "comfyui",
+        "output": f"/storage/{vin}/studio/{output_path.name}",
+    }
 
 
 # =============================================================================

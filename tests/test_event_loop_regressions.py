@@ -56,10 +56,17 @@ def test_exterior_upload_uses_module_threadpool_without_local_name_shadowing(
 
 
 def test_comfyui_status_uses_module_threadpool_without_local_name_shadowing(monkeypatch) -> None:
+    from ai_studio import background_studio
+
     monkeypatch.setattr(main, "_authenticated_user_email", lambda _request: "dealer@example.test")
     monkeypatch.setattr(main, "_comfyui_is_available", lambda: True)
+    monkeypatch.setattr(background_studio, "comfyui_scene_workflow_configured", lambda: True)
 
-    assert asyncio.run(main.comfyui_status(object())) == {"available": True}
+    assert asyncio.run(main.comfyui_status(object())) == {
+        "available": True,
+        "scene_workflow_configured": True,
+        "scene_generation_available": True,
+    }
 
 
 def test_public_lead_submission_uses_module_threadpool_without_local_name_shadowing(
