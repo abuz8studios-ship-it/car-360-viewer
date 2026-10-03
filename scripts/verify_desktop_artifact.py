@@ -32,12 +32,25 @@ USER_DATA_SUFFIXES = (
     ".db", ".db-journal", ".db-shm", ".db-wal", ".log", ".bak",
     ".sqlite", ".sqlite-journal", ".sqlite-shm", ".sqlite-wal", ".sqlite3",
 )
-SECRET_SUFFIXES = (".jks", ".key", ".keystore", ".p12", ".pem", ".pfx")
+SECRET_SUFFIXES = (".jks", ".key", ".keystore", ".p12", ".pfx")
+PRIVATE_KEY_PEM_MARKERS = (
+    b"-----BEGIN PRIVATE KEY-----",
+    b"-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    b"-----BEGIN RSA PRIVATE KEY-----",
+    b"-----BEGIN EC PRIVATE KEY-----",
+    b"-----BEGIN DSA PRIVATE KEY-----",
+    b"-----BEGIN OPENSSH PRIVATE KEY-----",
+)
 CODE_SUFFIXES = {
     ".bat", ".c", ".cc", ".cmd", ".cpp", ".css", ".go", ".h", ".hpp",
     ".html", ".java", ".js", ".jsx", ".mjs", ".pyo", ".py", ".pyc",
     ".ps1", ".rs", ".sh", ".ts", ".tsx",
 }
+
+
+def _pem_contains_private_key(archive: zipfile.ZipFile, path: str) -> bool:
+    content = archive.read(path).upper()
+    return any(marker in content for marker in PRIVATE_KEY_PEM_MARKERS)
 
 
 def _is_sensitive_path_part(part: str, *, is_file: bool) -> bool:
@@ -246,6 +259,13 @@ def verify_desktop_artifact(
                 )
                 if sensitive_parts or name.lower().endswith(USER_DATA_SUFFIXES):
                     raise ArtifactVerificationError(f"User secret, log, or database was packaged: {name}")
+                if path.suffix.lower() == ".pem":
+                    private_name = any(
+                        marker in path.name.lower()
+                        for marker in ("private", "privkey", "private_key", "private-key")
+                    )
+                    if private_name or _pem_contains_private_key(archive, name):
+                        raise ArtifactVerificationError(f"Private key material must not be bundled: {name}")
                 if path.suffix.lower() in MODEL_SUFFIXES:
                     raise ArtifactVerificationError(f"Model weights must not be bundled: {name}")
                 if any(part.lower() == "storage" for part in path.parts):
