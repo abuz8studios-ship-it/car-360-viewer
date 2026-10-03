@@ -76,13 +76,36 @@ jobs:
       - name: Install portable desktop dependencies
         env:
           PIP_CONSTRAINT: requirements-release-constraints.txt
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements-desktop.txt
+          set +e
+          python -m pip install -r requirements-desktop.txt 2>&1 | tee .desktop-pip-install.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ $status -ne 0 ]]; then
+            tail -n 40 .desktop-pip-install.log
+            details=$(tail -n 30 .desktop-pip-install.log | paste -sd ' ' - | sed 's/%/%25/g')
+            echo "::error title=Desktop dependency installation failed::$details"
+            exit "$status"
+          fi
+          rm -f .desktop-pip-install.log
       - name: Build self-contained application and installer archive
         env:
           LOTVUE_BUILD_ID: ${{ github.sha }}
-        run: python scripts/build_desktop.py --platform ${{ matrix.platform }} --output dist/desktop-release
+        shell: bash
+        run: |
+          set +e
+          python scripts/build_desktop.py --platform ${{ matrix.platform }} --output dist/desktop-release 2>&1 | tee .desktop-build.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ $status -ne 0 ]]; then
+            tail -n 50 .desktop-build.log
+            details=$(tail -n 35 .desktop-build.log | paste -sd ' ' - | sed 's/%/%25/g')
+            echo "::error title=Desktop package build failed::$details"
+            exit "$status"
+          fi
+          rm -f .desktop-build.log
       - name: Smoke-test Windows installer and frozen runtime
         if: matrix.platform == 'windows'
         shell: pwsh
