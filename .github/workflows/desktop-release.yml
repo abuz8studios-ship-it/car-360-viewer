@@ -22,9 +22,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -63,9 +63,9 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -85,8 +85,11 @@ jobs:
           set -e
           if [[ $status -ne 0 ]]; then
             tail -n 40 .desktop-pip-install.log
-            details=$(tail -n 30 .desktop-pip-install.log | paste -sd ' ' - | sed 's/%/%25/g')
-            echo "::error title=Desktop dependency installation failed::$details"
+            while IFS= read -r line; do
+              line=${line//$'\r'/}
+              escaped=$(printf '%s' "$line" | sed 's/%/%25/g')
+              echo "::error title=Desktop dependency install log::$escaped"
+            done < <(tail -n 30 .desktop-pip-install.log)
             exit "$status"
           fi
           rm -f .desktop-pip-install.log
@@ -101,8 +104,11 @@ jobs:
           set -e
           if [[ $status -ne 0 ]]; then
             tail -n 50 .desktop-build.log
-            details=$(tail -n 35 .desktop-build.log | paste -sd ' ' - | sed 's/%/%25/g')
-            echo "::error title=Desktop package build failed::$details"
+            while IFS= read -r line; do
+              line=${line//$'\r'/}
+              escaped=$(printf '%s' "$line" | sed 's/%/%25/g')
+              echo "::error title=Desktop build log::$escaped"
+            done < <(tail -n 30 .desktop-build.log)
             exit "$status"
           fi
           rm -f .desktop-build.log
@@ -158,7 +164,7 @@ jobs:
       contents: write
     steps:
       - name: Check out release notes
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Download all platform artifacts
         uses: actions/download-artifact@v4
         with:

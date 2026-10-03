@@ -44,7 +44,9 @@ networkx==3.6.1
 nh3==0.3.7
 numba==0.68.0
 numpy==2.4.6
-onnxruntime==1.30.0
+# ONNX Runtime 1.23.2 is the last release with a CPython 3.11 Intel macOS wheel.
+onnxruntime==1.23.2; sys_platform == "darwin" and platform_machine == "x86_64"
+onnxruntime==1.30.0; sys_platform != "darwin" or platform_machine != "x86_64"
 opencv-python-headless==4.14.0.94
 opentelemetry-api==1.45.0
 pefile==2023.2.7; sys_platform == "win32"

@@ -19,7 +19,7 @@ PACKAGES = [
     "fastapi", "starlette", "uvicorn", "pydantic", "pydantic_core",
     "numpy", "cv2", "PIL", "pillow_heif", "jose", "cryptography", "cffi",
     "stripe", "requests", "reportlab", "qrcode", "multipart", "anyio",
-    "sniffio", "click", "h11", "httptools", "websockets", "watchfiles",
+    "click", "h11", "httptools", "websockets", "watchfiles",
     "certifi", "charset_normalizer", "idna", "urllib3", "ecdsa", "rsa",
     "pyasn1", "annotated_types", "typing_extensions",
     "rembg", "onnxruntime", "pymatting", "scipy", "skimage", "numba",
