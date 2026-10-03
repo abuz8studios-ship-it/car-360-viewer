@@ -174,6 +174,40 @@ def test_rejects_secret_or_model_files_in_archive_payload(
         )
 
 
+def test_rejects_private_pem_key_material_but_allows_public_ca_bundle(tmp_path: Path) -> None:
+    private_archive = _make_archive(
+        tmp_path / "private",
+        "windows",
+        "x64",
+        extra_files={
+            "LotVue360/app/server.pem": b"-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
+        },
+    )
+    with pytest.raises(ArtifactVerificationError, match="Private key material"):
+        verify_desktop_artifact(
+            private_archive,
+            platform_name="windows",
+            architecture="x64",
+            expected_build_id=BUILD_ID,
+        )
+
+    public_archive = _make_archive(
+        tmp_path / "public",
+        "windows",
+        "x64",
+        extra_files={
+            "LotVue360/_internal/certifi/cacert.pem": b"-----BEGIN CERTIFICATE-----\npublic CA cert\n-----END CERTIFICATE-----\n",
+        },
+    )
+    summary = verify_desktop_artifact(
+        public_archive,
+        platform_name="windows",
+        architecture="x64",
+        expected_build_id=BUILD_ID,
+    )
+    assert summary["files"] > 0
+
+
 def test_rejects_unsafe_archive_paths(tmp_path: Path) -> None:
     archive_path = _make_archive(
         tmp_path,
