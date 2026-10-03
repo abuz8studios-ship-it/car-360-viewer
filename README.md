@@ -19,7 +19,7 @@ Dealer Studio is a deterministic control plane over the existing engines and rou
 The codebase includes routes and UI for:
 
 - Dealer inventory and capture uploads with request, image-size, pixel, file-count, and worker limits.
-- Photo processing, backdrop catalog, 360-frame/viewer routes, public vehicle pages, and interior/hotspot experiences.
+- Photo processing, backdrop catalog, 360-frame/viewer routes, public vehicle pages, and interior/hotspot experiences. Optional ComfyUI scene generation is an explicit API engine at `POST /api/photo/composite`; it requires an owner-supplied API-format workflow, is not yet a Dealer Studio UI action, and labels generated results for review. The default renderer is deterministic and rejects opaque photos when a transparent cut-out is required.
 - CRM and lead workflows, import/export routes, and optional marketplace/feed connectors.
 - Optional video, background-removal, and Gaussian/COLMAP integrations whose engines, models, hardware, credentials, and real-world quality vary by installation.
 
@@ -76,6 +76,7 @@ Stripe remains disabled, public prices remain hidden, and no tier or amount is a
 - Photo capture/Studio route limit: up to **72 photos**; background jobs default to **2 worker threads / 4 admitted jobs**.
 - Public spin viewer: up to **120 frames**; public media-directory enumeration: up to **300 names**. These are application caps, not total disk quotas.
 - Large/file-upload concurrency: **2 per process**; multi-process aggregate load requires separate sizing.
+- ComfyUI scene generation: **1 active job per process**; additional concurrent requests receive `429 Retry-After: 30` rather than building an unbounded queue.
 
 See the dated audit for measurement boundaries and details. The caps do not replace storage quotas, proxy timeouts, production memory limits, real-workload load tests, or an operations/retention policy.
 
