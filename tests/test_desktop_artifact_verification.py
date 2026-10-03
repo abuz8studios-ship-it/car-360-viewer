@@ -180,7 +180,10 @@ def test_rejects_private_pem_key_material_but_allows_public_ca_bundle(tmp_path: 
         "windows",
         "x64",
         extra_files={
-            "LotVue360/app/server.pem": b"-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
+            "LotVue360/app/server.pem": (
+                b"x" * (64 * 1024 - 10)
+                + b"-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n"
+            ),
         },
     )
     with pytest.raises(ArtifactVerificationError, match="Private key material"):
