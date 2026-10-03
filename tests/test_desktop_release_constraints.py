@@ -1,4 +1,4 @@
-"""Regression tests for native-platform desktop dependency pins."""
+"""Regression tests for native-platform desktop dependency pins and staging filters."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
+
+from scripts.build_desktop import _ignore_app
 
 ROOT = Path(__file__).resolve().parents[1]
 PLATFORM_DEPENDENCIES = {
@@ -52,3 +54,30 @@ def test_release_constraints_select_one_compatible_stack_per_platform(
         assert str(applicable[0].specifier) == f"=={expected}", (
             f"{label}: unexpected {package} pin {applicable[0].specifier}"
         )
+
+
+def test_desktop_staging_excludes_secrets_models_and_user_data_but_keeps_env_template() -> None:
+    names = [
+        ".env",
+        ".env.local",
+        "dealer.env",
+        ".jwt_secret",
+        "stripe_credentials.json",
+        "private.pem",
+        "signing.key",
+        "vehicles.db",
+        "custom.sqlite3",
+        "desktop_launch.log",
+        "rembg.onnx",
+        "weights.safetensors",
+        "storage",
+        "vehicles",
+        ".env.example",
+        "main.py",
+    ]
+
+    ignored = _ignore_app("app", names)
+
+    assert set(names) - {".env.example", "main.py"} <= ignored
+    assert ".env.example" not in ignored
+    assert "main.py" not in ignored
