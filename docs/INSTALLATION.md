@@ -1,6 +1,6 @@
 # LotVue360 desktop installation and connector setup
 
-**Status as of 2026-10-03:** the hosted Windows x64, Intel macOS x64, and Apple Silicon macOS arm64 build matrix has passed native installer/runtime smoke tests and uploaded all three artifacts. The workflow verifies each ZIP checksum, manifest, FFmpeg notices, and excluded user data before smoke-testing and upload. Find the 30-day artifacts under **Actions → Desktop releases → a successful run → Artifacts**. No tag-triggered GitHub Release has been published. Builds are unsigned and macOS artifacts are not notarized; hosted runner smoke tests are not owner acceptance on end-user machines.
+**Status as of 2026-10-03:** the [hosted matrix run 37132549158](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37132549158) passed for Windows x64, Intel macOS x64, and Apple Silicon macOS arm64. Each ZIP's checksum, manifest, FFmpeg notices/binary hashes, and exclusions for user secrets and model weights were verified before native installer/runtime smoke tests and artifact upload. The three ZIPs and SHA-256 sidecars are available in the run's **Artifacts** section for 30 days. No tag-triggered GitHub Release has been published. Builds are unsigned and macOS artifacts are not notarized; hosted runner smoke tests are not owner acceptance on end-user machines.
 
 ## Get a Windows or Mac build from GitHub
 
@@ -9,7 +9,7 @@
    - `LotVue360-windows-x64.zip` for 64-bit Windows.
    - `LotVue360-macOS-x64.zip` for Intel Macs.
    - `LotVue360-macOS-arm64.zip` for Apple Silicon Macs.
-3. Download its adjacent `.zip.sha256` file and verify the checksum before running the installer. A checksum verifies file integrity, not publisher identity or a digital signature.
+3. Download its adjacent `.zip.sha256` file and verify the checksum before running the installer. On macOS, run `shasum -a 256 -c LotVue360-macOS-x64.zip.sha256` for Intel or `shasum -a 256 -c LotVue360-macOS-arm64.zip.sha256` for Apple Silicon, beside the matching ZIP. On Windows, run `certutil -hashfile LotVue360-windows-x64.zip SHA256` and compare its hash with the first value in the sidecar. A checksum verifies file integrity, not publisher identity or a digital signature.
 4. Extract the complete ZIP and open its top-level folder (`LotVue360` on Windows; `LotVue360-macOS-x64` or `LotVue360-macOS-arm64` on Mac).
 
 ### Windows
@@ -94,4 +94,4 @@ The script stages app source into a temporary clean directory, generates backgro
 
 ## Owner actions still required
 
-The hosted matrix has passed, but before a customer-facing `v*` release the owner should independently download and inspect the artifacts, review their manifests, FFmpeg notices, checksums, and dependency-license/SBOM inventory, and test install/update/removal on representative end-user Windows and Intel/Apple-Silicon Mac computers. If signed public installers are intended, the owner must provide Apple Developer ID/Notary and Windows code-signing credentials through GitHub secrets; this workflow does not fabricate signatures or claim notarization. External provider credentials, account approvals, pricing decisions, and model-license clearance remain owner-provided.
+The hosted matrix has passed, but before a customer-facing `v*` release the owner should independently download and inspect the artifacts, review their manifests, FFmpeg notices, and checksums; generate/review a version-specific dependency-license or SBOM report; and test install/update/removal on representative end-user Windows and Intel/Apple-Silicon Mac computers. If signed public installers are intended, the owner must provide Apple Developer ID/Notary and Windows code-signing credentials through GitHub secrets; this workflow does not fabricate signatures or claim notarization. External provider credentials, account approvals, pricing decisions, and model-license clearance remain owner-provided.

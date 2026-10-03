@@ -49,8 +49,15 @@ CODE_SUFFIXES = {
 
 
 def _pem_contains_private_key(archive: zipfile.ZipFile, path: str) -> bool:
-    content = archive.read(path).upper()
-    return any(marker in content for marker in PRIVATE_KEY_PEM_MARKERS)
+    overlap_size = max(map(len, PRIVATE_KEY_PEM_MARKERS)) - 1
+    overlap = b""
+    with archive.open(path) as stream:
+        for chunk in iter(lambda: stream.read(64 * 1024), b""):
+            block = overlap + chunk.upper()
+            if any(marker in block for marker in PRIVATE_KEY_PEM_MARKERS):
+                return True
+            overlap = block[-overlap_size:]
+    return False
 
 
 def _is_sensitive_path_part(part: str, *, is_file: bool) -> bool:

@@ -6,7 +6,7 @@ Built by Ahmad Odeh / ABUZ8 LLC (Dayton, Ohio). Product price remains **undecide
 
 ## Current engineering and release status
 
-The current repository branch includes a cross-platform PyInstaller build path and GitHub Actions jobs that can build Windows x64, macOS Intel, and macOS Apple Silicon ZIP artifacts. The release workflow definition is in `.github/workflows/desktop-release.yml`; a checked-in CPython 3.11 dependency-constraints file stabilizes the core/test/build package versions, while platform-only tools remain runner-specific. A push to this session branch triggers Windows/macOS installer and frozen-runtime smoke tests; a `v*` tag triggers a GitHub Release. The workflow can be run manually after it is present on the default branch. These builds have not yet been produced or tested by GitHub Actions. Until an Actions run succeeds, there is no hosted installer artifact to download.
+The cross-platform PyInstaller workflow has produced Windows x64, Intel macOS x64, and Apple Silicon macOS arm64 ZIP artifacts. The release code passed in [GitHub Actions run 37132549158](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37132549158): it checked each ZIP's checksum, manifest, FFmpeg/FFprobe hashes and notices, and secret/model exclusions, then passed native installer/runtime smoke tests and uploaded the artifacts. These are 30-day Actions artifacts; no tag-triggered GitHub Release has been published. A push to this session branch triggers the matrix, and only a `v*` tag publishes a release. The workflow can also be run manually after it is present on the default branch.
 
 The installers are per-user, keep writable data outside read-only bundle resources, include the Python runtime, declared core dependencies, FFmpeg/FFprobe, and the generated 40-background catalog. RemBG/ONNX runtime libraries are included, but **no background-removal checkpoint is selected or bundled by default**; operators must verify a model's commercial terms and explicitly enable it before weights are fetched. CUDA/ComfyUI/WAN model weights, COLMAP/Brush, paid service credentials, dealership/provider approvals, signatures, and notarization are not bundled.
 
@@ -27,7 +27,7 @@ Synthetic route tests verify representative behavior (including tenant isolation
 
 ## Install a desktop build from GitHub
 
-1. From the repository, open **Actions → Desktop releases → Run workflow**, or download assets from a completed `v*` GitHub Release.
+1. Open **Actions → Desktop releases**, choose a successful run on this branch (a verified run is [37132549158](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37132549158)), and download the matching ZIP plus `.sha256` sidecar from its **Artifacts** section. No tag-triggered GitHub Release has been published yet.
 2. Choose the artifact matching the computer:
    - `LotVue360-windows-x64.zip`
    - `LotVue360-macOS-x64.zip` (Intel)
@@ -35,7 +35,7 @@ Synthetic route tests verify representative behavior (including tenant isolation
 3. Compare the ZIP with its adjacent `.sha256` file and extract the full archive.
 4. Open the extracted top-level folder (`LotVue360` on Windows, `LotVue360-macOS-*` on macOS). Windows: double-click `Install-LotVue360.cmd`. macOS: double-click `Install-LotVue360.command` or run `bash install-lotvue.sh` from that folder.
 
-The current workflows produce **unsigned** artifacts: no Windows Authenticode signature, Apple Developer ID signature, or notarization is claimed. Read [`docs/INSTALLATION.md`](docs/INSTALLATION.md) before installing. A maintainer must run the workflow and review its test results; merely adding workflow files does not create an artifact.
+The current artifacts are **unsigned**: no Windows Authenticode signature, Apple Developer ID signature, or notarization is claimed. The hosted runner smoke tests are not owner acceptance on end-user machines. Before a customer-facing release, the owner should independently inspect the artifacts, review the version-specific dependency/license inventory, and test installation/update/removal on supported Windows and macOS computers. Read [`docs/INSTALLATION.md`](docs/INSTALLATION.md) before installing.
 
 ## Run from source
 
