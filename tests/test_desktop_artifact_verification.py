@@ -191,6 +191,24 @@ def test_rejects_unsafe_archive_paths(tmp_path: Path) -> None:
         )
 
 
+def test_allows_dependency_code_modules_with_secret_in_their_module_name(tmp_path: Path) -> None:
+    archive_path = _make_archive(
+        tmp_path,
+        "windows",
+        "x64",
+        extra_files={"LotVue360/_internal/stripe/apps/_secret_service.py": b"# dependency source"},
+    )
+
+    summary = verify_desktop_artifact(
+        archive_path,
+        platform_name="windows",
+        architecture="x64",
+        expected_build_id=BUILD_ID,
+    )
+
+    assert summary["files"] > 0
+
+
 def test_rejects_wrong_build_identity(tmp_path: Path) -> None:
     archive_path = _make_archive(tmp_path, "macos", "arm64")
 

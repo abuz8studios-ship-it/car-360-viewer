@@ -41,32 +41,47 @@ def _ignore_app(_directory: str, names: list[str]) -> set[str]:
         "LotVue360.spec", "LotVue360_dbg.spec", "LotVue360_standalone.spec",
         "LOTVUE_README.md", "static/create_icons.py",
     }
-    return {
-        name for name in names
+    model_suffixes = {
+        ".bin", ".ckpt", ".engine", ".ggml", ".gguf", ".h5", ".keras",
+        ".onnx", ".pb", ".pt", ".pth", ".safetensors", ".tflite", ".weights",
+    }
+    code_suffixes = {
+        ".bat", ".c", ".cc", ".cmd", ".cpp", ".css", ".go", ".h", ".hpp",
+        ".html", ".java", ".js", ".jsx", ".mjs", ".pyo", ".py", ".pyc",
+        ".ps1", ".rs", ".sh", ".ts", ".tsx",
+    }
+    sensitive_suffixes = (
+        ".db", ".db-journal", ".db-shm", ".db-wal", ".jks", ".key",
+        ".keystore", ".log", ".p12", ".pem", ".pfx", ".pyc", ".pyo",
+        ".sqlite", ".sqlite-journal", ".sqlite-shm", ".sqlite-wal", ".sqlite3", ".bak",
+    )
+
+    result = set()
+    for name in names:
+        lowered = name.lower()
+        source_code = Path(lowered).suffix in code_suffixes
+        env_file = (
+            lowered == ".env"
+            or lowered.startswith(".env.")
+            or ".env." in lowered
+            or lowered.endswith(".env")
+        ) and lowered != ".env.example"
         if (
             name in ignored
-            or ".bak-" in name.lower()
-            or (
-                (
-                    name.lower() == ".env"
-                    or name.lower().startswith(".env.")
-                    or ".env." in name.lower()
-                    or name.lower().endswith(".env")
-                )
-                and name.lower() != ".env.example"
-            )
-            or "secret" in name.lower()
-            or "credential" in name.lower()
-            or Path(name).suffix.lower() in {
-                ".bin", ".ckpt", ".engine", ".ggml", ".gguf", ".h5", ".keras",
-                ".onnx", ".pb", ".pt", ".pth", ".safetensors", ".tflite", ".weights",
-            }
-            or name.lower().endswith((
-                ".pyc", ".pyo", ".log", ".db", ".sqlite", ".sqlite3", ".bak",
-                ".pem", ".p12", ".pfx", ".key", ".jks", ".keystore",
-            ))
-        )
-    }
+            or ".bak-" in lowered
+            or env_file
+            or (not source_code and ("secret" in lowered or "credential" in lowered))
+            or Path(lowered).suffix in model_suffixes
+            or lowered.endswith(sensitive_suffixes)
+        ):
+            result.add(name)
+    return result
+
+
+def _is_onnxruntime_test_data(path: str | Path) -> bool:
+    """Identify ORT's small sample models, which are test data, not runtime weights."""
+    parts = tuple(part.lower() for part in Path(path).parts)
+    return any(parts[index:index + 2] == ("onnxruntime", "datasets") for index in range(len(parts) - 1))
 
 
 def _stage_application(stage_app: Path, build_id: str) -> None:

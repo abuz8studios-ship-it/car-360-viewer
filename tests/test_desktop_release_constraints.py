@@ -7,7 +7,7 @@ import pytest
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
 
-from scripts.build_desktop import _ignore_app
+from scripts.build_desktop import _ignore_app, _is_onnxruntime_test_data
 
 ROOT = Path(__file__).resolve().parents[1]
 PLATFORM_DEPENDENCIES = {
@@ -68,16 +68,31 @@ def test_desktop_staging_excludes_secrets_models_and_user_data_but_keeps_env_tem
         "vehicles.db",
         "custom.sqlite3",
         "desktop_launch.log",
+        "stale_module.pyc",
         "rembg.onnx",
         "weights.safetensors",
         "storage",
         "vehicles",
         ".env.example",
         "main.py",
+        "_secret_service.py",
+        "credential_helpers.js",
     ]
 
     ignored = _ignore_app("app", names)
 
-    assert set(names) - {".env.example", "main.py"} <= ignored
-    assert ".env.example" not in ignored
-    assert "main.py" not in ignored
+    allowed = {".env.example", "main.py", "_secret_service.py", "credential_helpers.js"}
+    assert set(names) - allowed <= ignored
+    assert allowed.isdisjoint(ignored)
+
+
+def test_onnxruntime_test_graphs_are_excluded_without_exempting_real_model_weights() -> None:
+    assert _is_onnxruntime_test_data(
+        "/site-packages/onnxruntime/datasets/mul_1.onnx",
+    )
+    assert not _is_onnxruntime_test_data(
+        "/site-packages/rembg/models/u2net.onnx",
+    )
+    assert not _is_onnxruntime_test_data(
+        "/site-packages/onnxruntime/capi/onnxruntime_pybind11_state.so",
+    )
