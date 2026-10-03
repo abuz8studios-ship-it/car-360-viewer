@@ -15,15 +15,19 @@ import time
 import shutil
 import subprocess
 import threading
+import sys
 from pathlib import Path
 from typing import Optional
 
-STORAGE_DIR = Path(r"E:\ABU\360Car\app\storage")
-FACTORY_DIR = Path(r"E:\ABU\ComfyUI\revenue_workflows")
-COMFY_INPUT = Path(r"E:\ABU\ComfyUI\input")
-COMFY_OUTPUT = Path(r"E:\ABU\ComfyUI\output")
-FFMPEG = r"E:\ABU\AI\ffmpeg\ffmpeg.exe"
-LOTVUE_PYTHON = r"E:\Miniconda3\envs\lotvue\python.exe"
+from app_paths import BASE_DIR, STORAGE_DIR, configured_path
+
+_COMFYUI_ROOT = configured_path("COMFYUI_ROOT", BASE_DIR / "ComfyUI")
+FACTORY_DIR = configured_path("LOTVUE_FACTORY_DIR", _COMFYUI_ROOT / "revenue_workflows")
+COMFY_INPUT = configured_path("COMFYUI_INPUT", _COMFYUI_ROOT / "input")
+COMFY_OUTPUT = configured_path("COMFYUI_OUTPUT", _COMFYUI_ROOT / "output")
+COMFYUI_URL = (os.getenv("COMFYUI_URL") or "http://127.0.0.1:8188").rstrip("/")
+FFMPEG = os.getenv("FFMPEG_PATH") or shutil.which("ffmpeg") or "ffmpeg"
+LOTVUE_PYTHON = os.getenv("LOTVUE_PYTHON") or sys.executable
 
 # Motion prompts per angle
 ANGLE_PROMPTS = {
@@ -94,7 +98,7 @@ def generate_tts_voiceover(text: str, output_path: str) -> bool:
         }
         data = json.dumps({"prompt": workflow}).encode()
         req = urllib.request.Request(
-            "http://127.0.0.1:8188/prompt",
+            f"{COMFYUI_URL}/prompt",
             data=data,
             headers={"Content-Type": "application/json"}
         )
@@ -105,7 +109,7 @@ def generate_tts_voiceover(text: str, output_path: str) -> bool:
         for _ in range(60):
             time.sleep(2)
             h = json.loads(urllib.request.urlopen(
-                f"http://127.0.0.1:8188/history/{prompt_id}", timeout=30
+                f"{COMFYUI_URL}/history/{prompt_id}", timeout=30
             ).read())
             if prompt_id in h:
                 status = h[prompt_id].get("status", {})
@@ -127,7 +131,7 @@ def generate_tts_voiceover(text: str, output_path: str) -> bool:
             "-t", "5", "-y", output_path
         ], capture_output=True, timeout=10)
         return True
-    except:
+    except (OSError, subprocess.SubprocessError):
         return False
 
 

@@ -1,240 +1,298 @@
 """
 LotVue Pro — AI Background Studio (Module 11)
-AI background removal + premium showroom scene replacement.
-Cloning best of autofox + AIVO360.
+Background removal and premium showroom scene replacement.
 
-Uses rembg for background removal, ComfyUI for premium scene compositing.
-Zero cloud cost — all local generation.
+All paths are portable and rooted at the app directory by default. Operators may
+set LOTVUE_STORAGE_DIR / LOTVUE_SCENES_DIR to use external storage. Uploaded and
+stored images are bounded before inference/compositing to keep memory predictable.
 """
-import os
+from __future__ import annotations
+
 import io
-import json
-import shutil
+import os
+import re
 from pathlib import Path
-from datetime import datetime
 from typing import Optional
-from PIL import Image
 
-STORAGE_DIR = Path(r"E:\ABU\360Car\app\storage")
-SCENES_DIR = Path(r"E:\ABU\360Car\app\static\scenes")
+from PIL import Image, ImageDraw, ImageOps
 
-# Premium showroom scenes (shipped with LotVue Pro)
+from app_paths import BASE_DIR, STORAGE_DIR, configured_path
+from background_catalog import (
+    STATIC_BACKGROUND_DIR,
+    background_asset_path,
+    scene_asset_slug,
+)
+
+
+def _bounded_int(env_key: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(env_key, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+_PACKAGED_SCENES_DIR = configured_path(
+    "LOTVUE_BACKGROUNDS_DIR",
+    configured_path("LOTVUE_SCENES_DIR", STATIC_BACKGROUND_DIR),
+)
+SCENES_DIR = configured_path("LOTVUE_SCENES_DIR", _PACKAGED_SCENES_DIR)
+MAX_IMAGE_PIXELS = _bounded_int("LOTVUE_MAX_IMAGE_PIXELS", 40_000_000, 1_000_000, 100_000_000)
+MAX_PROCESSING_EDGE = _bounded_int("LOTVUE_BACKGROUND_MAX_EDGE", 1920, 640, 4096)
+MAX_PHOTOS_PER_JOB = _bounded_int("LOTVUE_BACKGROUND_MAX_PHOTOS", 20, 1, 100)
+
+# Compatibility IDs map to the same packaged asset library used by the main
+# 360 renderer and Photo Studio. These are deterministic local composites, not
+# generated/inpainted scenes.
 PREMIUM_SCENES = {
     "luxury-showroom": {
-        "name": "Luxury Showroom",
-        "description": "High-end glass showroom with marble floors",
-        "color": "#1a1a2e",
-        "prompt": "luxury car showroom, marble floor, glass walls, dramatic lighting, photorealistic, 8k",
+        "name": "Luxury Showroom", "description": "Warm glass showroom setting",
+        "color": "#1a1a2e", "asset_slug": "showroom_lux",
     },
     "outdoor-mountain": {
-        "name": "Mountain Vista",
-        "description": "Scenic mountain road at golden hour",
-        "color": "#2d4a3e",
-        "prompt": "car parked on mountain road, golden hour, scenic vista, cinematic, 8k photography",
+        "name": "Mountain Vista", "description": "Mountain road at golden hour",
+        "color": "#2d4a3e", "asset_slug": "outdoor_mountain",
     },
     "urban-night": {
-        "name": "Urban Night",
-        "description": "City street with neon reflections",
-        "color": "#0a1628",
-        "prompt": "car on city street at night, neon reflections, wet road, cinematic lighting, 8k",
+        "name": "Urban Night", "description": "City street after dark",
+        "color": "#0a1628", "asset_slug": "outdoor_night_city",
     },
     "clean-studio": {
-        "name": "Clean Studio",
-        "description": "Professional white/grey gradient studio",
-        "color": "#e8ecf0",
-        "prompt": "car in professional photography studio, clean white background, soft lighting, product photography, 8k",
+        "name": "Clean Studio", "description": "Neutral studio backdrop",
+        "color": "#e8ecf0", "asset_slug": "studio_white",
     },
     "desert-sunset": {
-        "name": "Desert Sunset",
-        "description": "Wide desert road at sunset",
-        "color": "#8b4513",
-        "prompt": "car on desert highway at sunset, dramatic sky, cinematic wide shot, 8k",
+        "name": "Desert Sunset", "description": "Desert landscape at sunset",
+        "color": "#8b4513", "asset_slug": "outdoor_desert",
     },
     "beach-coast": {
-        "name": "Coastal Drive",
-        "description": "Pacific coast highway with ocean",
-        "color": "#1a5276",
-        "prompt": "car on coastal highway, ocean view, blue sky, golden hour, cinematic, 8k",
+        "name": "Coastal Drive", "description": "Coastal road and ocean backdrop",
+        "color": "#1a5276", "asset_slug": "outdoor_coast",
     },
     "dealer-lot": {
-        "name": "Dealer Lot (Clean)",
-        "description": "Professional dealer lot, clean background",
-        "color": "#34495e",
-        "prompt": "car on clean dealer lot, professional, even lighting, no distractions, product photography",
+        "name": "Dealer Lot", "description": "Clean dealership showroom",
+        "color": "#34495e", "asset_slug": "showroom_classic",
     },
     "garage-dark": {
-        "name": "Dark Garage",
-        "description": "Moody garage with spotlight effect",
-        "color": "#0d1117",
-        "prompt": "car in dark garage, single spotlight, dramatic shadows, automotive photography, 8k",
+        "name": "Dark Studio", "description": "Dark neutral studio backdrop",
+        "color": "#0d1117", "asset_slug": "studio_dark",
     },
 }
 
 
-def list_scenes() -> list:
-    """List all available background scenes."""
+def list_scenes() -> list[dict]:
+    """List compatibility scenes backed by the canonical packaged background set."""
     scenes = []
     for scene_id, info in PREMIUM_SCENES.items():
-        preview_path = SCENES_DIR / f"{scene_id}.jpg"
+        slug = scene_asset_slug(scene_id)
+        asset = background_asset_path(slug, SCENES_DIR) if slug else None
+        packaged = False
+        if asset is not None:
+            try:
+                packaged = asset.is_relative_to(STATIC_BACKGROUND_DIR.resolve())
+            except (OSError, RuntimeError, ValueError):
+                packaged = False
         scenes.append({
             "id": scene_id,
             "name": info["name"],
             "description": info["description"],
-            "color": info["color"],
-            "has_preview": preview_path.exists(),
-            "preview_url": f"/static/scenes/{scene_id}.jpg" if preview_path.exists() else None,
+            "background_slug": slug,
+            "has_preview": asset is not None,
+            "preview_url": f"/static/backgrounds/thumbs/{slug}.jpg" if packaged and slug else None,
+            "renderer": "local_image_composite" if asset else "local_gradient_fallback",
+            "ai_generated": False,
+            "requires_background_removal": True,
         })
     return scenes
 
 
-def remove_background(image_path: str, output_path: str = None) -> str:
-    """
-    Remove background from a vehicle photo using rembg.
-    Returns path to the transparent PNG.
-    """
-    from rembg import remove as rembg_remove
+def _open_bounded_image(image_path: str | Path, mode: str) -> Image.Image:
+    """Decode one image only after applying pixel and long-edge bounds."""
+    with Image.open(image_path) as source:
+        width, height = source.size
+        if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+            raise ValueError(f"Image exceeds the {MAX_IMAGE_PIXELS:,}-pixel processing limit")
+        source.draft("RGB", (MAX_PROCESSING_EDGE, MAX_PROCESSING_EDGE))
+        source.thumbnail(
+            (MAX_PROCESSING_EDGE, MAX_PROCESSING_EDGE),
+            Image.Resampling.LANCZOS,
+        )
+        source.load()
+        oriented = ImageOps.exif_transpose(source)
+        try:
+            return oriented.convert(mode)
+        finally:
+            if oriented is not source:
+                oriented.close()
 
-    img = Image.open(image_path)
-    result = rembg_remove(img)
 
-    if not output_path:
-        p = Path(image_path)
-        output_path = str(p.parent / f"{p.stem}_nobg.png")
+def _image_from_result(result) -> Image.Image:
+    if isinstance(result, Image.Image):
+        return result
+    if isinstance(result, (bytes, bytearray, memoryview)):
+        with Image.open(io.BytesIO(result)) as image:
+            image.load()
+            return image.copy()
+    raise TypeError("Background-removal engine returned an unsupported image type")
 
-    result.save(output_path, "PNG")
-    return output_path
+
+def remove_background(image_path: str, output_path: Optional[str] = None) -> str:
+    """Remove a photo background only with an explicitly approved local model."""
+    from rembg_runtime import remove as rembg_remove
+
+    image = _open_bounded_image(image_path, "RGB")
+    result = None
+    try:
+        result = _image_from_result(rembg_remove(image))
+        output = Path(output_path) if output_path else Path(image_path).with_name(
+            f"{Path(image_path).stem}_nobg.png"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        result.save(output, "PNG", optimize=True)
+        return str(output)
+    finally:
+        image.close()
+        if result is not None:
+            result.close()
 
 
-def composite_on_scene(vehicle_png: str, scene_id: str,
-                       output_path: str = None) -> str:
-    """
-    Composite a vehicle (with transparent background) onto a scene.
-    Uses simple PIL compositing — no GPU needed for basic scenes.
-    """
+def _make_gradient(size: tuple[int, int], color: str) -> Image.Image:
+    width, height = size
+    rgb = tuple(int(color[index:index + 2], 16) for index in (1, 3, 5))
+    scene = Image.new("RGBA", size)
+    draw = ImageDraw.Draw(scene)
+    # One bounded gradient image is generated per vehicle frame; avoid storing rows.
+    denominator = max(height - 1, 1)
+    for y in range(height):
+        factor = 1.0 - 0.3 * (y / denominator)
+        draw.line(
+            (0, y, width, y),
+            fill=tuple(round(channel * factor) for channel in rgb) + (255,),
+        )
+    return scene
+
+
+def composite_on_scene(
+    vehicle_png: str,
+    scene_id: str,
+    output_path: Optional[str] = None,
+) -> str:
+    """Composite a transparent vehicle cutout onto a bounded scene image."""
     scene_info = PREMIUM_SCENES.get(scene_id)
     if not scene_info:
         raise ValueError(f"Unknown scene: {scene_id}")
 
-    # Load vehicle with transparency
-    vehicle = Image.open(vehicle_png).convert("RGBA")
-    vw, vh = vehicle.size
+    vehicle = _open_bounded_image(vehicle_png, "RGBA")
+    scene = None
+    final = None
+    try:
+        size = vehicle.size
+        scene_slug = scene_asset_slug(scene_id)
+        scene_path = background_asset_path(scene_slug, SCENES_DIR) if scene_slug else None
+        if scene_path is not None:
+            scene = _open_bounded_image(scene_path, "RGBA")
+            if scene.size != size:
+                resized_scene = scene.resize(size, Image.Resampling.LANCZOS)
+                scene.close()
+                scene = resized_scene
+        else:
+            # Degraded local fallback only; this is not an AI-generated scene.
+            scene = _make_gradient(size, scene_info["color"])
 
-    # Create scene background
-    scene_path = SCENES_DIR / f"{scene_id}.jpg"
-    if scene_path.exists():
-        scene = Image.open(scene_path).convert("RGBA")
-        scene = scene.resize((vw, vh), Image.LANCZOS)
-    else:
-        # Generate solid color + gradient background
-        from PIL import ImageDraw
-        scene = Image.new("RGBA", (vw, vh))
-        draw = ImageDraw.Draw(scene)
-        base_color = scene_info["color"]
-        r = int(base_color[1:3], 16)
-        g = int(base_color[3:5], 16)
-        b = int(base_color[5:7], 16)
+        x = max(0, (scene.width - vehicle.width) // 2)
+        y = max(0, scene.height - vehicle.height)
+        scene.alpha_composite(vehicle, (x, y))
 
-        # Vertical gradient
-        for y in range(vh):
-            ratio = y / vh
-            cr = int(r * (1 - ratio * 0.3))
-            cg = int(g * (1 - ratio * 0.3))
-            cb = int(b * (1 - ratio * 0.3))
-            draw.line([(0, y), (vw, y)], fill=(cr, cg, cb, 255))
-
-    # Composite vehicle onto scene
-    # Position vehicle centered, lower third
-    vx = (scene.width - vehicle.width) // 2
-    vy = scene.height - vehicle.height
-    scene.paste(vehicle, (vx, vy), vehicle)
-
-    if not output_path:
-        p = Path(vehicle_png)
-        output_path = str(p.parent / f"{p.stem}_{scene_id}.jpg")
-
-    # Convert to RGB for JPEG
-    final = scene.convert("RGB")
-    final.save(output_path, "JPEG", quality=95)
-    return output_path
+        output = Path(output_path) if output_path else Path(vehicle_png).with_name(
+            f"{Path(vehicle_png).stem}_{scene_id}.jpg"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        final = scene.convert("RGB")
+        final.save(output, "JPEG", quality=92, optimize=True, progressive=True)
+        return str(output)
+    finally:
+        vehicle.close()
+        if scene is not None:
+            scene.close()
+        if final is not None:
+            final.close()
 
 
-def process_vehicle_photos(vin: str, scene_id: str = "clean-studio",
-                           max_photos: int = 20) -> dict:
-    """
-    Process all photos for a vehicle: remove backgrounds + composite on scene.
-    Returns paths to processed photos.
-    """
-    vehicle_dir = STORAGE_DIR / vin
-    exterior_dir = vehicle_dir / "exterior"
-    studio_dir = vehicle_dir / "studio"
-    studio_dir.mkdir(parents=True, exist_ok=True)
+def _safe_storage_path(*parts: str) -> Path:
+    root = STORAGE_DIR.resolve()
+    path = root.joinpath(*parts).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError("Vehicle storage path is invalid")
+    return path
 
-    if not exterior_dir.exists():
-        return {"error": f"No exterior photos found for {vin}", "processed": 0}
 
-    photos = sorted(exterior_dir.glob("*.jpg"))[:max_photos]
-    if not photos:
-        return {"error": f"No JPG photos found for {vin}", "processed": 0}
+def process_vehicle_photos(
+    vin: str,
+    scene_id: str = "clean-studio",
+    max_photos: int = 20,
+) -> dict:
+    """Compatibility wrapper over the canonical PhotoProcessor engine."""
+    vehicle_id = (vin or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{1,32}", vehicle_id):
+        raise ValueError("Invalid vehicle identifier")
+    if scene_id not in PREMIUM_SCENES:
+        raise ValueError(f"Unknown scene: {scene_id}")
+    from rembg_runtime import is_enabled as rembg_enabled
+    if not rembg_enabled():
+        return {
+            "vin": vehicle_id, "scene": scene_id, "status": "unavailable",
+            "processed": 0, "errors": 0,
+            "error": "No explicitly approved background-removal model is configured",
+        }
 
-    results = []
-    errors = []
+    scene_slug = scene_asset_slug(scene_id)
+    if not scene_slug:
+        raise ValueError("Scene is not mapped to the packaged background catalog")
+    photo_limit = max(1, min(int(max_photos), MAX_PHOTOS_PER_JOB))
+    exterior_dir = _safe_storage_path(vehicle_id, "exterior")
+    studio_dir = _safe_storage_path(vehicle_id, "studio")
+    if not exterior_dir.is_dir():
+        return {"vin": vehicle_id, "scene": scene_id, "processed": 0,
+                "errors": 0, "error": "No exterior photos found"}
 
-    for photo_path in photos:
-        try:
-            # Step 1: Remove background
-            nobg_path = str(studio_dir / f"{photo_path.stem}_nobg.png")
-            remove_background(str(photo_path), nobg_path)
-
-            # Step 2: Composite on scene
-            final_path = str(studio_dir / f"{photo_path.stem}.jpg")
-            composite_on_scene(nobg_path, scene_id, final_path)
-
-            results.append({
-                "original": str(photo_path),
-                "no_bg": nobg_path,
-                "final": final_path,
-                "scene": scene_id,
-            })
-
-            # Clean up intermediate PNG to save space
-            if os.path.exists(nobg_path):
-                os.remove(nobg_path)
-
-        except Exception as e:
-            errors.append({"photo": str(photo_path), "error": str(e)})
-
+    from .photo_processor import PhotoProcessor
+    results = PhotoProcessor(background_name=scene_slug).process_batch(
+        str(exterior_dir), str(studio_dir), max_photos=photo_limit
+    )
+    succeeded = sum(result.get("status") == "ok" for result in results)
+    degraded = sum(result.get("status") == "degraded" for result in results)
+    errors = sum(result.get("status") == "error" for result in results)
     return {
-        "vin": vin,
+        "vin": vehicle_id,
         "scene": scene_id,
-        "processed": len(results),
-        "errors": len(errors),
+        "background_slug": scene_slug,
+        "status": "error" if results and errors == len(results) else (
+            "degraded" if degraded or errors else "completed"
+        ),
+        "processed": succeeded + degraded,
+        "degraded": degraded,
+        "errors": errors,
         "results": results,
-        "error_details": errors,
     }
 
 
-def generate_scene_with_comfyui(vehicle_png: str, scene_id: str,
-                                output_path: str = None) -> str:
-    """
-    Use ComfyUI for high-quality AI scene generation.
-    Sends the vehicle + scene prompt to ComfyUI inpainting pipeline.
-    Falls back to simple compositing if ComfyUI is unavailable.
-    """
+def generate_scene_with_comfyui(
+    vehicle_png: str,
+    scene_id: str,
+    output_path: Optional[str] = None,
+) -> str:
+    """Probe ComfyUI and use the bounded local compositor as the current fallback."""
+    if scene_id not in PREMIUM_SCENES:
+        raise ValueError(f"Unknown scene: {scene_id}")
     import requests
 
-    scene_info = PREMIUM_SCENES.get(scene_id)
-    if not scene_info:
-        raise ValueError(f"Unknown scene: {scene_id}")
-
-    # Check ComfyUI availability
+    comfy_url = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
     try:
-        r = requests.get("http://localhost:8188/system_stats", timeout=3)
-        if r.status_code != 200:
-            raise ConnectionError("ComfyUI not responding")
-    except:
-        # Fallback to simple compositing
+        response = requests.get(f"{comfy_url}/system_stats", timeout=3)
+        response.raise_for_status()
+    except requests.RequestException:
         return composite_on_scene(vehicle_png, scene_id, output_path)
 
-    # For now, use simple compositing
-    # TODO: Wire up actual ComfyUI inpainting workflow for premium quality
+    # TODO: Wire inpainting into a real ComfyUI workflow; current successful probe
+    # still uses the deterministic local composite until that workflow is configured.
     return composite_on_scene(vehicle_png, scene_id, output_path)

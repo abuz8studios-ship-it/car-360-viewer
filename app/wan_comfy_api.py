@@ -13,15 +13,19 @@ import json
 import glob
 import time
 import shutil
+import tempfile
 import argparse
 import subprocess
 import urllib.request
 import urllib.error
 from pathlib import Path
 
-COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
-COMFYUI_OUTPUT = os.environ.get("COMFYUI_OUTPUT", r"E:\ABU\ComfyUI\output")
-FFMPEG = os.environ.get("FFMPEG_PATH", r"E:\ABU\AI\ffmpeg\ffmpeg.exe")
+from app_paths import BASE_DIR, configured_path
+
+COMFYUI_URL = (os.getenv("COMFYUI_URL") or "http://127.0.0.1:8188").rstrip("/")
+_COMFYUI_ROOT = configured_path("COMFYUI_ROOT", BASE_DIR / "ComfyUI")
+COMFYUI_OUTPUT = str(configured_path("COMFYUI_OUTPUT", _COMFYUI_ROOT / "output"))
+FFMPEG = os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg") or "ffmpeg"
 
 UNET = "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
 CLIP = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
@@ -340,7 +344,7 @@ def generate_wan_video_via_api(image_path: str, output_path: str, prompt: str = 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", required=True)
-    ap.add_argument("--out", default=r"C:\Temp\lotvue_wan_test.mp4")
+    ap.add_argument("--out", default=str(Path(tempfile.gettempdir()) / "lotvue_wan_test.mp4"))
     ap.add_argument("--prompt", default=DEFAULT_PROMPT)
     ap.add_argument("--frames", type=int, default=49)
     ap.add_argument("--steps", type=int, default=20)

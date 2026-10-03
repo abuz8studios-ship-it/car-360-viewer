@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-STORAGE_DIR = Path(r"E:\ABU\360Car\app\storage")
+from app_paths import STORAGE_DIR
 
 
 def _get_photo_urls(vin: str, base_url: str = "") -> list:

@@ -31,28 +31,18 @@ _SESSION = None
 
 
 def _session():
-    """rembg session, loaded once. u2net is the general model; isnet-general-use
-    gives cleaner wheel-arch edges on cars but is a bigger download."""
+    """Load the owner-selected model after explicit license acknowledgement."""
     global _SESSION
     if _SESSION is None:
-        from rembg import new_session
-        # Pegasus trap (logged 2026-08-10): cudnn64_9.dll is missing, so the CUDA
-        # provider throws NOT_IMPLEMENTED on Conv_0. Try CUDA, fall back to CPU.
-        try:
-            _SESSION = new_session("u2net", providers=["CUDAExecutionProvider"])
-            import numpy as _np
-            from rembg import remove as _rm
-            from PIL import Image as _Im
-            _rm(_Im.new("RGB", (32, 32), (127, 127, 127)), session=_SESSION)
-        except Exception:
-            _SESSION = new_session("u2net", providers=["CPUExecutionProvider"])
+        from rembg_runtime import require_session
+        _SESSION = require_session()
     return _SESSION
 
 
 def cut_car(img: Image.Image) -> Image.Image:
     """RGBA with the car isolated. Alpha is refined: erode 1px then blur 1.2px so
     the composite doesn't show a white halo from the original background."""
-    from rembg import remove
+    from rembg_runtime import remove
     out = remove(img.convert("RGB"), session=_session())
     r, g, b, a = out.split()
     a = a.filter(ImageFilter.MinFilter(3))          # pull the edge in 1px

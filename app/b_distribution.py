@@ -11,22 +11,23 @@ B6b: DealerCenter + Frazer DMS feed consumers
 Wired in from main.py via:  from b_distribution import register_distribution; register_distribution(app)
 """
 
-import io
-import os
 import csv
+import io
 import json
+import os
+import re
 import sqlite3
-from pathlib import Path
 from datetime import datetime
+from ipaddress import ip_address
+from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from app_paths import DB_PATH, STORAGE_DIR
+from auth_rate import check_auth_rate
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
-from pydantic import BaseModel
-
-BASE_DIR = Path(__file__).resolve().parent
-STORAGE_DIR = BASE_DIR / "storage"
-DB_PATH = BASE_DIR / "vehicles.db"
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 
@@ -35,6 +36,69 @@ def _db():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _actor_email(request: Request) -> str:
+    token = request.headers.get("authorization", "")
+    token = token[7:].strip() if token.lower().startswith("bearer ") else request.cookies.get("lotvue_token", "")
+    from a2_extensions import JWT_ALG, JWTError, _jwt_secret, jwt
+    try:
+        payload = jwt.decode(token, _jwt_secret(), algorithms=[JWT_ALG])
+    except JWTError as exc:
+        raise HTTPException(401, "Sign in required") from exc
+    email = str(payload.get("sub", "")).strip().lower()
+    if payload.get("type") != "access" or not email:
+        raise HTTPException(401, "Sign in required")
+    conn = _db()
+    exists = conn.execute("SELECT 1 FROM users WHERE LOWER(email)=?", (email,)).fetchone()
+    conn.close()
+    if not exists:
+        raise HTTPException(401, "User no longer exists")
+    return email
+
+
+def _is_owner(email: str) -> bool:
+    return bool(os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower() == email)
+
+
+def _strict_vin(value: str) -> str:
+    vin = str(value or "").strip().upper()
+    if not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", vin):
+        raise HTTPException(404, "Vehicle not found")
+    return vin
+
+
+def _csv_cell(value) -> str:
+    """Neutralize spreadsheet formulas in any user-controlled CSV field."""
+    text = "".join(ch for ch in str(value if value is not None else "")
+                   if ord(ch) in (9, 10, 13) or ord(ch) >= 32)
+    if text.lstrip(" \t\r\n")[:1] in {"=", "+", "-", "@"}:
+        return "'" + text
+    return text
+
+
+def _xml_escape(value) -> str:
+    from xml.sax.saxutils import escape
+
+    text = str(value if value is not None else "")
+    cleaned = "".join(
+        ch for ch in text
+        if ord(ch) in (9, 10, 13)
+        or 0x20 <= ord(ch) <= 0xD7FF
+        or 0xE000 <= ord(ch) <= 0xFFFD
+        or 0x10000 <= ord(ch) <= 0x10FFFF
+    )
+    return escape(cleaned)
+
+
+def _usd_price(value) -> str:
+    text = str(value if value is not None else "").replace("$", "").replace(",", "").strip()
+    if len(text) > 16 or not re.fullmatch(r"[0-9]+(?:\.[0-9]{1,2})?", text):
+        return ""
+    try:
+        return text if 0 < float(text) <= 100_000_000 else ""
+    except ValueError:
+        return ""
 
 
 # =============================================================================
@@ -59,40 +123,68 @@ _COL_ALIASES = {
     "stock": "stock_number", "stock#": "stock_number", "stock #": "stock_number",
     "stock_number": "stock_number", "stocknumber": "stock_number", "stock number": "stock_number",
     "description": "description", "comments": "description", "notes": "description",
-    "status": "status",
 }
 _IMPORTABLE = ["year", "make", "model", "trim_level", "engine", "transmission", "drivetrain",
                "fuel_type", "body_style", "color", "price", "mileage", "stock_number",
-               "description", "status"]
+               "description"]
 
 
-def _import_rows(rows: list, source: str = "csv"):
-    """Shared importer used by CSV upload and DMS feed consumers.
-    Each row: dict with canonical column names, must include 'vin'."""
+def _import_rows(rows: list, source: str = "csv", user_email: str = ""):
+    """Import metadata only into the authenticated tenant's inventory."""
+    user_email = (user_email or "").strip().lower()
+    if not user_email:
+        raise HTTPException(401, "Sign in required")
+    owner = _is_owner(user_email)
     conn = _db()
     imported, updated, errors = 0, 0, []
-    for i, row in enumerate(rows, 1):
-        vin = str(row.get("vin", "")).strip().upper()
-        if not (5 <= len(vin) <= 17) or not vin.isalnum():
-            errors.append({"row": i, "vin": vin, "error": "invalid VIN"})
-            continue
-        fields = {k: str(row[k]).strip() for k in _IMPORTABLE if k in row and str(row[k]).strip() != ""}
-        exists = conn.execute("SELECT vin FROM vehicles WHERE vin=?", (vin,)).fetchone()
-        try:
-            if exists:
-                if fields:
-                    sets = ", ".join(f"{k}=?" for k in fields)
-                    conn.execute(f"UPDATE vehicles SET {sets} WHERE vin=?", (*fields.values(), vin))
-                updated += 1
-            else:
-                cols = ["vin", "created_at"] + list(fields.keys())
-                vals = [vin, datetime.now().isoformat()] + list(fields.values())
-                ph = ",".join("?" * len(cols))
-                conn.execute(f"INSERT INTO vehicles ({','.join(cols)}) VALUES ({ph})", vals)
-                imported += 1
-        except Exception as e:
-            errors.append({"row": i, "vin": vin, "error": str(e)})
-    conn.commit()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for i, row in enumerate(rows, 1):
+            vin = str(row.get("vin", "")).strip().upper()
+            if not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", vin):
+                errors.append({"row": i, "vin": vin[:32], "error": "invalid VIN"})
+                continue
+            fields = {}
+            too_long = False
+            for key in _IMPORTABLE:
+                value = str(row.get(key, "") or "").strip()
+                if value:
+                    limit = 2000 if key == "description" else 300
+                    if len(value) > limit:
+                        too_long = True
+                        break
+                    fields[key] = value
+            if too_long:
+                errors.append({"row": i, "vin": vin, "error": "metadata field is too long"})
+                continue
+            existing = conn.execute(
+                "SELECT user_email, status FROM vehicles WHERE vin=?", (vin,)
+            ).fetchone()
+            if existing and existing["status"] != "active":
+                errors.append({"row": i, "vin": vin, "error": "vehicle is inactive"})
+                continue
+            if existing and not owner and str(existing["user_email"] or "").strip().lower() != user_email:
+                errors.append({"row": i, "vin": vin, "error": "vehicle belongs to another tenant"})
+                continue
+            try:
+                if existing:
+                    if fields:
+                        sets = ", ".join(f"{key}=?" for key in fields)
+                        conn.execute(f"UPDATE vehicles SET {sets} WHERE vin=? AND status='active'", (*fields.values(), vin))
+                    updated += 1
+                else:
+                    cols = ["vin", "created_at", "user_email"] + list(fields.keys())
+                    vals = [vin, datetime.now().isoformat(), user_email] + list(fields.values())
+                    ph = ",".join("?" for _ in cols)
+                    conn.execute(f"INSERT INTO vehicles ({','.join(cols)}) VALUES ({ph})", vals)
+                    imported += 1
+            except sqlite3.Error:
+                errors.append({"row": i, "vin": vin, "error": "could not import row"})
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        conn.close()
+        raise HTTPException(500, "Vehicle import failed")
     conn.close()
     print(f"[Import:{source}] imported={imported} updated={updated} errors={len(errors)}")
     return {"imported": imported, "updated": updated, "errors": errors,
@@ -100,11 +192,14 @@ def _import_rows(rows: list, source: str = "csv"):
 
 
 @router.post("/api/import/csv")
-async def import_csv(file: UploadFile = File(...)):
-    """Bulk vehicle import. Accepts a CSV with a header row; flexible column names
-    (vin/year/make/model/trim/price/miles/stock#/etc). Existing VINs are updated
-    (metadata only — photos/frames untouched), new VINs are created as drafts."""
-    raw = await file.read()
+async def import_csv(request: Request, file: UploadFile = File(...)):
+    """Bulk import only into the current tenant's inventory."""
+    from starlette.concurrency import run_in_threadpool
+
+    email = await run_in_threadpool(_actor_email, request)
+    raw = await file.read(10 * 1024 * 1024 + 1)
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(413, "CSV file exceeds 10 MB")
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -122,15 +217,18 @@ async def import_csv(file: UploadFile = File(...)):
             if canon:
                 row[canon] = v
         if row:
+            if len(rows) >= 5000:
+                raise HTTPException(413, "CSV may contain at most 5,000 vehicle rows")
             rows.append(row)
     if not rows:
         raise HTTPException(400, f"No usable columns found. Headers seen: {reader.fieldnames}. "
                                  f"Need at least a 'vin' column.")
-    return _import_rows(rows, source=f"csv:{file.filename}")
+    safe_filename = Path(file.filename or "import.csv").name[:100]
+    return await run_in_threadpool(_import_rows, rows, f"csv:{safe_filename}", email)
 
 
 @router.get("/api/import/csv-template")
-async def csv_template():
+def csv_template():
     tpl = ("vin,year,make,model,trim,mileage,price,color,stock_number,description\n"
            "1HGCM82633A004352,2024,Honda,Accord,EX-L,12500,27995,Silver,STK1001,One owner clean carfax\n")
     return Response(tpl, media_type="text/csv",
@@ -169,43 +267,87 @@ def _ensure_post_log():
     conn = _db()
     conn.execute("""CREATE TABLE IF NOT EXISTS post_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        vin TEXT, channel TEXT, posted_at TEXT, meta TEXT DEFAULT ''
+        vin TEXT, channel TEXT, posted_at TEXT, meta TEXT DEFAULT '',
+        user_email TEXT DEFAULT ''
     )""")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(post_log)")}
+    if "user_email" not in columns:
+        conn.execute("ALTER TABLE post_log ADD COLUMN user_email TEXT DEFAULT ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_post_log_owner_channel_time "
+                 "ON post_log(user_email, channel, posted_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_post_log_channel_time "
+                 "ON post_log(channel, posted_at DESC)")
     conn.commit()
     conn.close()
     _fb_post_log_init = True
 
 
 def _vehicle(vin: str):
+    vin = _strict_vin(vin)
     conn = _db()
-    v = conn.execute("SELECT * FROM vehicles WHERE vin=?", (vin.upper(),)).fetchone()
+    v = conn.execute("SELECT * FROM vehicles WHERE vin=? AND status='active'", (vin,)).fetchone()
     conn.close()
     if not v:
         raise HTTPException(404, "Vehicle not found")
     return {k: v[k] for k in v.keys()}
 
 
-def _public_base():
-    return os.getenv("LOTVUE_PUBLIC_URL", "http://127.0.0.1:8001").rstrip("/")
+def _public_base(*, require_public: bool = False):
+    base = (os.getenv("LOTVUE_PUBLIC_URL", "").strip() or "http://127.0.0.1:8001").rstrip("/")
+    parts = urlsplit(base)
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise HTTPException(503, "LOTVUE_PUBLIC_URL must be a valid absolute HTTP(S) URL") from exc
+    if (parts.scheme not in {"http", "https"} or not parts.hostname
+            or parts.username is not None or parts.password is not None
+            or parts.query or parts.fragment):
+        raise HTTPException(503, "LOTVUE_PUBLIC_URL must be a valid absolute HTTP(S) URL")
+    if require_public:
+        host = parts.hostname.lower().rstrip(".")
+        private_host = host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".internal"))
+        try:
+            addr = ip_address(host)
+            private_host = private_host or not addr.is_global
+        except ValueError:
+            pass
+        if parts.scheme != "https" or private_host or (port is not None and port != 443):
+            raise HTTPException(503, "LOTVUE_PUBLIC_URL must use a public HTTPS host for feed exports")
+    return base
 
 
 def _photo_urls(vin: str, limit: int = 20):
+    try:
+        vin = _strict_vin(vin)
+    except HTTPException:
+        return []
     base = _public_base()
-    vdir = STORAGE_DIR / vin.upper()
+    root = STORAGE_DIR.resolve()
+    vdir = (STORAGE_DIR / vin).resolve()
+    if vdir.parent != root or not vdir.is_dir():
+        return []
     urls = []
     for sub in ["spin", "exterior", "gallery"]:
         d = vdir / sub
-        if d.exists():
-            for f in sorted(d.glob("*.jpg"))[:limit - len(urls)]:
-                urls.append(f"{base}/storage/{vin.upper()}/{sub}/{f.name}")
+        if d.is_symlink() or not d.is_dir():
+            continue
+        safe_files = [
+            f for f in sorted(d.glob("*.jpg"))
+            if (not f.is_symlink() and f.is_file()
+                and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}\.jpg", f.name)
+                and f.resolve().is_relative_to(vdir))
+        ]
+        for f in safe_files[:max(0, limit - len(urls))]:
+            urls.append(f"{base}/storage/{vin.upper()}/{sub}/{f.name}")
         if len(urls) >= limit:
             break
     return urls
 
 
 @router.get("/api/marketplace/facebook/{vin}/pack")
-async def fb_listing_pack(vin: str):
+def fb_listing_pack(vin: str, request: Request):
     """Ready-to-paste Facebook Marketplace listing pack + guardrail check."""
+    email = _actor_email(request)
     _ensure_post_log()
     v = _vehicle(vin)
     title = f"{v.get('year','')} {v.get('make','')} {v.get('model','')} {v.get('trim_level','') or ''}".strip()
@@ -223,11 +365,14 @@ async def fb_listing_pack(vin: str):
     # Guardrail: pacing check from post_log
     conn = _db()
     today = datetime.now().strftime("%Y-%m-%d")
+    scope_sql = "" if _is_owner(email) else " AND user_email=?"
+    scope_params = () if _is_owner(email) else (email,)
     posts_today = conn.execute(
-        "SELECT COUNT(*) FROM post_log WHERE channel='facebook' AND posted_at LIKE ?",
-        (today + "%",)).fetchone()[0]
+        "SELECT COUNT(*) FROM post_log WHERE channel='facebook' AND posted_at LIKE ?" + scope_sql,
+        (today + "%", *scope_params)).fetchone()[0]
     last = conn.execute(
-        "SELECT posted_at FROM post_log WHERE channel='facebook' ORDER BY posted_at DESC LIMIT 1"
+        "SELECT posted_at FROM post_log WHERE channel='facebook'" + scope_sql +
+        " ORDER BY posted_at DESC LIMIT 1", scope_params
     ).fetchone()
     conn.close()
     minutes_since_last = None
@@ -261,25 +406,34 @@ async def fb_listing_pack(vin: str):
 
 
 @router.post("/api/marketplace/facebook/{vin}/mark-posted")
-async def fb_mark_posted(vin: str):
+def fb_mark_posted(vin: str, request: Request):
     """Log a manual FB post so pacing guardrails stay accurate."""
+    email = _actor_email(request)
     _ensure_post_log()
     conn = _db()
-    conn.execute("INSERT INTO post_log (vin, channel, posted_at) VALUES (?,?,?)",
-                 (vin.upper(), "facebook", datetime.now().isoformat()))
+    conn.execute("INSERT INTO post_log (vin, channel, posted_at, user_email) VALUES (?,?,?,?)",
+                 (vin.upper(), "facebook", datetime.now().isoformat(), email))
     conn.commit()
     conn.close()
     return {"status": "logged", "vin": vin.upper(), "channel": "facebook"}
 
 
 @router.get("/api/marketplace/facebook/catalog.csv")
-async def fb_catalog_csv():
-    """Facebook Commerce Manager 'vehicles' catalog feed (official volume path).
-    Upload this in Commerce Manager → Catalog → Data sources."""
+def fb_catalog_csv(request: Request):
+    """Download the authenticated tenant's Facebook vehicle catalog."""
+    email = _actor_email(request)
     conn = _db()
-    rows = conn.execute("SELECT * FROM vehicles WHERE exterior_frames > 0 OR price != ''").fetchall()
+    if _is_owner(email):
+        rows = conn.execute(
+            "SELECT * FROM vehicles WHERE status='active' AND (exterior_frames > 0 OR price != '')"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM vehicles WHERE status='active' AND LOWER(COALESCE(user_email,''))=? "
+            "AND (exterior_frames > 0 OR price != '')", (email,)
+        ).fetchall()
     conn.close()
-    base = _public_base()
+    base = _public_base(require_public=True)
     buf = io.StringIO()
     w = csv.writer(buf)
     # address.* fields are required by Meta's vehicle feed spec; market id must be
@@ -289,22 +443,27 @@ async def fb_catalog_csv():
                 "exterior_color", "transmission", "fuel_type", "body_style", "image[0].url",
                 "address.addr1", "address.city", "address.region", "address.postal_code",
                 "address.country", "comscore_market_id"])
-    page_id = os.getenv("LOTVUE_FB_PAGE_ID", "")
-    addr = [os.getenv("LOTVUE_DEALER_ADDR1", ""), os.getenv("LOTVUE_DEALER_CITY", ""),
-            os.getenv("LOTVUE_DEALER_REGION", ""), os.getenv("LOTVUE_DEALER_POSTAL", ""),
-            os.getenv("LOTVUE_DEALER_COUNTRY", "US"),
-            os.getenv("LOTVUE_COMSCORE_MARKET_ID", "")]
+    page_id = os.getenv("LOTVUE_FB_PAGE_ID", "").strip()
+    addr = [os.getenv("LOTVUE_DEALER_ADDR1", "").strip(), os.getenv("LOTVUE_DEALER_CITY", "").strip(),
+            os.getenv("LOTVUE_DEALER_REGION", "").strip(), os.getenv("LOTVUE_DEALER_POSTAL", "").strip(),
+            os.getenv("LOTVUE_DEALER_COUNTRY", "US").strip(),
+            os.getenv("LOTVUE_COMSCORE_MARKET_ID", "").strip()]
+    if not page_id or any(not value for value in addr):
+        raise HTTPException(503, "Facebook catalog requires page id, dealer address, and Comscore market ID settings")
     for v in rows:
+        price_val = _usd_price(v["price"])
+        if not price_val:
+            continue
         title = f"{v['year']} {v['make']} {v['model']}".strip()
         photos = _photo_urls(v["vin"], limit=1)
-        price_val = str(v["price"] or "0").replace("$", "").replace(",", "")
-        w.writerow([
+        row = [
             page_id, v["vin"], title, (v["description"] or title),
             f"{base}/view/{v['vin']}", v["make"], v["model"], v["year"],
             v["mileage"] or "0", "MI", f"{price_val} USD", "USED", "car_truck",
             v["color"] or "", v["transmission"] or "", v["fuel_type"] or "",
             v["body_style"] or "", photos[0] if photos else "", *addr,
-        ])
+        ]
+        w.writerow([_csv_cell(value) for value in row])
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=fb_vehicle_catalog.csv"})
 
@@ -312,8 +471,23 @@ async def fb_catalog_csv():
 # =============================================================================
 # B2 — GOOGLE VEHICLE LISTINGS FEED
 # =============================================================================
+def _google_feed_email(token: str) -> str:
+    """Authorize the crawler's secret URL and bind the feed to one tenant."""
+    import hmac
+
+    expected = os.getenv("LOTVUE_GOOGLE_FEED_TOKEN", "")
+    tenant_email = os.getenv("LOTVUE_GOOGLE_FEED_USER_EMAIL", "").strip().lower()
+    if (len(expected) < 32 or len(expected) > 512 or not re.fullmatch(
+            r"[^@\s]{1,64}@[^@\s]{1,190}\.[^@\s]{2,63}", tenant_email)):
+        raise HTTPException(503, "Google vehicle feed is not configured")
+    if (not token or len(token) != len(expected) or len(token) > 512
+            or not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))):
+        raise HTTPException(404, "Feed not found")
+    return tenant_email
+
+
 @router.get("/api/feeds/google-vehicle-listings.xml")
-async def google_vehicle_feed():
+def google_vehicle_feed(token: str = ""):
     """Google Vehicle Listings feed (Merchant Center 'vehicle ads' XML).
     Register at Merchant Center → vehicle ads program, point it at this URL.
 
@@ -323,25 +497,38 @@ async def google_vehicle_feed():
     price, condition, make, model, trim (where available), year, mileage.
     Rows with no price or no photo are SKIPPED — Google disapproves them and
     partial items drag down feed quality score."""
-    from xml.sax.saxutils import escape
+    feed_email = _google_feed_email(token)
+    base = _public_base(require_public=True)
+    store_code = os.getenv("LOTVUE_GOOGLE_STORE_CODE", "").strip()
+    dealer_name = os.getenv("LOTVUE_DEALER_NAME", "").strip()
+    address_parts = (
+        os.getenv("LOTVUE_DEALER_ADDR1", "").strip(), os.getenv("LOTVUE_DEALER_CITY", "").strip(),
+        os.getenv("LOTVUE_DEALER_REGION", "").strip(), os.getenv("LOTVUE_DEALER_POSTAL", "").strip(),
+        os.getenv("LOTVUE_DEALER_COUNTRY", "US").strip(),
+    )
+    if not store_code or not dealer_name or any(not part for part in address_parts):
+        raise HTTPException(503, "Google vehicle feed requires store code and complete dealer address settings")
+    dealer_addr = ", ".join(address_parts)
     conn = _db()
-    rows = conn.execute("SELECT * FROM vehicles WHERE exterior_frames > 0 OR price != ''").fetchall()
+    rows = conn.execute(
+        "SELECT vin, year, make, model, trim_level, price, mileage, color "
+        "FROM vehicles WHERE status='active' AND LOWER(COALESCE(user_email,''))=? "
+        "AND (exterior_frames > 0 OR price != '') ORDER BY vin LIMIT 5000", (feed_email,)
+    ).fetchall()
     conn.close()
-    base = _public_base()
-    store_code = os.getenv("LOTVUE_GOOGLE_STORE_CODE", "lotvue-demo")
-    dealer_name = os.getenv("LOTVUE_DEALER_NAME", "LotVue Motors")
-    dealer_addr = ", ".join(x for x in (
-        os.getenv("LOTVUE_DEALER_ADDR1", ""), os.getenv("LOTVUE_DEALER_CITY", ""),
-        os.getenv("LOTVUE_DEALER_REGION", ""), os.getenv("LOTVUE_DEALER_POSTAL", ""),
-        os.getenv("LOTVUE_DEALER_COUNTRY", "US")) if x)
     items, skipped = [], 0
     for v in rows:
-        photos = _photo_urls(v["vin"], limit=10)
-        price_val = str(v["price"] or "").replace("$", "").replace(",", "").strip()
-        if not photos or not price_val or price_val == "0":
+        try:
+            vin = _strict_vin(v["vin"])
+        except HTTPException:
             skipped += 1
             continue
-        e = lambda s: escape(str(s or ""))
+        photos = _photo_urls(vin, limit=10)
+        price_val = _usd_price(v["price"])
+        if not photos or not price_val:
+            skipped += 1
+            continue
+        e = _xml_escape
         title = e(f"{v['year']} {v['make']} {v['model']} {v['trim_level'] or ''}".strip())
         trim = f"\n      <g:trim>{e(v['trim_level'])}</g:trim>" if v["trim_level"] else ""
         color = (f"\n      <g:exterior_color>{e(v['color'])}</g:exterior_color>"
@@ -369,14 +556,14 @@ async def google_vehicle_feed():
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
   <channel>
-    <title>{escape(dealer_name)} Vehicle Inventory</title>
-    <link>{escape(base)}</link>
+    <title>{_xml_escape(dealer_name)} Vehicle Inventory</title>
+    <link>{_xml_escape(base)}</link>
     <description>Vehicle listings feed for Google vehicle ads</description>
     <!-- {len(items)} items emitted, {skipped} rows skipped (missing price or photos) -->
 {chr(10).join(items)}
   </channel>
 </rss>"""
-    return Response(xml, media_type="application/xml")
+    return Response(xml, media_type="application/xml", headers={"Cache-Control": "no-store"})
 
 
 # =============================================================================
@@ -393,7 +580,7 @@ def _ebay_creds():
 
 
 @router.get("/api/marketplace/ebay/status")
-async def ebay_status():
+def ebay_status():
     c = _ebay_creds()
     configured = bool(c["app_id"] and c["cert_id"] and c["oauth_token"])
     return {"configured": configured, "sandbox": c["sandbox"],
@@ -403,9 +590,9 @@ async def ebay_status():
 
 
 @router.get("/api/marketplace/ebay/{vin}/draft")
-async def ebay_draft(vin: str):
-    """Build the eBay Motors listing payload (Inventory API format). Returns the
-    draft always; only submits when credentials are configured."""
+def ebay_draft(vin: str, request: Request):
+    """Build the eBay Motors listing payload for the authenticated tenant."""
+    _actor_email(request)
     v = _vehicle(vin)
     photos = _photo_urls(vin, limit=12)
     title = f"{v.get('year','')} {v.get('make','')} {v.get('model','')} {v.get('trim_level','') or ''}".strip()[:80]
@@ -431,17 +618,18 @@ async def ebay_draft(vin: str):
         "categoryId": "6001",
         "pricingSummary": {"price": {"value": price_val, "currency": "USD"}},
     }
-    return {"vin": vin.upper(), "configured": (await ebay_status())["configured"], "draft": payload,
+    return {"vin": vin.upper(), "configured": ebay_status()["configured"], "draft": payload,
             "note": "POST /api/marketplace/ebay/{vin}/publish to submit once credentialed."}
 
 
 @router.post("/api/marketplace/ebay/{vin}/publish")
-async def ebay_publish(vin: str):
+def ebay_publish(vin: str, request: Request):
+    _actor_email(request)
     c = _ebay_creds()
     if not (c["app_id"] and c["oauth_token"]):
         raise HTTPException(503, "eBay API not credentialed. Set EBAY_* env vars (see /api/marketplace/ebay/status).")
     import urllib.request
-    draft = (await ebay_draft(vin))["draft"]
+    draft = ebay_draft(vin, request)["draft"]
     host = "api.sandbox.ebay.com" if c["sandbox"] else "api.ebay.com"
     req = urllib.request.Request(
         f"https://{host}/sell/inventory/v1/inventory_item/{draft['sku']}",
@@ -466,10 +654,9 @@ async def ebay_publish(vin: str):
 # B3 — CRAIGSLIST PACK (manual-post helper; CL has no public posting API)
 # =============================================================================
 @router.get("/api/marketplace/craigslist/{vin}/pack")
-async def craigslist_pack(vin: str):
-    """Ready-to-paste Craigslist 'cars+trucks by dealer' listing pack.
-    Craigslist has no official posting API; automated posting violates their ToS,
-    so this produces the complete paste-ready pack instead."""
+def craigslist_pack(vin: str, request: Request):
+    """Build a listing pack for the authenticated tenant's vehicle."""
+    _actor_email(request)
     v = _vehicle(vin)
     title = f"{v.get('year','')} {v.get('make','')} {v.get('model','')} {v.get('trim_level','') or ''}".strip()
     price_val = str(v.get("price") or "").replace("$", "").replace(",", "")
@@ -501,7 +688,7 @@ def _postiz_cfg():
 
 
 @router.get("/api/social/postiz/status")
-async def postiz_status():
+def postiz_status():
     c = _postiz_cfg()
     if not (c["url"] and c["key"]):
         return {"configured": False, "how_to": "Set POSTIZ_URL and POSTIZ_API_KEY env vars."}
@@ -510,21 +697,33 @@ async def postiz_status():
         req = urllib.request.Request(f"{c['url']}/api/public/v1/integrations",
                                      headers={"Authorization": c["key"]})
         with urllib.request.urlopen(req, timeout=15) as r:
-            chans = json.loads(r.read())
+            raw = r.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("Postiz integrations response exceeds 1 MB")
+        chans = json.loads(raw)
         return {"configured": True, "channels": chans}
     except Exception as e:
         return {"configured": True, "reachable": False, "error": str(e)}
 
 
 class SocialPost(BaseModel):
-    channels: list = []           # Postiz integration ids; empty = all
-    text: Optional[str] = ""      # override caption
-    schedule_iso: Optional[str] = ""  # ISO datetime; empty = now
+    channels: list[str] = Field(default_factory=list, max_length=20)
+    text: Optional[str] = Field(default="", max_length=3000)
+    schedule_iso: Optional[str] = Field(default="", max_length=64)
 
 
 @router.post("/api/social/postiz/{vin}/post")
-async def postiz_post(vin: str, body: SocialPost):
-    """Queue a vehicle post through Postiz to connected social channels."""
+def postiz_post(vin: str, body: SocialPost, request: Request):
+    """Queue a bounded post for the authenticated tenant's vehicle."""
+    email = _actor_email(request)
+    for channel in body.channels:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", channel):
+            raise HTTPException(400, "Invalid social integration id")
+    if body.schedule_iso:
+        try:
+            datetime.fromisoformat(body.schedule_iso.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(400, "schedule_iso must be an ISO-8601 datetime") from exc
     c = _postiz_cfg()
     if not (c["url"] and c["key"]):
         raise HTTPException(503, "Postiz not configured (POSTIZ_URL / POSTIZ_API_KEY).")
@@ -547,13 +746,16 @@ async def postiz_post(vin: str, body: SocialPost):
                                      headers={"Authorization": c["key"], "Content-Type": "application/json"},
                                      method="POST")
         with urllib.request.urlopen(req, timeout=30) as r:
-            res = json.loads(r.read())
+            raw = r.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("Postiz response exceeds 1 MB")
+        res = json.loads(raw)
     except Exception as e:
         raise HTTPException(502, f"Postiz call failed: {e}")
     _ensure_post_log()
     conn = _db()
-    conn.execute("INSERT INTO post_log (vin, channel, posted_at, meta) VALUES (?,?,?,?)",
-                 (vin.upper(), "postiz", datetime.now().isoformat(), json.dumps(body.channels)))
+    conn.execute("INSERT INTO post_log (vin, channel, posted_at, meta, user_email) VALUES (?,?,?,?,?)",
+                 (vin.upper(), "postiz", datetime.now().isoformat(), json.dumps(body.channels), email))
     conn.commit(); conn.close()
     return {"status": "queued", "caption": caption, "postiz": res}
 
@@ -585,7 +787,7 @@ _DMS_MAPS = {
 }
 
 
-def _consume_dms_csv(text: str, dms: str):
+def _consume_dms_csv(text: str, dms: str, user_email: str):
     mapping = _DMS_MAPS.get(dms)
     if not mapping:
         raise HTTPException(400, f"Unknown DMS '{dms}'. Supported: {list(_DMS_MAPS)}")
@@ -600,38 +802,61 @@ def _consume_dms_csv(text: str, dms: str):
             if canon:
                 row[canon] = v
         if row.get("vin"):
+            if len(rows) >= 5000:
+                raise HTTPException(413, "DMS CSV may contain at most 5,000 vehicle rows")
             rows.append(row)
-    return _import_rows(rows, source=f"dms:{dms}")
+    return _import_rows(rows, source=f"dms:{dms}", user_email=user_email)
 
 
 @router.post("/api/dms/{dms}/import")
-async def dms_import(dms: str, file: UploadFile = File(...)):
-    """Consume a DealerCenter or Frazer inventory CSV export."""
-    raw = await file.read()
+async def dms_import(dms: str, request: Request, file: UploadFile = File(...)):
+    """Consume a DealerCenter or Frazer inventory CSV into this tenant."""
+    from starlette.concurrency import run_in_threadpool
+
+    email = await run_in_threadpool(_actor_email, request)
+    raw = await file.read(10 * 1024 * 1024 + 1)
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(413, "DMS CSV exceeds 10 MB")
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         text = raw.decode("latin-1")
-    return _consume_dms_csv(text, dms.lower())
+    return await run_in_threadpool(_consume_dms_csv, text, dms.lower(), email)
 
 
 @router.post("/api/dms/{dms}/sync-folder")
-async def dms_sync_folder(dms: str, folder: str = Form(...)):
-    """Consume the newest CSV in a watch folder (where the DMS FTP-drops exports).
-    Defense-in-depth: only paths under LOTVUE_DMS_WATCH_ROOT are allowed."""
-    watch_root = Path(os.getenv("LOTVUE_DMS_WATCH_ROOT", str(STORAGE_DIR / "dms_inbox"))).resolve()
+def dms_sync_folder(dms: str, request: Request, folder: str = Form(...)):
+    """Consume the newest CSV in this tenant's configured DMS watch folder."""
+    email = _actor_email(request)
+    base_root = Path(os.getenv("LOTVUE_DMS_WATCH_ROOT", str(STORAGE_DIR / "dms_inbox"))).resolve()
+    if _is_owner(email):
+        watch_root = base_root
+    else:
+        import hashlib
+        watch_root = (base_root / hashlib.sha256(email.encode("utf-8")).hexdigest()[:20]).resolve()
     fdir = Path(folder).resolve()
-    if watch_root not in [fdir, *fdir.parents]:
-        raise HTTPException(403, f"Folder must be under the DMS watch root ({watch_root}). "
-                                 f"Set LOTVUE_DMS_WATCH_ROOT to change it.")
-    if not fdir.exists():
-        raise HTTPException(404, f"Folder not found: {folder}")
-    csvs = sorted(fdir.glob("*.csv"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if watch_root != fdir and watch_root not in fdir.parents:
+        raise HTTPException(403, "Folder must be inside this account's DMS watch folder")
+    if not fdir.exists() or not fdir.is_dir():
+        raise HTTPException(404, "DMS watch folder not found")
+    csvs = []
+    for candidate in fdir.glob("*.csv"):
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if (fdir == resolved.parent or fdir in resolved.parents) and resolved.is_file():
+            csvs.append(resolved)
+    csvs.sort(key=lambda f: f.stat().st_mtime, reverse=True)
     if not csvs:
-        raise HTTPException(404, f"No CSV files in {folder}")
-    text = csvs[0].read_text(encoding="utf-8-sig", errors="replace")
-    result = _consume_dms_csv(text, dms.lower())
-    result["file"] = str(csvs[0])
+        raise HTTPException(404, "No CSV files in the watch folder")
+    with csvs[0].open("rb") as csv_file:
+        raw = csv_file.read(10 * 1024 * 1024 + 1)
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(413, "DMS CSV exceeds 10 MB")
+    text = raw.decode("utf-8-sig", errors="replace")
+    result = _consume_dms_csv(text, dms.lower(), email)
+    result["file"] = csvs[0].name
     return result
 
 
@@ -641,17 +866,24 @@ async def dms_sync_folder(dms: str, folder: str = Form(...)):
 #       existing inventory pipeline. Dark until FTP creds configured.
 # =============================================================================
 def _ftp_cfg():
+    try:
+        port = int(os.getenv("LOTVUE_FTP_PORT", "21"))
+    except ValueError as exc:
+        raise HTTPException(503, "LOTVUE_FTP_PORT must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise HTTPException(503, "LOTVUE_FTP_PORT must be between 1 and 65535")
     return {
-        "host": os.getenv("LOTVUE_FTP_HOST", ""),
-        "port": int(os.getenv("LOTVUE_FTP_PORT", "21")),
-        "user": os.getenv("LOTVUE_FTP_USER", ""),
+        "host": os.getenv("LOTVUE_FTP_HOST", "").strip(),
+        "port": port,
+        "user": os.getenv("LOTVUE_FTP_USER", "").strip(),
         "password": os.getenv("LOTVUE_FTP_PASS", ""),
         "base_dir": os.getenv("LOTVUE_FTP_DIR", "/"),
+        "tls": os.getenv("LOTVUE_FTP_TLS", "1").strip().lower() not in {"0", "false", "no"},
     }
 
 
 @router.get("/api/syndication/push/status")
-async def push_status():
+def push_status():
     c = _ftp_cfg()
     return {"configured": bool(c["host"] and c["user"]),
             "host": c["host"] or None,
@@ -661,9 +893,9 @@ async def push_status():
 
 
 @router.post("/api/syndication/push/{vin}")
-async def push_vehicle_media(vin: str):
-    """Push processed spin frames + a manifest CSV to the configured FTP drop.
-    This is how the media lands in HomeNet/vAuto-class pipelines."""
+def push_vehicle_media(vin: str, request: Request):
+    """Push this authenticated tenant's processed frames to its configured FTP drop."""
+    email = _actor_email(request)
     c = _ftp_cfg()
     if not (c["host"] and c["user"]):
         raise HTTPException(503, "Media push not configured — set LOTVUE_FTP_* env vars "
@@ -671,15 +903,24 @@ async def push_vehicle_media(vin: str):
     vin = vin.upper()
     v = _vehicle(vin)
     fdir = STORAGE_DIR / vin / "spin"
-    frames = sorted(fdir.glob("spin_*.jpg")) if fdir.exists() else []
+    resolved_spin_dir = fdir.resolve()
+    frames = sorted(
+        path for path in fdir.glob("spin_*.jpg")
+        if path.is_file() and re.fullmatch(r"spin_[A-Za-z0-9_.-]{1,120}\.jpg", path.name)
+        and path.resolve().parent == resolved_spin_dir
+    ) if fdir.is_dir() else []
     if not frames:
         raise HTTPException(404, "No processed frames to push — finalize the vehicle first.")
+    public_base = _public_base(require_public=True)
     import ftplib
     pushed = []
     try:
-        with ftplib.FTP() as ftp:
+        ftp_client = ftplib.FTP_TLS if c["tls"] else ftplib.FTP
+        with ftp_client() as ftp:
             ftp.connect(c["host"], c["port"], timeout=30)
             ftp.login(c["user"], c["password"])
+            if c["tls"]:
+                ftp.prot_p()
             if c["base_dir"] and c["base_dir"] != "/":
                 ftp.cwd(c["base_dir"])
             try:
@@ -691,18 +932,22 @@ async def push_vehicle_media(vin: str):
                 with open(f, "rb") as fh:
                     ftp.storbinary(f"STOR {f.name}", fh)
                 pushed.append(f.name)
-            manifest = io.BytesIO(
-                (f"vin,year,make,model,price,mileage,frame_count,viewer_url\n"
-                 f"{vin},{v.get('year','')},{v.get('make','')},{v.get('model','')},"
-                 f"{v.get('price','')},{v.get('mileage','')},{len(frames)},"
-                 f"{_public_base()}/view/{vin}\n").encode())
+            manifest_text = io.StringIO()
+            manifest_writer = csv.writer(manifest_text)
+            manifest_writer.writerow(["vin", "year", "make", "model", "price", "mileage", "frame_count", "viewer_url"])
+            manifest_writer.writerow([_csv_cell(value) for value in (
+                vin, v.get("year", ""), v.get("make", ""), v.get("model", ""),
+                v.get("price", ""), v.get("mileage", ""), len(frames),
+                f"{public_base}/view/{vin}",
+            )])
+            manifest = io.BytesIO(manifest_text.getvalue().encode("utf-8"))
             ftp.storbinary("STOR manifest.csv", manifest)
     except Exception as e:
         raise HTTPException(502, f"FTP push failed after {len(pushed)} files: {e}")
     _ensure_post_log()
     conn = _db()
-    conn.execute("INSERT INTO post_log (vin, channel, posted_at, meta) VALUES (?,?,?,?)",
-                 (vin, "ftp_push", datetime.now().isoformat(), f"{len(pushed)} frames -> {c['host']}"))
+    conn.execute("INSERT INTO post_log (vin, channel, posted_at, meta, user_email) VALUES (?,?,?,?,?)",
+                 (vin, "ftp_push", datetime.now().isoformat(), f"{len(pushed)} frames -> {c['host']}", email))
     conn.commit(); conn.close()
     return {"status": "pushed", "vin": vin, "files": len(pushed) + 1, "host": c["host"]}
 
@@ -712,7 +957,10 @@ async def push_vehicle_media(vin: str):
 #       Local Ollama first (no cost, private), clean template fallback.
 # =============================================================================
 @router.get("/api/vehicle/{vin}/description")
-async def generate_description(vin: str, tone: str = "professional"):
+def generate_description(vin: str, request: Request, tone: str = "professional"):
+    _actor_email(request)
+    check_auth_rate(request, "description", 20)
+    tone = re.sub(r"[^A-Za-z -]", "", tone)[:40].strip() or "professional"
     v = _vehicle(vin)
     title = f"{v.get('year','')} {v.get('make','')} {v.get('model','')} {v.get('trim_level','') or ''}".strip()
     facts = [x for x in [
@@ -733,7 +981,10 @@ async def generate_description(vin: str, tone: str = "professional"):
                                            "prompt": prompt, "stream": False}).encode(),
                           headers={"Content-Type": "application/json"})
         with _ur.urlopen(req, timeout=90) as r:
-            text = json.loads(r.read()).get("response", "").strip()
+            raw = r.read(64 * 1024 + 1)
+        if len(raw) > 64 * 1024:
+            raise ValueError("Local model response exceeds 64 KB")
+        text = json.loads(raw).get("response", "").strip()
         # strip <think> blocks some local models emit
         if "</think>" in text:
             text = text.split("</think>", 1)[1].strip()

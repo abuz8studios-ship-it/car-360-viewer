@@ -533,33 +533,30 @@ async function pollBuild(bar){
   return 'timeout';
 }
 
-// ── finalize (photos -> premium engine: stabilized + AI-densified 360) ──────
+// ── finalize (capture photos -> canonical 360 renderer) ────────────────────
 async function finalize(){
   const msg=document.getElementById('buildMsg');msg.textContent='';msg.classList.remove('ok');
   const btn=document.getElementById('buildBtn');
   btn.disabled=true;
   try{
-    const r=await api('/api/finalize/'+VIN+'?engine=pro',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const r=await api('/api/finalize/'+VIN,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
     if(!r.ok){ throw new Error(await jsonDetail(r)); }
-    const mode=(await r.json()).engine||'classic';
     const bar=document.getElementById('buildProg');
-    if(mode==='pro'){
-      const done = await pollBuild(bar);
-      if(done==='ok'){ document.getElementById('doneTitle').textContent='VIN '+VIN; show('s-done'); return; }
-      msg.textContent = done==='timeout' ? 'Still processing — check the dashboard in a few minutes.' : done;
-    }else{
-      for(let i=0;i<220;i++){
-        await new Promise(res=>setTimeout(res,4000));
-        const s=await (await api('/api/finalize-status/'+VIN)).json();
-        const pct=Math.min(95, Math.round((s.spin_frames||0)/36*100));
-        bar.style.width=(s.ready?100:pct)+'%';
-        if(s.ready){
-          document.getElementById('doneTitle').textContent='VIN '+VIN;
-          show('s-done');return;
-        }
+    let completed=false;
+    for(let i=0;i<360;i++){
+      await new Promise(res=>setTimeout(res,1500));
+      const response=await api('/api/finalize-status/'+VIN);
+      if(!response.ok) throw new Error(await jsonDetail(response));
+      const s=await response.json();
+      const pct=Math.min(98,s.progress||Math.round((s.spin_frames||0)/36*90));
+      bar.style.width=(s.status==='completed'||s.status==='degraded'?100:pct)+'%';
+      if(s.status==='error') throw new Error(s.message||'360 processing failed');
+      if((s.status==='completed'||s.status==='degraded')&&s.ready){
+        document.getElementById('doneTitle').textContent='VIN '+VIN;
+        show('s-done');return;
       }
-      msg.textContent='Still processing — check the dashboard in a minute.';
     }
+    msg.textContent='Still processing — check Dealer Studio in a few minutes.';
   }catch(e){msg.textContent='Build failed: '+e.message;}
   btn.disabled=false;
 }
@@ -616,18 +613,18 @@ def _make_icons():
 
 
 @router.get("/mobile", response_class=HTMLResponse)
-async def mobile_app():
+def mobile_app():
     import json
     return HTML.replace("__ANGLES__", json.dumps(ANGLES))
 
 
 @router.get("/mobile/manifest.json")
-async def mobile_manifest():
+def mobile_manifest():
     return JSONResponse(MANIFEST, media_type="application/manifest+json")
 
 
 @router.get("/mobile/sw.js")
-async def mobile_sw():
+def mobile_sw():
     return Response(SW_JS, media_type="application/javascript")
 
 

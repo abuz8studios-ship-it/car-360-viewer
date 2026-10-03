@@ -36,11 +36,9 @@ from validate_video import _orb_inliers, _resolve_tool
 
 FFMPEG = _resolve_tool("FFMPEG_PATH", "ffmpeg.exe")
 
-# clip_classify.py must run ISOLATED (user-site shadows break transformers)
-ISOLATED_PY = next((p for p in (os.environ.get("LOTVUE_PY_ISOLATED"),
-                                r"E:\Miniconda3\envs\lotvue\python.exe",
-                                sys.executable) if p and Path(p).exists()),
-                   sys.executable)
+# Use an optional isolated interpreter for CLIP; otherwise reuse this runtime.
+_isolated_python = os.getenv("LOTVUE_PY_ISOLATED", "").strip()
+ISOLATED_PY = _isolated_python if _isolated_python and Path(_isolated_python).is_file() else sys.executable
 
 
 def clip_exteriors(files):

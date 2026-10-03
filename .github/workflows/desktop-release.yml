@@ -1,0 +1,151 @@
+name: Desktop releases
+
+on:
+  push:
+    branches:
+      - "arena/01a0ffa3-car-360-viewer"
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lotvue-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify core application
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            requirements-release-constraints.txt
+      - name: Install runtime and test dependencies
+        env:
+          PIP_CONSTRAINT: requirements-release-constraints.txt
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+      - name: Lint Python source
+        run: python -m ruff check app tests scripts
+      - name: Run test suite
+        run: python -m pytest -q
+
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            platform: windows
+            arch: x64
+          - runner: macos-15-intel
+            platform: macos
+            arch: x64
+          - runner: macos-15
+            platform: macos
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-desktop.txt
+            requirements-release-constraints.txt
+      - name: Install portable desktop dependencies
+        env:
+          PIP_CONSTRAINT: requirements-release-constraints.txt
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-desktop.txt
+      - name: Build self-contained application and installer archive
+        env:
+          LOTVUE_BUILD_ID: ${{ github.sha }}
+        run: python scripts/build_desktop.py --platform ${{ matrix.platform }} --output dist/desktop-release
+      - name: Smoke-test Windows installer and frozen runtime
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem dist/desktop-release/LotVue360-windows-x64.zip
+          $extract = Join-Path $env:RUNNER_TEMP 'lotvue-desktop-smoke'
+          $data = Join-Path $env:RUNNER_TEMP 'lotvue-desktop-smoke-data'
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $extract -Force
+          $installer = Join-Path $extract 'LotVue360/Install-LotVue360.ps1'
+          & $installer -NoLaunch
+          $installRoot = Join-Path $env:LOCALAPPDATA 'Programs/LotVue360'
+          if (-not (Test-Path -LiteralPath $installRoot)) { throw 'Windows installer did not create the per-user app directory.' }
+          $env:LOTVUE_DATA_DIR = $data
+          $exe = Join-Path $installRoot 'LotVue360.exe'
+          & $exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Installed Windows app smoke test failed with exit code $LASTEXITCODE" }
+          $uninstaller = Join-Path $env:LOCALAPPDATA 'Programs/LotVue360/Uninstall-LotVue360.ps1'
+          & $uninstaller
+          if (Test-Path -LiteralPath $installRoot) { throw 'Windows app files remain after uninstall.' }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'LotVue360'))) { throw 'Uninstaller unexpectedly removed per-user data.' }
+      - name: Smoke-test macOS installer and frozen runtime
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/lotvue-desktop-smoke"
+          ditto -x -k "dist/desktop-release/LotVue360-macOS-${{ matrix.arch }}.zip" "$RUNNER_TEMP/lotvue-desktop-smoke"
+          PACKAGE="$RUNNER_TEMP/lotvue-desktop-smoke/LotVue360-macOS-${{ matrix.arch }}"
+          bash "$PACKAGE/install-lotvue.sh" --no-open
+          export LOTVUE_DATA_DIR="$RUNNER_TEMP/lotvue-desktop-smoke-data"
+          "$HOME/Applications/LotVue360.app/Contents/MacOS/LotVue360" --self-test
+          test -d "$HOME/Library/Application Support/LotVue360"
+          rm -rf "$HOME/Applications/LotVue360.app"
+          test ! -e "$HOME/Applications/LotVue360.app"
+      - name: Upload verified platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lotvue-desktop-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            dist/desktop-release/*.zip
+            dist/desktop-release/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@v4
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lotvue-desktop-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/*.zip release-assets/*.zip.sha256 \
+            --title "LotVue360 $GITHUB_REF_NAME" \
+            --notes-file .github/RELEASE_NOTES.md

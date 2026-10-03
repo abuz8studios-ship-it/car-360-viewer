@@ -11,6 +11,10 @@
 *secret*
 *credentials*
 app/.env
+*.keystore
+*.jks
+**/keystore.properties
+**/key.properties
 
 # --- Databases & personal data ---
 *.db
@@ -88,4 +92,6 @@ Thumbs.db
 .vscode/
 .idea/
 node_modules/
+.venv/
+venv/
 installer/*.exe

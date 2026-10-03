@@ -1,0 +1,9 @@
+# Optional CPU background-removal Python runtime. This installs code/dependencies,
+# not model weights. The app does not select or download a model until an operator
+# verifies the chosen checkpoint's commercial-use terms, sets LOTVUE_REMBG_MODEL,
+# and explicitly sets LOTVUE_REMBG_LICENSE_ACCEPTED=1 in a private environment.
+-r requirements.txt
+rembg[cpu]>=2.0.60,<3
+
+# CUDA, ComfyUI/WAN, COLMAP, Brush, and model-specific weights remain separate,
+# platform/hardware- and license-dependent installations.

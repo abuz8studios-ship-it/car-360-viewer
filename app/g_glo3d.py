@@ -20,23 +20,22 @@ Everything GLO3D bundles that LotVue was missing, built better + cheaper:
 Wired from main.py:  from g_glo3d import register_glo3d; register_glo3d(app)
 """
 
-import io
-import os
-import json
 import html
+import io
+import json
+import os
+import re
 import sqlite3
 import urllib.request
-from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
+from urllib.parse import urlsplit
 
+from app_paths import DB_PATH, STORAGE_DIR
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
-from pydantic import BaseModel
-
-BASE_DIR = Path(__file__).resolve().parent
-STORAGE_DIR = BASE_DIR / "storage"
-DB_PATH = BASE_DIR / "vehicles.db"
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 router = APIRouter()
 
@@ -64,8 +63,11 @@ def _db():
 
 
 def _vehicle(vin: str):
+    vin = (vin or "").strip().upper()
+    if not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", vin):
+        raise HTTPException(404, "Vehicle not found")
     conn = _db()
-    v = conn.execute("SELECT * FROM vehicles WHERE vin=?", (vin.upper(),)).fetchone()
+    v = conn.execute("SELECT * FROM vehicles WHERE vin=? AND status='active'", (vin,)).fetchone()
     conn.close()
     if not v:
         raise HTTPException(404, "Vehicle not found")
@@ -83,7 +85,9 @@ def _photo_urls(vin, limit=24):
     for sub in ("spin", "exterior", "gallery"):
         d = vdir / sub
         if d.exists():
-            for f in sorted(d.glob("*.jpg"))[:limit - len(urls)]:
+            safe_files = [f for f in sorted(d.glob("*.jpg"))
+                          if f.is_file() and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}\.jpg", f.name)]
+            for f in safe_files[:max(0, limit - len(urls))]:
                 urls.append(f"{base}/storage/{vin.upper()}/{sub}/{f.name}")
         if len(urls) >= limit:
             break
@@ -109,21 +113,53 @@ def _estimate_value(year, body_style, make, mileage):
     return avg, int(avg * 0.9), int(avg * 1.1)
 
 
-def _create_lead(vin, name, email, phone, message, source, extra=None):
-    conn = _db()
-    cur = conn.execute(
-        """INSERT INTO leads (vin, name, email, phone, message, source, created_at)
-           VALUES (?,?,?,?,?,?,?)""",
-        (vin.upper() if vin else "", name, email, phone or "", message or "",
-         source, datetime.now().isoformat()))
-    lead_id = cur.lastrowid
-    conn.commit(); conn.close()
+def _notify_lead(lead: dict) -> None:
     try:
         from a2_extensions import notify_lead
-        notify_lead({"id": lead_id, "vin": vin or "", "name": name, "email": email,
-                     "phone": phone or "", "message": message or "", **(extra or {})})
-    except Exception as e:
-        print(f"[Leadmagnet] notify error: {e}")
+        notify_lead(lead)
+    except Exception as exc:
+        print(f"[Leadmagnet] notify failed: {type(exc).__name__}")
+
+
+def _create_lead(vin, name, email, phone, message, source, extra=None, *, notify=True):
+    vin = (vin or "").strip().upper()
+    if not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", vin):
+        raise HTTPException(400, "A valid 17-character vehicle VIN is required")
+    name = "".join(ch for ch in str(name or "") if ord(ch) >= 32 and ord(ch) != 127).strip()[:120]
+    email = "".join(ch for ch in str(email or "") if ord(ch) >= 32 and ord(ch) != 127).strip().lower()[:254]
+    phone = "".join(ch for ch in str(phone or "") if ord(ch) >= 32 and ord(ch) != 127).strip()[:40]
+    message = "".join(ch for ch in str(message or "") if ord(ch) in (9, 10, 13) or ord(ch) >= 32 and ord(ch) != 127).strip()[:2000]
+    if not name:
+        raise HTTPException(400, "Name is required")
+    if not email and not phone:
+        raise HTTPException(400, "Email or phone is required")
+    if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(400, "Enter a valid email address")
+    source = source if source in {"tradein_tool", "history_request", "video_request", "test_drive"} else "website"
+    conn = _db()
+    vehicle = conn.execute(
+        "SELECT user_email FROM vehicles WHERE vin=? AND status='active'", (vin,)
+    ).fetchone()
+    if not vehicle:
+        conn.close()
+        raise HTTPException(404, "Vehicle not found")
+    tenant_email = str(vehicle["user_email"] or "").strip().lower()
+    dealer = conn.execute(
+        "SELECT id FROM dealers WHERE LOWER(COALESCE(NULLIF(user_email,''),email,''))=? ORDER BY id LIMIT 1",
+        (tenant_email,),
+    ).fetchone() if tenant_email else None
+    dealer_id = int(dealer["id"]) if dealer else 0
+    cur = conn.execute(
+        """INSERT INTO leads (dealer_id, vin, name, email, phone, message, source, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (dealer_id, vin, name, email, phone, message, source, datetime.now().isoformat()))
+    lead_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    lead = {"id": lead_id, "vin": vin, "name": name, "email": email,
+            "phone": phone, "message": message, **(extra or {})}
+    if notify:
+        _notify_lead(lead)
     return lead_id
 
 
@@ -131,19 +167,21 @@ def _create_lead(vin, name, email, phone, message, source, extra=None):
 # LEAD MAGNETS
 # =============================================================================
 class TradeIn(BaseModel):
-    name: str
-    email: str
-    phone: Optional[str] = ""
-    vehicle_of_interest: Optional[str] = ""   # VIN they're shopping
-    year: Optional[str] = ""
-    make: Optional[str] = ""
-    model: Optional[str] = ""
-    mileage: Optional[str] = ""
-    condition: Optional[str] = "good"         # excellent/good/fair/poor
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(max_length=254)
+    phone: Optional[str] = Field(default="", max_length=40)
+    vehicle_of_interest: Optional[str] = Field(default="", max_length=17)
+    year: Optional[str] = Field(default="", max_length=4)
+    make: Optional[str] = Field(default="", max_length=60)
+    model: Optional[str] = Field(default="", max_length=80)
+    mileage: Optional[str] = Field(default="", max_length=12)
+    condition: Optional[str] = Field(default="good", max_length=20)
 
 
 @router.post("/api/leadmagnet/tradein")
-async def tradein_estimate(body: TradeIn):
+def tradein_estimate(body: TradeIn, request: Request):
+    from main import _check_public_lead_rate
+    _check_public_lead_rate(request)
     avg, low, high = _estimate_value(body.year, "", body.make, body.mileage)
     cond_adj = {"excellent": 1.12, "good": 1.0, "fair": 0.85, "poor": 0.68}.get(
         (body.condition or "good").lower(), 1.0)
@@ -151,8 +189,10 @@ async def tradein_estimate(body: TradeIn):
     msg = (f"Trade-in lead: {body.year} {body.make} {body.model}, {body.mileage} mi, "
            f"condition {body.condition}. Est ${low:,}-${high:,}. "
            f"Shopping: {body.vehicle_of_interest}")
-    lead_id = _create_lead(body.vehicle_of_interest, body.name, body.email, body.phone,
-                           msg, "tradein_tool", {"wants_trade": 1})
+    lead_id = None
+    if body.vehicle_of_interest:
+        lead_id = _create_lead(body.vehicle_of_interest, body.name, body.email, body.phone,
+                               msg, "tradein_tool", {"wants_trade": 1})
     return {"status": "ok", "lead_id": lead_id,
             "estimate": {"low": low, "average": avg, "high": high},
             "disclaimer": "Instant estimate based on year, make, mileage and condition. "
@@ -160,7 +200,7 @@ async def tradein_estimate(body: TradeIn):
 
 
 @router.get("/api/leadmagnet/{vin}/price-advisor")
-async def price_advisor(vin: str):
+def price_advisor(vin: str):
     """Public buyer-facing 'priced vs market' badge — honest estimate, labeled."""
     v = _vehicle(vin)
     avg, low, high = _estimate_value(v.get("year"), v.get("body_style"),
@@ -187,14 +227,16 @@ async def price_advisor(vin: str):
 
 
 class HistoryReq(BaseModel):
-    vin: str
-    name: str
-    email: str
-    phone: Optional[str] = ""
+    vin: str = Field(min_length=17, max_length=17)
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(max_length=254)
+    phone: Optional[str] = Field(default="", max_length=40)
 
 
 @router.post("/api/leadmagnet/request-history")
-async def request_history(body: HistoryReq):
+def request_history(body: HistoryReq, request: Request):
+    from main import _check_public_lead_rate
+    _check_public_lead_rate(request)
     lead_id = _create_lead(body.vin, body.name, body.email, body.phone,
                            "Requested vehicle history report (CARFAX/AutoCheck).",
                            "history_request", {"wants_history": 1})
@@ -203,14 +245,16 @@ async def request_history(body: HistoryReq):
 
 
 class VideoReq(BaseModel):
-    vin: str
-    name: str
-    email: str
-    phone: Optional[str] = ""
+    vin: str = Field(min_length=17, max_length=17)
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(max_length=254)
+    phone: Optional[str] = Field(default="", max_length=40)
 
 
 @router.post("/api/leadmagnet/request-video")
-async def request_video(body: VideoReq):
+def request_video(body: VideoReq, request: Request):
+    from main import _check_public_lead_rate
+    _check_public_lead_rate(request)
     lead_id = _create_lead(body.vin, body.name, body.email, body.phone,
                            "Requested a personalized walk-around video.",
                            "video_request", {"wants_video": 1})
@@ -219,33 +263,50 @@ async def request_video(body: VideoReq):
 
 
 @router.get("/api/leadmagnet/test-drive-slots")
-async def test_drive_slots(days: int = 7):
+def test_drive_slots(vin: str, request: Request, days: int = 7):
+    from main import _check_public_lead_rate
+    _check_public_lead_rate(request)
+    vehicle = _vehicle(vin)
     try:
         from ai_studio.lead_engine import get_available_slots
-        slots = get_available_slots(days_ahead=days)
+        slots = get_available_slots(days_ahead=max(1, min(days, 30)),
+                                    user_email=str(vehicle.get("user_email") or ""))
     except Exception:
         slots = []
     return {"status": "ok", "slots": slots[:40], "count": len(slots)}
 
 
 class TestDrive(BaseModel):
-    vin: str
-    name: str
-    email: str
-    phone: Optional[str] = ""
-    slot: str
+    vin: str = Field(min_length=17, max_length=17)
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(max_length=254)
+    phone: Optional[str] = Field(default="", max_length=40)
+    slot: str = Field(min_length=1, max_length=64)
 
 
 @router.post("/api/leadmagnet/book-test-drive")
-async def book_test_drive(body: TestDrive):
+def book_test_drive(body: TestDrive, request: Request):
+    from ai_studio.lead_engine import book_appointment
+    from main import _check_public_lead_rate
+    _check_public_lead_rate(request)
+    vehicle = _vehicle(body.vin)
     lead_id = _create_lead(body.vin, body.name, body.email, body.phone,
                            f"Requested a test drive for {body.slot}.",
-                           "test_drive", {"wants_test_drive": 1, "slot": body.slot})
-    try:
-        from ai_studio.lead_engine import book_appointment
-        book_appointment(lead_id, body.slot, "test_drive")
-    except Exception:
-        pass
+                           "test_drive", {"wants_test_drive": 1, "slot": body.slot}, notify=False)
+    booked = book_appointment(
+        lead_id, body.slot, "test_drive",
+        user_email=str(vehicle.get("user_email") or "").strip().lower(),
+    )
+    if booked.get("error"):
+        conn = _db()
+        conn.execute("DELETE FROM leads WHERE id=? AND vin=?", (lead_id, body.vin.upper()))
+        conn.commit()
+        conn.close()
+        raise HTTPException(409, booked["error"])
+    _notify_lead({"id": lead_id, "vin": body.vin.upper(), "name": body.name,
+                  "email": body.email, "phone": body.phone or "",
+                  "message": f"Requested a test drive for {body.slot}.",
+                  "wants_test_drive": 1})
     return {"status": "ok", "lead_id": lead_id,
             "message": f"Test drive requested for {body.slot}. We'll confirm by email/text."}
 
@@ -253,9 +314,14 @@ async def book_test_drive(body: TestDrive):
 # =============================================================================
 # AI BDC CHATBOT
 # =============================================================================
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=500)
+
+
 class ChatTurn(BaseModel):
-    message: str
-    history: list = []   # [{"role":"user"/"assistant","content":...}]
+    message: str = Field(min_length=1, max_length=500)
+    history: list[ChatMessage] = Field(default_factory=list, max_length=12)
 
 
 def _vehicle_context(v):
@@ -291,35 +357,50 @@ def _rule_based_reply(msg, title, facts):
             f"history, or book a test drive. Want me to have a specialist reach out?")
 
 
+def _ollama_chat_reply(body: ChatTurn, title: str, facts: dict) -> str | None:
+    """Bounded local-model call; never block the ASGI event loop or buffer unlimited output."""
+    facts_str = "; ".join(f"{key}: {value}" for key, value in facts.items())
+    system_prompt = (
+        "You are a friendly, concise sales assistant for a car dealership, chatting on a "
+        f"vehicle's 360 listing page. ONLY use these facts about the car: {facts_str}. "
+        "Never invent specs, history, or pricing you weren't given — if asked something you "
+        "don't know, offer to connect them with the team. Keep replies under 60 words. "
+        "Nudge toward booking a test drive or leaving contact info when natural.")
+    messages = [{"role": "system", "content": system_prompt}]
+    for item in body.history[-6:]:
+        if item.content:
+            messages.append({"role": item.role, "content": item.content})
+    messages.append({"role": "user", "content": body.message})
+    endpoint = os.getenv("LOTVUE_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+    req = urllib.request.Request(
+        f"{endpoint}/api/chat",
+        data=json.dumps({"model": os.getenv("LOTVUE_OLLAMA_MODEL", "qwen3.6-64k:latest"),
+                         "messages": messages, "stream": False}).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as response:
+        raw = response.read(64 * 1024 + 1)
+    if len(raw) > 64 * 1024:
+        return None
+    payload = json.loads(raw)
+    reply = payload.get("message", {}).get("content", "").strip()
+    if "</think>" in reply:
+        reply = reply.split("</think>", 1)[1].strip()
+    letters = sum(char.isalpha() or char.isspace() for char in reply)
+    if 5 <= len(reply) <= 800 and letters / max(1, len(reply)) > 0.7:
+        return reply
+    return None
+
+
 @router.post("/api/chat/{vin}")
-async def chat(vin: str, body: ChatTurn):
-    v = _vehicle(vin)
-    title, facts = _vehicle_context(v)
-    facts_str = "; ".join(f"{k}: {val}" for k, val in facts.items())
-    # Try local Ollama — vehicle-aware, no per-message cost
+async def chat(vin: str, body: ChatTurn, request: Request):
+    from main import _check_public_lead_rate
+    _check_public_lead_rate(request)
+    vehicle = await run_in_threadpool(_vehicle, vin)
+    title, facts = _vehicle_context(vehicle)
+    # Ollama is synchronous and may take several seconds; keep it off the event loop.
     try:
-        sys_prompt = (
-            "You are a friendly, concise sales assistant for a car dealership, chatting on a "
-            f"vehicle's 360 listing page. ONLY use these facts about the car: {facts_str}. "
-            "Never invent specs, history, or pricing you weren't given — if asked something you "
-            "don't know, offer to connect them with the team. Keep replies under 60 words. "
-            "Nudge toward booking a test drive or leaving contact info when natural.")
-        msgs = [{"role": "system", "content": sys_prompt}]
-        for h in (body.history or [])[-6:]:
-            if h.get("role") in ("user", "assistant") and h.get("content"):
-                msgs.append({"role": h["role"], "content": str(h["content"])[:500]})
-        msgs.append({"role": "user", "content": body.message[:500]})
-        req = urllib.request.Request(
-            "http://127.0.0.1:11434/api/chat",
-            data=json.dumps({"model": os.getenv("LOTVUE_OLLAMA_MODEL", "qwen3.6-64k:latest"),
-                             "messages": msgs, "stream": False}).encode(),
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            reply = json.loads(r.read()).get("message", {}).get("content", "").strip()
-        if "</think>" in reply:
-            reply = reply.split("</think>", 1)[1].strip()
-        letters = sum(c.isalpha() or c.isspace() for c in reply)
-        if 5 <= len(reply) <= 800 and (not reply or letters / max(1, len(reply)) > 0.7):
+        reply = await run_in_threadpool(_ollama_chat_reply, body, title, facts)
+        if reply:
             return {"vin": vin.upper(), "reply": reply, "source": "ai"}
     except Exception:
         pass
@@ -330,18 +411,35 @@ async def chat(vin: str, body: ChatTurn):
 # =============================================================================
 # VIRTUAL SHOWROOM MICROSITE
 # =============================================================================
-def _active_inventory(dealer=None, limit=200):
+def _active_inventory(dealer: str, limit: int = 200):
+    dealer_key = (dealer or "").strip()
+    if not dealer_key or len(dealer_key) > 120:
+        raise HTTPException(404, "Showroom not found")
     conn = _db()
+    dealer_row = conn.execute(
+        "SELECT user_email, email FROM dealers WHERE LOWER(name)=LOWER(?) LIMIT 1", (dealer_key,)
+    ).fetchone()
+    if not dealer_row:
+        conn.close()
+        raise HTTPException(404, "Showroom not found")
+    tenant_email = str(dealer_row["user_email"] or dealer_row["email"] or "").strip().lower()
+    if not tenant_email:
+        conn.close()
+        return []
     rows = conn.execute(
-        "SELECT * FROM vehicles WHERE (status IS NULL OR status != 'archived') "
-        "ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        "SELECT vin, year, make, model, trim_level, price, mileage, color "
+        "FROM vehicles WHERE status='active' AND LOWER(COALESCE(user_email,''))=? "
+        "ORDER BY created_at DESC LIMIT ?", (tenant_email, max(1, min(int(limit), 200)))
+    ).fetchall()
     conn.close()
     out = []
     for v in rows:
-        vin = v["vin"]
+        vin = str(v["vin"] or "").strip().upper()
+        if not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", vin):
+            continue
         photos = _photo_urls(vin, limit=1)
         if not photos:
-            continue  # only show vehicles with media
+            continue  # only show vehicles with public media
         out.append({
             "vin": vin,
             "title": f"{v['year']} {v['make']} {v['model']}".strip() or vin,
@@ -353,19 +451,44 @@ def _active_inventory(dealer=None, limit=200):
 
 
 @router.get("/api/showroom/{dealer}/inventory")
-async def showroom_inventory(dealer: str):
+def showroom_inventory(dealer: str):
     return {"dealer": dealer, "inventory": _active_inventory(dealer)}
 
 
 @router.get("/showroom/{dealer}", response_class=HTMLResponse)
-async def showroom(dealer: str, request: Request):
+def showroom(dealer: str, request: Request):
+    dealer = (dealer or "").strip()
+    if not dealer or len(dealer) > 120 or any(ord(ch) < 32 for ch in dealer):
+        raise HTTPException(404, "Showroom not found")
     conn = _db()
-    drow = conn.execute("SELECT * FROM dealers WHERE name=?", (dealer,)).fetchone()
+    drow = conn.execute("SELECT * FROM dealers WHERE LOWER(name)=LOWER(?)", (dealer,)).fetchone()
     conn.close()
-    dname = (drow["display_name"] or drow["name"]) if drow else dealer.replace("-", " ").title()
-    logo = (drow["logo_url"] if drow else "") or ""
-    brand = (drow["brand_color"] if drow else "") or PRIMARY
-    phone = (drow["phone"] if drow else "") or ""
+    if not drow:
+        raise HTTPException(404, "Showroom not found")
+    dname = str(drow["display_name"] or drow["name"] or "")[:120]
+    logo = str(drow["logo_url"] or "")[:2048]
+    brand = str(drow["brand_color"] or PRIMARY)
+    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", brand):
+        brand = PRIMARY
+    phone = str(drow["phone"] or "")[:40]
+    if logo:
+        try:
+            parsed_logo = urlsplit(logo)
+            port = parsed_logo.port
+            if parsed_logo.scheme:
+                valid_logo = (parsed_logo.scheme.lower() == "https" and bool(parsed_logo.hostname)
+                              and not parsed_logo.username and not parsed_logo.password
+                              and port in {None, 443})
+            else:
+                path = parsed_logo.path
+                valid_logo = (not parsed_logo.netloc and not parsed_logo.query and not parsed_logo.fragment
+                              and ".." not in path.split("/") and chr(92) not in path
+                              and path.startswith("/storage/_brand/")
+                              and re.fullmatch(r"/storage/_brand/[A-Za-z0-9_./-]+", path))
+            if not valid_logo:
+                logo = ""
+        except ValueError:
+            logo = ""
     inv = _active_inventory(dealer)
     base = _public_base()
     cards = "\n".join(f"""
@@ -429,12 +552,12 @@ c.style.display=c.querySelector('.ctitle').textContent.toLowerCase().includes(q)
 # WINDOW STICKER + FTC BUYERS GUIDE (dealer paperwork — gated)
 # =============================================================================
 @router.get("/api/vehicle/{vin}/window-sticker.pdf")
-async def window_sticker(vin: str):
+def window_sticker(vin: str):
+    import qrcode
+    from reportlab.lib import colors
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.units import inch
-    from reportlab.lib import colors
     from reportlab.pdfgen import canvas as pdfcanvas
-    import qrcode
 
     v = _vehicle(vin)
     vin = vin.upper()
@@ -481,10 +604,9 @@ async def window_sticker(vin: str):
 
 
 @router.get("/api/vehicle/{vin}/buyers-guide.pdf")
-async def buyers_guide(vin: str, warranty: str = "as_is"):
+def buyers_guide(vin: str, warranty: str = "as_is"):
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.units import inch
-    from reportlab.lib import colors
     from reportlab.pdfgen import canvas as pdfcanvas
 
     v = _vehicle(vin); vin = vin.upper()

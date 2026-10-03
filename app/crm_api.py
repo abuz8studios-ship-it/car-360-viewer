@@ -4,17 +4,29 @@ One pane: lead inbox w/ stages, vehicle-linked context, appointments,
 follow-ups, AI-BDC thread hand-off. Reads the live vehicles.db / lotvue.db.
 Auth: NOT in auth_gate public lists -> dealer sign-in required (correct).
 """
+import os
 import sqlite3, json
-from pathlib import Path
 from datetime import datetime
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
-BASE = Path(__file__).parent
+from app_paths import DB_PATH
+
 STAGES = ["new", "contacted", "appointment", "negotiating", "sold", "lost"]
 
-def _db(name="vehicles.db"):
-    c = sqlite3.connect(BASE / name)
+async def _read_limited_body(request: Request, limit_bytes: int) -> bytes:
+    chunks = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit_bytes:
+            raise HTTPException(status_code=413, detail="Request body exceeds the size limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+def _db():
+    c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
     return c
 
@@ -24,69 +36,187 @@ def _rows(c, q, args=()):
     except sqlite3.OperationalError:
         return []
 
+def _actor_email(request: Request) -> str:
+    token = request.headers.get("authorization", "")
+    token = token[7:].strip() if token.lower().startswith("bearer ") else request.cookies.get("lotvue_token", "")
+    from a2_extensions import JWT_ALG, _jwt_secret, jwt, JWTError
+    try:
+        payload = jwt.decode(token, _jwt_secret(), algorithms=[JWT_ALG])
+    except JWTError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(401, "Sign in required") from exc
+    email = str(payload.get("sub", "")).strip().lower()
+    if payload.get("type") != "access" or not email:
+        from fastapi import HTTPException
+        raise HTTPException(401, "Sign in required")
+    conn = _db()
+    exists = conn.execute("SELECT 1 FROM users WHERE LOWER(email)=?", (email,)).fetchone()
+    conn.close()
+    if not exists:
+        from fastapi import HTTPException
+        raise HTTPException(401, "User no longer exists")
+    return email
+
+
+def _scope(email: str, alias: str = "l") -> tuple[str, tuple]:
+    owner_email = os.environ.get("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    if owner_email and email == owner_email:
+        return "1=1", ()
+    return (
+        f"EXISTS (SELECT 1 FROM vehicles v WHERE v.vin={alias}.vin "
+        "AND LOWER(v.user_email)=?)",
+        (email,),
+    )
+
+
+def _owned_lead(conn, email: str, lead_id: int):
+    from fastapi import HTTPException
+    clause, args = _scope(email, "l")
+    lead = conn.execute(
+        f"SELECT l.* FROM leads l WHERE l.id=? AND {clause}", (lead_id, *args)
+    ).fetchone()
+    if not lead:
+        raise HTTPException(404, "Lead not found")
+    return lead
+
+
+def _update_lead_stage(request: Request, lead_id: int, stage: str) -> None:
+    email = _actor_email(request)
+    conn = _db()
+    try:
+        _owned_lead(conn, email, lead_id)
+        conn.execute("UPDATE leads SET status=? WHERE id=?", (stage, lead_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _create_appointment(request: Request, body: dict):
+    from ai_studio.lead_engine import book_appointment
+
+    email = _actor_email(request)
+    lead_id = int(body["lead_id"])
+    conn = _db()
+    try:
+        _owned_lead(conn, email, lead_id)
+    finally:
+        conn.close()
+    return book_appointment(
+        lead_id,
+        str(body.get("scheduled_at", ""))[:64],
+        str(body.get("type", "test_drive")),
+        str(body.get("notes", ""))[:500],
+        user_email=email,
+    )
+
+
 def register_crm(app):
     @app.get("/api/crm/summary")
-    async def crm_summary():
-        v, l = _db(), _db("lotvue.db")
-        out = {
-            "vehicles": _rows(v, "select count(*) n, sum(case when status='live' then 1 else 0 end) live from vehicles")[0],
-            "leads_total": (_rows(v, "select count(*) n from leads") or [{"n": 0}])[0]["n"],
-            "leads_new": (_rows(v, "select count(*) n from leads where coalesce(status,'new')='new'") or [{"n": 0}])[0]["n"],
-            "by_stage": {r["s"]: r["n"] for r in _rows(v, "select coalesce(status,'new') s, count(*) n from leads group by 1")},
-            "appointments_upcoming": (_rows(l, "select count(*) n from appointments where scheduled_at >= datetime('now')") or [{"n": 0}])[0]["n"],
-            "followups_pending": (_rows(l, "select count(*) n from follow_ups where status='pending'") or [{"n": 0}])[0]["n"],
+    def crm_summary(request: Request):
+        email = _actor_email(request)
+        clause, args = _scope(email, "l")
+        v = _db()
+        try:
+            vehicles = _rows(v, "SELECT COUNT(*) n, "
+                "SUM(CASE WHEN workflow_status='published' THEN 1 ELSE 0 END) live "
+                "FROM vehicles WHERE LOWER(user_email)=?", (email,))
+            if os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower() == email:
+                vehicles = _rows(v, "SELECT COUNT(*) n, "
+                    "SUM(CASE WHEN workflow_status='published' THEN 1 ELSE 0 END) live FROM vehicles")
+            leads_total = (_rows(v, f"SELECT COUNT(*) n FROM leads l WHERE {clause}", args) or [{"n": 0}])[0]["n"]
+            leads_new = (_rows(v, f"SELECT COUNT(*) n FROM leads l WHERE {clause} "
+                "AND COALESCE(l.status,'new')='new'", args) or [{"n": 0}])[0]["n"]
+            by_stage = {r["s"]: r["n"] for r in _rows(v,
+                f"SELECT COALESCE(l.status,'new') s, COUNT(*) n FROM leads l WHERE {clause} GROUP BY 1", args)}
+            appointments = (_rows(v,
+                "SELECT COUNT(*) n FROM appointments a JOIN leads l ON l.id=a.lead_id "
+                f"WHERE a.scheduled_at >= datetime('now') AND {clause}", args) or [{"n": 0}])[0]["n"]
+            followups = (_rows(v,
+                "SELECT COUNT(*) n FROM follow_ups f JOIN leads l ON l.id=f.lead_id "
+                f"WHERE f.status='pending' AND {clause}", args) or [{"n": 0}])[0]["n"]
+        finally:
+            v.close()
+        return {
+            "vehicles": (vehicles or [{"n": 0, "live": 0}])[0],
+            "leads_total": leads_total,
+            "leads_new": leads_new,
+            "by_stage": by_stage,
+            "appointments_upcoming": appointments,
+            "followups_pending": followups,
         }
-        v.close(); l.close()
-        return out
 
     @app.get("/api/crm/leads")
-    async def crm_leads(stage: str = "", limit: int = 100):
+    def crm_leads(request: Request, stage: str = "", limit: int = 100):
+        if stage and stage not in STAGES:
+            return JSONResponse({"error": "Invalid stage"}, status_code=400)
+        limit = max(1, min(limit, 200))
+        email = _actor_email(request)
+        clause, scope_args = _scope(email, "l")
         v = _db()
-        q = ("select l.*, ve.year, ve.make, ve.model, ve.price from leads l "
-             "left join vehicles ve on ve.vin = l.vin ")
-        args = ()
+        q = ("SELECT l.*, ve.year, ve.make, ve.model, ve.price FROM leads l "
+             "LEFT JOIN vehicles ve ON ve.vin=l.vin WHERE " + clause)
+        args = list(scope_args)
         if stage:
-            q += "where coalesce(l.status,'new') = ? "
-            args = (stage,)
-        q += "order by l.created_at desc limit ?"
-        rows = _rows(v, q, args + (limit,))
+            q += " AND COALESCE(l.status,'new')=?"
+            args.append(stage)
+        q += " ORDER BY l.created_at DESC LIMIT ?"
+        args.append(limit)
+        rows = _rows(v, q, tuple(args))
         v.close()
         return {"stages": STAGES, "leads": rows}
 
     @app.post("/api/crm/leads/{lead_id}/stage")
     async def crm_lead_stage(lead_id: int, request: Request):
-        body = await request.json()
-        stage = body.get("stage", "")
+        if lead_id <= 0:
+            return JSONResponse({"error": "Invalid lead id"}, status_code=400)
+        raw = await _read_limited_body(request, 2048)
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        stage = body.get("stage", "") if isinstance(body, dict) else ""
         if stage not in STAGES:
             return JSONResponse({"error": f"stage must be one of {STAGES}"}, status_code=400)
-        v = _db()
-        v.execute("update leads set status=? where id=?", (stage, lead_id))
-        v.commit(); v.close()
+        await run_in_threadpool(_update_lead_stage, request, lead_id, stage)
         return {"ok": True, "lead_id": lead_id, "stage": stage}
 
     @app.get("/api/crm/appointments")
-    async def crm_appointments():
-        l = _db("lotvue.db")
-        rows = _rows(l, "select * from appointments order by scheduled_at asc limit 200")
-        l.close()
+    def crm_appointments(request: Request):
+        email = _actor_email(request)
+        clause, args = _scope(email, "l")
+        conn = _db()
+        rows = _rows(conn,
+            "SELECT a.* FROM appointments a JOIN leads l ON l.id=a.lead_id "
+            f"WHERE {clause} ORDER BY a.scheduled_at ASC LIMIT 200", args)
+        conn.close()
         return {"appointments": rows}
 
     @app.post("/api/crm/appointments")
     async def crm_appointment_create(request: Request):
-        b = await request.json()
-        l = _db("lotvue.db")
-        l.execute("insert into appointments (lead_id, vin, appointment_type, scheduled_at, status, notes, created_at) "
-                  "values (?,?,?,?,?,?,datetime('now'))",
-                  (b.get("lead_id"), b.get("vin", ""), b.get("type", "test_drive"),
-                   b.get("scheduled_at", ""), "scheduled", b.get("notes", "")))
-        l.commit(); l.close()
-        return {"ok": True}
+        raw = await _read_limited_body(request, 4096)
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "Expected a JSON object"}, status_code=400)
+        try:
+            lead_id = int(body.get("lead_id", 0))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "Invalid lead_id"}, status_code=400)
+        if lead_id <= 0:
+            return JSONResponse({"error": "Invalid lead_id"}, status_code=400)
+        body["lead_id"] = lead_id
+        result = await run_in_threadpool(_create_appointment, request, body)
+        if "error" in result:
+            return JSONResponse({"error": result["error"]}, status_code=400)
+        return {"ok": True, "appointment": result}
 
     @app.get("/crm", response_class=HTMLResponse)
-    async def crm_page():
+    def crm_page():
         return CRM_HTML
 
-    print("[CRM] registered: /crm center + /api/crm/{summary,leads,appointments} (dealer-gated)")
+    print("[CRM] registered: tenant-scoped /crm center + lead/appointment APIs")
 
 
 CRM_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -112,6 +242,7 @@ CRM_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <div class="board" id="board"></div>
 <script>
 const STAGES=["new","contacted","appointment","negotiating","sold","lost"];
+const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
 async function load(){
  const s=await (await fetch('/api/crm/summary')).json();
  document.getElementById('stats').innerHTML=
@@ -129,10 +260,10 @@ async function load(){
    <h3>${st} (${(byStage[st]||[]).length})</h3>` +
    (byStage[st]||[]).map(l=>
     `<div class="card" draggable="true" ondragstart="event.dataTransfer.setData('id',${l.id})">
-      <b>${(l.name||'Anonymous')}</b>
-      <i>${[l.year,l.make,l.model].filter(Boolean).join(' ')||l.vin||''}</i><br>
-      <i>${(l.phone||l.email||'').slice(0,26)}</i><br>
-      ${l.vin?`<a href="/vdp/${l.vin}" target="_blank">VDP ↗</a> `:''}
+      <b>${esc(l.name||'Anonymous')}</b>
+      <i>${esc([l.year,l.make,l.model].filter(Boolean).join(' ')||l.vin||'')}</i><br>
+      <i>${esc((l.phone||l.email||'').slice(0,26))}</i><br>
+      ${l.vin?`<a href="/vdp/${esc(encodeURIComponent(l.vin))}" target="_blank" rel="noopener">VDP ↗</a> `:''}
       ${l.wants_test_drive?'🚗':''}${l.wants_video?'🎬':''}
      </div>`).join('') + `</div>`).join('');
 }

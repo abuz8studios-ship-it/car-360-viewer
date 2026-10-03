@@ -24,7 +24,10 @@ import time
 import argparse
 import subprocess
 import tempfile
+import shutil
 from pathlib import Path
+
+from app_paths import BASE_DIR, STORAGE_DIR, configured_path
 
 # Fix Windows CP1252 stdout encoding issues
 if sys.platform == 'win32':
@@ -35,32 +38,34 @@ if sys.platform == 'win32':
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
-STORAGE_DIR      = BASE_DIR / "storage"
-FFMPEG           = os.environ.get("FFMPEG_PATH", str(BASE_DIR.parents[1] / "AI" / "ffmpeg" / "ffmpeg.exe"))
-FFPROBE          = os.environ.get("FFPROBE_PATH", str(BASE_DIR.parents[1] / "AI" / "ffmpeg" / "ffprobe.exe"))
+FFMPEG = os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg") or "ffmpeg"
+FFPROBE = os.environ.get("FFPROBE_PATH") or shutil.which("ffprobe") or "ffprobe"
 
-# WAN 2.2 I2V model files
-WAN_HIGH_NOISE   = r"E:\ABU\ComfyUI\models\diffusion_models\wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
-WAN_LOW_NOISE    = r"E:\ABU\ComfyUI\models\diffusion_models\wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
-WAN_VAE          = r"E:\ABU\ComfyUI\models\vae\wan2.2_vae.safetensors"
-UMT5_ENCODER     = r"E:\ABU\ComfyUI\models\text_encoders\umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-UMT5_TOKENIZER   = r"E:\ABU\ComfyUI\models\text_encoders\umt5-xxl"   # folder with spiece.model
-CLIP_VISION      = r"E:\ABU\ComfyUI\models\clip_vision\clip_vision_h.safetensors"
+# WAN model files can live in an external ComfyUI installation; all locations
+# are environment-configurable and portable across operating systems.
+COMFYUI_ROOT = str(configured_path("COMFYUI_ROOT", BASE_DIR / "ComfyUI"))
+_COMFY_MODELS = configured_path("COMFYUI_MODELS", Path(COMFYUI_ROOT) / "models")
+WAN_HIGH_NOISE = os.getenv("WAN_HIGH_NOISE_PATH") or str(_COMFY_MODELS / "diffusion_models" / "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors")
+WAN_LOW_NOISE = os.getenv("WAN_LOW_NOISE_PATH") or str(_COMFY_MODELS / "diffusion_models" / "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors")
+WAN_VAE = os.getenv("WAN_VAE_PATH") or str(_COMFY_MODELS / "vae" / "wan2.2_vae.safetensors")
+UMT5_ENCODER = os.getenv("WAN_TEXT_ENCODER_PATH") or str(_COMFY_MODELS / "text_encoders" / "umt5_xxl_fp8_e4m3fn_scaled.safetensors")
+UMT5_TOKENIZER = os.getenv("WAN_TOKENIZER_PATH") or str(_COMFY_MODELS / "text_encoders" / "umt5-xxl")
+CLIP_VISION = os.getenv("WAN_CLIP_VISION_PATH") or str(_COMFY_MODELS / "clip_vision" / "clip_vision_h.safetensors")
 
-# Kokoro TTS
+# Kokoro TTS models may be kept outside the repository; configure an explicit
+# model directory or individual files without baking in developer-machine paths.
+_MODELS_DIR = configured_path("LOTVUE_MODELS_DIR", BASE_DIR / "models")
 KOKORO_MODEL_CANDIDATES = [
-    r"E:\ABU\MODELS\Kokoro\kokoro-v1_0.pth",
-    r"E:\ABU\MODELS\TTS\kokoro\kokoro-v1_0.pth",
-    r"E:\ABU\AvatarStack\Kokoro\models\kokoro-v1_0.pth",
+    os.getenv("KOKORO_MODEL_PATH", ""),
+    str(_MODELS_DIR / "kokoro-v1_0.pth"),
 ]
 KOKORO_VOICES_CANDIDATES = [
-    r"E:\ABU\MODELS\Kokoro\voices.bin",
-    r"E:\ABU\MODELS\TTS\kokoro\voices\voices.bin",
+    os.getenv("KOKORO_VOICES_PATH", ""),
+    str(_MODELS_DIR / "voices.bin"),
 ]
 KOKORO_ONNX_CANDIDATES = [
-    r"E:\ABU\MODELS\Kokoro\kokoro-v1_0.onnx",
-    r"E:\ABU\MODELS\TTS\kokoro\kokoro-v1_0.onnx",
+    os.getenv("KOKORO_ONNX_PATH", ""),
+    str(_MODELS_DIR / "kokoro-v1_0.onnx"),
 ]
 
 
@@ -75,34 +80,35 @@ KOKORO_MODEL = _first_existing_path(KOKORO_MODEL_CANDIDATES)
 KOKORO_VOICES = _first_existing_path(KOKORO_VOICES_CANDIDATES)
 KOKORO_ONNX = _first_existing_path(KOKORO_ONNX_CANDIDATES)
 
-# ComfyUI Python (has all required libs: torch, comfy, etc.)
-COMFYUI_ROOT     = r"E:\ABU\ComfyUI"
+# ComfyUI runtime paths are configured above through COMFYUI_ROOT.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STATUS WRITER
 # ─────────────────────────────────────────────────────────────────────────────
 _STATUS_FILE = None
 
+def _write_status(data: dict):
+    if not _STATUS_FILE:
+        return
+    temp_path = f"{_STATUS_FILE}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(temp_path, _STATUS_FILE)
+
 def set_status(step: str, progress: int, extra: dict = None):
-    if _STATUS_FILE:
-        data = {"status": "running", "step": step, "progress": progress, "vin": _VIN}
-        if extra:
-            data.update(extra)
-        with open(_STATUS_FILE, "w") as f:
-            json.dump(data, f)
+    data = {"status": "running", "step": step, "progress": progress, "vin": _VIN}
+    if extra:
+        data.update(extra)
+    _write_status(data)
     print(f"[Commercial] [{progress}%] {step}")
     sys.stdout.flush()
 
 def set_done(url: str):
-    if _STATUS_FILE:
-        with open(_STATUS_FILE, "w") as f:
-            json.dump({"status": "done", "step": "complete", "progress": 100, "vin": _VIN, "url": url}, f)
+    _write_status({"status": "done", "step": "complete", "progress": 100, "vin": _VIN, "url": url})
     print(f"[Commercial] DONE -> {url}")
 
 def set_error(msg: str):
-    if _STATUS_FILE:
-        with open(_STATUS_FILE, "w") as f:
-            json.dump({"status": "error", "step": "error", "progress": 0, "vin": _VIN, "error": msg}, f)
+    _write_status({"status": "error", "step": "error", "progress": 0, "vin": _VIN, "error": msg})
     print(f"[Commercial] ERROR: {msg}", file=sys.stderr)
 
 _VIN = "UNKNOWN"
@@ -588,7 +594,7 @@ def _generate_silent_audio(output_wav: str, duration: float = 10.0) -> bool:
 
 def assemble_commercial(video_path: str, audio_path: str, output_path: str,
                          year: str, make: str, model: str, trim: str,
-                         price: str, dealer: str) -> bool:
+                         price: str, dealer: str, style: str = "cinematic") -> bool:
     """
     Assemble final commercial MP4:
     - Video (WAN or slideshow)
@@ -621,9 +627,23 @@ def assemble_commercial(video_path: str, audio_path: str, output_path: str,
 
     dealer_text = dealer or "Available Now"
 
-    # Font path — try Windows fonts
-    font_path = r"C\:/Windows/Fonts/arialbd.ttf"
-    font_path_regular = r"C\:/Windows/Fonts/arial.ttf"
+    # Prefer configured fonts, then common Linux/macOS/Windows system fonts.
+    font_candidates = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+    )
+    regular_candidates = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    )
+    font_path = os.getenv("FFMPEG_FONT_BOLD") or next((p for p in font_candidates if Path(p).is_file()), "")
+    font_path_regular = os.getenv("FFMPEG_FONT_REGULAR") or next((p for p in regular_candidates if Path(p).is_file()), "")
+    bold_font_arg = f"fontfile='{_escape_ffmpeg(font_path)}':" if font_path else ""
+    regular_font_arg = f"fontfile='{_escape_ffmpeg(font_path_regular)}':" if font_path_regular else ""
 
     # Build drawtext filter chain
     # Line 1: Vehicle name (large, white, bottom-left, fade in at 0.5s)
@@ -640,7 +660,7 @@ def assemble_commercial(video_path: str, audio_path: str, output_path: str,
     # "...CONTINENTAL GT COU" cut off, 2026-07-06)
     title_fs = min(36, max(20, int(1100 / max(1, len(title_line1)))))
     drawtext_filters.append(
-        f"drawtext=fontfile='{font_path}':"
+        f"drawtext={bold_font_arg}"
         f"text='{_escape_ffmpeg(title_line1)}':"
         f"fontsize={title_fs}:fontcolor=white:x=40:y=h-120:"
         f"shadowcolor=black:shadowx=2:shadowy=2:"
@@ -650,16 +670,16 @@ def assemble_commercial(video_path: str, audio_path: str, output_path: str,
     # Price
     if price_text:
         drawtext_filters.append(
-            f"drawtext=fontfile='{font_path}':"
+            f"drawtext={bold_font_arg}"
             f"text='{_escape_ffmpeg(price_text)}':"
-            f"fontsize=28:fontcolor=#FFD700:x=40:y=h-78:"
+            f"fontsize=28:fontcolor={'#E7C36A' if style == 'showroom' else '#FFD700'}:x=40:y=h-78:"
             f"shadowcolor=black:shadowx=2:shadowy=2:"
             f"enable='between(t,{fade_in_end},{audio_duration})'"
         )
 
     # Dealer name
     drawtext_filters.append(
-        f"drawtext=fontfile='{font_path_regular}':"
+        f"drawtext={regular_font_arg}"
         f"text='{_escape_ffmpeg(dealer_text)}':"
         f"fontsize=20:fontcolor=white@0.85:x=40:y=h-44:"
         f"shadowcolor=black:shadowx=1:shadowy=1:"
@@ -668,12 +688,17 @@ def assemble_commercial(video_path: str, audio_path: str, output_path: str,
 
     # LotVue360 watermark (top-right, small)
     drawtext_filters.append(
-        f"drawtext=fontfile='{font_path_regular}':"
+        f"drawtext={regular_font_arg}"
         f"text='LotVue360':"
         f"fontsize=16:fontcolor=white@0.6:x=w-120:y=20:"
         f"enable='gte(t,0)'"
     )
 
+    scale_filter = (
+        "scale=480:720:force_original_aspect_ratio=increase,crop=480:720"
+        if style == "social" else
+        "scale=720:480:force_original_aspect_ratio=decrease,pad=720:480:(ow-iw)/2:(oh-ih)/2"
+    )
     vf_parts = [
         # Loop video to cover audio duration
         f"loop={loops_needed}:size=32767:start=0",
@@ -682,8 +707,8 @@ def assemble_commercial(video_path: str, audio_path: str, output_path: str,
         # Fade in/out
         f"fade=t=in:st=0:d={fade_in_end}",
         f"fade=t=out:st={fade_out_start}:d=0.5",
-        # Scale to 720x480
-        "scale=720:480:flags=lanczos",
+        # Keep source aspect ratio; social style uses portrait framing.
+        scale_filter,
     ] + drawtext_filters
 
     vf_string = ",".join(vf_parts)
@@ -753,16 +778,13 @@ def _get_duration(path: str) -> float:
 
 
 def _escape_ffmpeg(text: str) -> str:
-    """Escape special characters for FFmpeg drawtext filter."""
+    """Escape drawtext filter delimiters and discard control characters."""
     if not text:
         return ""
-    # Escape: ' : \ [ ] , ; = ( )
-    text = str(text)
+    text = "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in str(text))
     text = text.replace("\\", "\\\\")
-    text = text.replace("'", "\\'")
-    text = text.replace(":", "\\:")
-    text = text.replace("[", "\\[")
-    text = text.replace("]", "\\]")
+    for char in ("'", ":", ",", ";", "=", "[", "]"):
+        text = text.replace(char, "\\" + char)
     return text
 
 
@@ -825,11 +847,19 @@ def run_pipeline(args):
     final_mp4 = str(commercial_dir / "commercial.mp4")
 
     # ── Step 1: Build voiceover script ────────────────────────────────────
-    script = build_voiceover_script(
+    requested_script = str(getattr(args, "script", "") or "").strip()
+    if len(requested_script) > 600:
+        set_error("Script exceeds the 600 character limit")
+        return False
+    script = requested_script or build_voiceover_script(
         year=args.year, make=args.make, model=args.model, trim=args.trim,
         engine=args.engine, transmission=args.transmission,
         price=args.price, dealer=args.dealer
     )
+    style = getattr(args, "style", "cinematic")
+    if style not in {"cinematic", "social", "showroom"}:
+        set_error("Unsupported commercial style")
+        return False
     print(f"[Pipeline] Script: {script}")
 
     # ── Step 2: Generate video ─────────────────────────────────────────────
@@ -878,7 +908,7 @@ def run_pipeline(args):
         audio_path=voiceover_wav,
         output_path=final_mp4,
         year=args.year, make=args.make, model=args.model, trim=args.trim,
-        price=args.price, dealer=args.dealer
+        price=args.price, dealer=args.dealer, style=style
     )
 
     if not assembly_ok or not os.path.exists(final_mp4):
@@ -909,6 +939,9 @@ if __name__ == "__main__":
     parser.add_argument("--transmission", default="",     help="Transmission type")
     parser.add_argument("--price",        default="",     help="Vehicle price")
     parser.add_argument("--dealer",       default="",     help="Dealer name")
+    parser.add_argument("--script",       default="",     help="Optional voiceover script (max 600 characters)")
+    parser.add_argument("--style",        default="cinematic", choices=["cinematic", "social", "showroom"],
+                        help="Commercial layout style")
     parser.add_argument("--mode",         default="real", choices=["real", "ai"],
                         help="real = actual vehicle photos (default, honest); "
                              "ai = WAN 2.2 generative concept video (re-imagines the car)")

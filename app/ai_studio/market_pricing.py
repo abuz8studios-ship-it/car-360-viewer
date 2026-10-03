@@ -4,10 +4,6 @@ Estimates market value based on vehicle specs.
 Uses NHTSA data + statistical pricing model.
 Future: web scraping of marketplace listings for real comps.
 """
-import json
-import urllib.request
-from typing import Optional
-
 # Base price estimates by body class (rough market averages for used vehicles)
 BASE_PRICES = {
     "sedan": 18000,
@@ -93,13 +89,13 @@ def estimate_market_price(vehicle_info: dict) -> dict:
     mileage_str = str(vehicle_info.get("mileage", "0") or "0").replace(",", "").strip()
     try:
         mileage_val = int(float(mileage_str))
-    except:
+    except (ValueError, TypeError, OverflowError):
         mileage_val = 0
 
     asking_price_str = str(vehicle_info.get("price", "0") or "0").replace(",", "").replace("$", "").strip()
     try:
         asking_price = float(asking_price_str)
-    except:
+    except (ValueError, TypeError, OverflowError):
         asking_price = 0
 
     # Determine body class

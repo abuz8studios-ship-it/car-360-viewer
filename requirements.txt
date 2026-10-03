@@ -1,0 +1,15 @@
+# LotVue360 API/runtime dependencies (Python 3.11+).
+# Optional CUDA/AI toolchains are intentionally kept out of the base install;
+# see requirements-ai.txt before enabling rembg/COLMAP/ComfyUI features.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+python-multipart>=0.0.9,<1
+Pillow>=10.2,<13
+pillow-heif>=0.16,<2
+numpy>=1.26,<3
+opencv-python-headless>=4.9,<5
+python-jose[cryptography]>=3.3,<4
+stripe>=10,<14
+requests>=2.31,<3
+qrcode[pil]>=7.4,<9
+reportlab>=4,<5
