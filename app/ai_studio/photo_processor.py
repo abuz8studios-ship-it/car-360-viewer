@@ -4,7 +4,8 @@ The pipeline applies a background cut-out when rembg is installed, then a
 packaged-scene composite, enhancement, a heuristic plate-blur attempt, and an
 optional ComfyUI upscale. Missing optional engines produce explicit degraded
 results; an unsegmented source is never reported as a successful background
-replacement.
+replacement. Strict background jobs also refuse to publish a source photo when
+cut-out or scene compositing fails.
 """
 from __future__ import annotations
 
@@ -44,11 +45,19 @@ _BACKGROUND_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 class PhotoProcessor:
     """Process one photo or a bounded directory batch using one image at a time."""
 
-    def __init__(self, background_name: str = "studio_white", upscale: bool = False):
+    def __init__(
+        self,
+        background_name: str = "studio_white",
+        upscale: bool = False,
+        require_background_removal: bool = False,
+    ):
         if not isinstance(background_name, str) or not _BACKGROUND_RE.fullmatch(background_name):
             raise ValueError("Invalid background name")
         self.background_name = background_name
         self.upscale = bool(upscale)
+        self.require_background_removal = bool(require_background_removal)
+        if self.require_background_removal and background_name == "none":
+            raise ValueError("Required background replacement cannot keep the source background")
 
     def process(self, input_path: str, output_path: str) -> dict:
         result = {
@@ -118,12 +127,20 @@ class PhotoProcessor:
                     car_isolated = None
                     mask = None
 
+            if self.require_background_removal and not cutout_ready:
+                result["error_type"] = "BackgroundRemovalRequiredError"
+                result["steps"].append("bg_swap:blocked_without_cutout")
+                result["warnings"].append(
+                    "Required background removal did not complete; no replacement output was written."
+                )
+                return result
+
             composited = None
             if cutout_ready and car_isolated is not None:
                 bg_path = BACKGROUNDS_DIR / f"{self.background_name}.jpg"
                 if not bg_path.is_file():
                     fallback_path = BACKGROUNDS_DIR / "studio_white.jpg"
-                    if fallback_path.is_file():
+                    if not self.require_background_removal and fallback_path.is_file():
                         bg_path = fallback_path
                         degraded = True
                         result["warnings"].append(
@@ -147,6 +164,14 @@ class PhotoProcessor:
                     result["warnings"].append("No packaged backdrop was available.")
             elif self.background_name != "none":
                 result["steps"].append("bg_swap:skipped_without_cutout")
+
+            if self.require_background_removal and composited is None:
+                result["error_type"] = "BackgroundReplacementRequiredError"
+                result["steps"].append("bg_swap:blocked_without_replacement")
+                result["warnings"].append(
+                    "Required background replacement did not complete; no output was written."
+                )
+                return result
 
             if composited is None:
                 composited = keep(img.copy())

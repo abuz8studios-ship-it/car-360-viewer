@@ -26,9 +26,9 @@ def remove_background(img: Image.Image) -> Tuple[Image.Image, Optional[Image.Ima
     if result.mode != "RGBA":
         result = result.convert("RGBA")
     alpha = result.getchannel("A")
-    # rembg should make at least some pixels transparent. An all-opaque result is
-    # not a valid cut-out and must not be composited as though segmentation worked.
-    if alpha.getextrema() == (255, 255):
+    # A useful cut-out must contain both foreground and background. All-opaque
+    # output retained the photo; all-transparent output lost the vehicle entirely.
+    if alpha.getextrema() in {(0, 0), (255, 255)}:
         alpha.close()
         result.close()
         return img.convert("RGBA"), None

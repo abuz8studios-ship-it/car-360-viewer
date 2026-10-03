@@ -112,6 +112,105 @@ def test_photo_processor_honors_keep_background_selection_without_cutout(tmp_pat
     assert not any(step.startswith("bg_removal:error") for step in result["steps"])
 
 
+def test_strict_photo_processing_does_not_publish_without_a_cutout(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "input.jpg"
+    output = tmp_path / "studio.jpg"
+    Image.new("RGB", (320, 180), (120, 140, 160)).save(source)
+
+    def no_cutout(image):
+        return image.convert("RGBA"), None
+
+    monkeypatch.setattr(photo_processor, "remove_background", no_cutout)
+    result = photo_processor.PhotoProcessor(
+        require_background_removal=True,
+    ).process(str(source), str(output))
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "BackgroundRemovalRequiredError"
+    assert "bg_swap:blocked_without_cutout" in result["steps"]
+    assert any("no replacement output was written" in warning for warning in result["warnings"])
+    assert not output.exists()
+
+
+def test_strict_photo_processing_requires_requested_scene_before_output(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "input.jpg"
+    output = tmp_path / "studio.jpg"
+    Image.new("RGB", (320, 180), (120, 140, 160)).save(source)
+    backgrounds = tmp_path / "backgrounds"
+    backgrounds.mkdir()
+    Image.new("RGB", (320, 180), (60, 170, 100)).save(backgrounds / "studio_white.jpg")
+    monkeypatch.setattr(photo_processor, "BACKGROUNDS_DIR", backgrounds)
+
+    def make_cutout(image):
+        cutout = image.convert("RGBA")
+        mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(mask).rectangle((30, 30, 290, 150), fill=255)
+        cutout.putalpha(mask)
+        return cutout, mask
+
+    monkeypatch.setattr(photo_processor, "remove_background", make_cutout)
+    result = photo_processor.PhotoProcessor(
+        background_name="showroom_lux",
+        require_background_removal=True,
+    ).process(str(source), str(output))
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "BackgroundReplacementRequiredError"
+    assert "bg_swap:blocked_without_replacement" in result["steps"]
+    assert not output.exists()
+
+
+def test_photo_processor_strict_mode_completes_with_cutout_and_packaged_scene(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "input.jpg"
+    output = tmp_path / "studio.jpg"
+    backgrounds = tmp_path / "backgrounds"
+    backgrounds.mkdir()
+    Image.new("RGB", (320, 180), (60, 170, 100)).save(backgrounds / "studio_white.jpg")
+    Image.new("RGB", (320, 180), (120, 140, 160)).save(source)
+    monkeypatch.setattr(photo_processor, "BACKGROUNDS_DIR", backgrounds)
+
+    def make_cutout(image):
+        cutout = image.convert("RGBA")
+        mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(mask).rectangle((30, 30, 290, 150), fill=255)
+        cutout.putalpha(mask)
+        return cutout, mask
+
+    monkeypatch.setattr(photo_processor, "remove_background", make_cutout)
+    result = photo_processor.PhotoProcessor(
+        require_background_removal=True,
+    ).process(str(source), str(output))
+
+    assert result["status"] in {"ok", "degraded"}
+    assert "bg_removal:ok" in result["steps"]
+    assert "bg_swap:ok" in result["steps"]
+    assert output.is_file()
+
+
+def test_background_swap_rejects_empty_and_opaque_masks(monkeypatch) -> None:
+    from ai_studio import background_swap
+    import rembg_runtime
+
+    monkeypatch.setattr(rembg_runtime, "is_enabled", lambda: True)
+    source = Image.new("RGB", (16, 12), (90, 110, 130))
+
+    for alpha_value in (0, 255):
+        def fake_remove(_image, value=alpha_value):
+            result = Image.new("RGBA", (16, 12), (200, 40, 30, value))
+            return result
+
+        monkeypatch.setattr(rembg_runtime, "remove", fake_remove)
+        cutout, mask = background_swap.remove_background(source)
+        alpha = cutout.getchannel("A")
+        try:
+            assert mask is None
+            assert alpha.getextrema() == (255, 255)
+        finally:
+            alpha.close()
+            cutout.close()
+    source.close()
+
+
 def test_360_render_uses_truthful_natural_fallback_and_commits_36_frames(tmp_path, monkeypatch) -> None:
     vehicle_dir, exterior = _vehicle(tmp_path, monkeypatch)
     _make_frames(exterior)
@@ -165,6 +264,58 @@ def test_strict_background_replacement_fails_closed_when_rembg_is_missing(tmp_pa
         assert "no photos were changed" in exc.detail
     else:
         raise AssertionError("strict scene replacement must not report success without rembg")
+
+
+def test_background_studio_queue_forwards_required_removal_policy(tmp_path, monkeypatch) -> None:
+    _, exterior = _vehicle(tmp_path, monkeypatch)
+    _make_frames(exterior, count=1)
+    monkeypatch.setattr(main, "REMBG_AVAILABLE", True)
+    submitted = []
+
+    def capture_submission(key, target, *args):
+        submitted.append((key, target, args))
+        return "started"
+
+    monkeypatch.setattr(main, "_submit_background_job", capture_submission)
+    result = main._queue_photo_studio_job(
+        VIN, background="studio_white", kind="background_studio",
+        max_photos=20, require_rembg=True,
+    )
+
+    assert result["status"] == "started"
+    assert submitted[0][0] == f"background_studio:{VIN}"
+    assert submitted[0][1] is main._run_photo_studio_job
+    assert submitted[0][2][-1] is True
+
+
+def test_background_studio_worker_preserves_previous_outputs_when_cutout_fails(
+    tmp_path, monkeypatch,
+) -> None:
+    vehicle_dir, exterior = _vehicle(tmp_path, monkeypatch)
+    _make_frames(exterior, count=1)
+    studio_dir = vehicle_dir / "studio"
+    studio_dir.mkdir()
+    previous = studio_dir / "studio_previous.jpg"
+    previous.write_bytes(b"previous approved output")
+
+    def no_cutout(image):
+        return image.convert("RGBA"), None
+
+    monkeypatch.setattr(photo_processor, "remove_background", no_cutout)
+    monkeypatch.setattr(photo_processor, "BACKGROUNDS_DIR", tmp_path / "backgrounds")
+
+    main._run_photo_studio_job(
+        VIN, "studio_white", False, "background_studio", 20,
+        require_background_removal=True,
+    )
+
+    assert previous.read_bytes() == b"previous approved output"
+    assert not list(studio_dir.glob("studio_frame_*.jpg"))
+    assert not list(vehicle_dir.glob(".studio-stage-*"))
+    job = next(item for item in main._read_pipeline_jobs(VIN) if item["kind"] == "background_studio")
+    assert job["status"] == "error"
+    assert job["succeeded"] == 0
+    assert job["failed"] == 1
 
 
 def test_public_viewer_page_returns_at_most_120_frames(tmp_path, monkeypatch) -> None:
