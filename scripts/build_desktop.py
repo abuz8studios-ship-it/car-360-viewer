@@ -43,8 +43,29 @@ def _ignore_app(_directory: str, names: list[str]) -> set[str]:
     }
     return {
         name for name in names
-        if name in ignored or ".bak-" in name
-        or name.endswith((".pyc", ".pyo", ".log", ".db", ".sqlite", ".sqlite3", ".bak"))
+        if (
+            name in ignored
+            or ".bak-" in name.lower()
+            or (
+                (
+                    name.lower() == ".env"
+                    or name.lower().startswith(".env.")
+                    or ".env." in name.lower()
+                    or name.lower().endswith(".env")
+                )
+                and name.lower() != ".env.example"
+            )
+            or "secret" in name.lower()
+            or "credential" in name.lower()
+            or Path(name).suffix.lower() in {
+                ".bin", ".ckpt", ".engine", ".ggml", ".gguf", ".h5", ".keras",
+                ".onnx", ".pb", ".pt", ".pth", ".safetensors", ".tflite", ".weights",
+            }
+            or name.lower().endswith((
+                ".pyc", ".pyo", ".log", ".db", ".sqlite", ".sqlite3", ".bak",
+                ".pem", ".p12", ".pfx", ".key", ".jks", ".keystore",
+            ))
+        )
     }
 
 

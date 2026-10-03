@@ -136,6 +136,19 @@ jobs:
             exit "$status"
           fi
           rm -f .desktop-build.log
+      - name: Verify archive checksum, manifest, and bundled notices
+        shell: bash
+        run: |
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            archive='dist/desktop-release/LotVue360-windows-x64.zip'
+          else
+            archive="dist/desktop-release/LotVue360-macOS-${{ matrix.arch }}.zip"
+          fi
+          python scripts/verify_desktop_artifact.py \
+            --archive "$archive" \
+            --platform "${{ matrix.platform }}" \
+            --architecture "${{ matrix.arch }}" \
+            --build-id "$GITHUB_SHA"
       - name: Smoke-test Windows installer and frozen runtime
         if: matrix.platform == 'windows'
         shell: pwsh
