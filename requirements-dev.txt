@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=8,<9
+# Starlette >=1.7 prefers httpx2; keep httpx for older compatible Starlette releases.
+httpx>=0.27,<1
+httpx2>=2,<3
+ruff>=0.9,<1

@@ -1,10 +1,12 @@
 # LotVue360 — Product Requirements & Definition of Done
 
 > This is a checklist of what "done" means, not a wishlist. DONE rows cite the commit, HTTP probe, or measurement that proved them. OPEN rows say exactly what's missing and who unblocks it.
+>
+> **Audit update: 2026-10-03.** This checkout was tested locally; the recorded August/September production and workstation checks remain historical evidence and were not re-run against live credentials or `lotvue.abuz8ai.com` in this audit. The Windows/macOS desktop workflow and installer scripts are implemented in this branch, but no hosted matrix run or desktop artifact exists yet; do not call the appliance complete until hosted builds and actual installs pass.
 
 ## The product, one line
 
-A dealer uploads phone photos or a walkaround video of a car; LotVue360 gates the input for quality, removes the background, composites it onto a studio backdrop, builds a 360-degree spin viewer, and publishes a public VDP plus a Google Vehicle Listings feed — at a fraction of Spyne/CarCutter/GLO3D/MotorCut pricing.
+A dealer uploads phone photos or a walkaround video; LotVue360 gates capture quality, builds the 360-photo spin and viewer, and can composite onto a studio backdrop only when an operator has separately approved and configured a commercially cleared removal model. The public VDP/feed still require owner setup and live-provider verification; product pricing remains undecided.
 
 ## Definition of done — the stranger-dealer test
 
@@ -20,9 +22,11 @@ A dealer who has never seen the product, unaided, end to end:
 
 Steps 2–6, plus account creation and dashboard (step 1), were run and passed end to end on 2026-08-12 (fresh account `dealer60@`: register + login 200 → dashboard 200 with capture links → real walkaround upload, gate PASS, 36 frames → 360 render → public VDP 200 with viewer, screenshot-verified → priced → Google feed validator 156/156). That specific test account's session is the evidence for step 1, not a standing guarantee — re-verify before quoting. Step 7 has never been attempted against a live Stripe key.
 
-**"Done" is not code-complete or builds-clean.** It's: a real independent dealer, with zero help from Ahmad or any agent, uploads a real car and pays. That has not happened. Revenue to date: **$0**.
+**"Done" is not code-complete or builds-clean.** It's: a real independent dealer, with zero help from Ahmad or any agent, uploads a real car and pays. The last recorded result is no completed paid stranger-dealer run and **$0 revenue reported**; this audit did not access billing/accounting data to refresh that number.
 
-## Shipped and working (disk-verified)
+## Previously verified on the owner's workstation (historical evidence)
+
+The checks below are retained with their original dates; this audit did not re-run them against the deployed service. The current checkout's `app/storage/` has no VIN outputs, so a generated spin could not be visually inspected here.
 
 | Capability | Evidence |
 |---|---|
@@ -43,21 +47,29 @@ Steps 2–6, plus account creation and dashboard (step 1), were run and passed e
 | Stranger-dealer 60-second test | PASSED 2026-08-12 for every step except payment (see Definition of Done above) |
 | Real-world dealer run | 2026-09-02: pulled 42 real listing photos from a named live dealer (Select Auto, Dayton OH) and produced a 7-angle studio spin; 4 of 7 angles judged clean on inspection |
 
+## Current Windows/macOS desktop-release acceptance — 2026-10-03
+
+The session branch contains a PyInstaller launcher/package path, per-user Windows and macOS installers, a 3-platform GitHub Actions matrix, checksums, and CPython 3.11 dependency constraints. The hosted workflow is designed to install, self-test, and uninstall on Windows x64, macOS Intel, and Apple Silicon; pushing this session branch triggers it. The local source launcher passes its smoke test. **The hosted workflow has not yet run, no frozen artifact is available, and no Windows/macOS host has been used to install this branch's package.** The older Windows installer listed in the historical table is not evidence for these new artifacts.
+
+The base bundle contains local Python/runtime libraries and FFmpeg/FFprobe only after the hosted build can download and verify platform binaries. No CUDA/ComfyUI/WAN/COLMAP infrastructure, provider accounts, credentials, signatures, notarization, or model weights are bundled. Background removal stays disabled unless the owner reviews and explicitly selects a checkpoint; the app's acknowledgment flag is not legal verification. The checkpoint's commercial license/provenance, actual FFmpeg license output, dependency notices, and end-user installer behavior remain release gates.
+
 ## Explicitly out of scope — do not resume
 
 - **Generative-mesh 3D as a standard tier.** Tried, killed 2026-08-11 (68 of 118 generated GLB meshes were unusable and quarantined). Both reverse-engineered competitors (Spyne, GLO3D) also use photo-spin plus background replacement, not mesh generation — that independently confirms the pivot rather than exposing a shortfall. The real-3D Gaussian-splat path stays as the premium, real-footage-only tier.
 
 ## Blocking revenue — fix these before anything else
 
-1. **Stripe checkout is dead.** The secret key in `app/.env` returns `401 Expired API Key` on a live test. No payment can be collected until the key is rolled. *(Owner action: roll the key in the Stripe dashboard.)*
-2. **Pricing is undecided — three different numbers exist on disk right now:**
+1. **Stripe checkout has not been verified live in this audit.** The last recorded test returned `401 Expired API Key`; this checkout has no `app/.env`, and no secret was accessed or changed. No payment can be confirmed until Ahmad rolls the key and runs a live test. *(Owner action.)*
+2. **Pricing is undecided and several incompatible catalogs are present:**
    - `BRAIN.md`: $99/mo/dealer SaaS
    - `SALES_FUNNEL_FIRST_DOLLAR_2026-08-28.md`: $1,000 launch + $500/mo retainer
    - `SALES_FUNNEL_LOTVUE360_2026-08-28.md`: $1,000 sprint + $1,000/mo retainer
-   No offer goes out with a number Ahmad hasn't confirmed.
-3. **No sample has been sent to any prospect.** The Select Auto sample (2026-09-02, real dealer, real car) is built and sitting in `growth/select-auto-sample-2026-09-02/` — status is explicitly "FREE SAMPLE PRODUCED. NOT SENT." Sending is Ahmad's gate (it's an outbound message on his behalf).
-4. **Lead-alert email is broken.** The Gmail SMTP app password in `app/.env` returns `535 BadCredentials` on a live test — no lead-notification email currently fires. *(Owner action: generate a new app password.)*
-5. **The production server had roughly 3 weeks of unplanned downtime** (502, from on/around 2026-08-12 to 2026-09-02) because the Windows scheduled task that auto-starts it (`LOTVUE\StartApp`) was left Disabled. It was manually restarted 2026-09-02; whether the task itself has since been re-enabled needs a fresh check, not an assumption. *(Owner decision: re-enable — it's a persistent system-config change.)*
+   - `app/main.py`: plan tables/page include $2.99, $19.99, $75/mo, $99.99/mo, and $299.99/mo values.
+
+   The local code now defaults `LOTVUE_PRICING_APPROVED=0`: `/pricing` hides the price cards, `/api/plans` returns an empty catalog, and checkout/subscription/unlock/webhook paths stay disabled unless both pricing approval and the payment feature are enabled. A second fail-closed check also requires the checkout and subscription amounts to agree for single-render, starter, and dealership tiers; subscription checkout is restricted to the public dealership tier, and one-time unlocks use the checkout catalog amount rather than a separate literal. The legacy dealership values still conflict, so setting the approval flag alone cannot publish prices or create charges. This is a safe default, **not** a price decision. Ahmad must approve one canonical offer, reconcile the tables, and only then enable it.
+3. **No sample has been sent to any prospect in the last recorded evidence.** The Select Auto sample was marked "FREE SAMPLE PRODUCED. NOT SENT" on 2026-09-02. Sending is Ahmad's gate (it's an outbound message on his behalf); the output is not present in this checkout.
+4. **Lead-alert email has not been live-verified in this audit.** The last recorded Gmail SMTP app-password test returned `535 BadCredentials`; this checkout has no `app/.env`. *(Owner action: rotate/test the SMTP app password.)*
+5. **Production uptime is unverified.** The last recorded note says the production server had roughly 3 weeks of 502 downtime through 2026-09-02 and was manually restarted. Whether `LOTVUE\\StartApp` is enabled and survives reboot needs a fresh owner-side check. *(Owner action; persistent system-config change.)*
 
 ## Owner-gated — blocked on Ahmad, not on build work
 
@@ -68,16 +80,20 @@ Steps 2–6, plus account creation and dashboard (step 1), were run and passed e
 
 ## Smaller open items
 
-- One VIN's full studio-grade spin set still needs full-resolution visual inspection (BRAIN.md's own delivery contract has this unchecked)
-- License-plate blur is still open (the rest of the hotspot/damage layer is done; plate blur specifically is not)
+- **One VIN's full studio-grade spin set still needs full-resolution visual inspection.** The repository checkout has no generated VIN output under `app/storage/`; synthetic tests and source review cannot substitute for a visual review of a real spin set.
+- **License-plate privacy remains OPEN.** The optional AI PhotoProcessor already calls the blur stage, and a synthetic 640×480 plate smoke test passes. The detector is a lower/center ROI heuristic with a regional Haar cascade and contour fallback; there are no representative real-dealer recall/false-negative measurements, and it is not proven to cover every standard capture/render path. Do not market this as reliable plate anonymization until measured on a labeled dataset and visually reviewed.
+- **Background-removal model licensing remains OPEN.** The rembg package is only a Python runtime; no checkpoint is selected or included. Inference is gated on an operator-selected model plus explicit acknowledgment. The owner must verify commercial rights and weights provenance for the exact checkpoint; the acknowledgment is not legal approval. Until then, 360 output keeps photographed backgrounds and strict cut-out endpoints return a setup response.
 
 ## Repo hygiene — not blocking revenue, but real debt
 
-- **No `requirements.txt` or `pyproject.toml` anywhere in the repo.** Dependencies exist only as an inline pip-install comment in `app/main.py` and in `README.md`. A from-scratch environment is not reproducible from disk alone without reverse-engineering imports.
-- **`app/` carries at least 7 parallel copies of the main entry point** (`main.py.bak`, `.bak-classifier`, `.bak-dealer-import`, `.bak-preglue`, `main_backup_20260318.py`, `main_before_op6.py`, `main_original.py`, `main_v1.py`) plus `.bak` variants of `commercial_pipeline.py`, `gaussian_3d.py`, `h_dealer_import.py`, and `mobile_app.py` — all sitting live alongside the real files.
-- **Doc naming doesn't match the BRAIN/GOAL/LEDGER convention used elsewhere.** There is no literal `GOAL.md` (`LOTVUE_GOAL_ARTIFACT.md` and `LOTVUE_CREATION_ARTIFACT.md` split that role between them), and two differently-shaped ledgers already exist (`LEDGER.md`, a dev-log, vs. `LOTVUE_CANONICAL_LEDGER.md`, a numbered capability table). This PRD and its siblings `README.md` / `LEDGER_LOG.md` are a *second* naming convention layered on top of that, not a replacement — **Ahmad needs to decide which convention this project runs on going forward.** Nothing old has been deleted; `BRAIN.md`, `LEDGER.md`, `LOTVUE_CANONICAL_LEDGER.md`, `LOTVUE_GOAL_ARTIFACT.md`, and `LOTVUE_CREATION_ARTIFACT.md` are all still on disk, unchanged.
-- **Licensing is undecided.** A `LICENSE` file (MIT, uncommitted, added 2026-08-19) sits at the repo root and has never been reconciled with the commercial pricing above — an MIT grant would let anyone copy and resell this. Flagged here, not resolved.
-- **Uncommitted work as of this pass:** `LEDGER.md` modified; `LICENSE`, two `SALES_FUNNEL_*.md` files, `docs/`, `growth/`, and `.codegraph/` untracked.
+- **Declared dependencies and release constraints are now present.** Root `requirements.txt`, `requirements-ai.txt`, `requirements-dev.txt`, `requirements-desktop.txt`, and `requirements-release-constraints.txt` replace the old inline-install-only setup and stabilize the CPython 3.11 CI/build package set. Local dry runs passed on Linux; the Windows/macOS wheel resolution remains unverified until the hosted workflow runs.
+- **Dormant backup copies remain in `app/`.** The current checkout includes `main.py.bak-*`, `main_before_op6.py`, `main_original.py`, `main_v1.py`, and `.bak-*` copies of other modules. They are not runtime sources; archive or remove them only after Ahmad confirms there is no recovery/deployment dependency.
+- **Doc naming doesn't match the BRAIN/GOAL/LEDGER convention used elsewhere.** There is no literal `GOAL.md` (`LOTVUE_GOAL_ARTIFACT.md` and `LOTVUE_CREATION_ARTIFACT.md` split that role between them), and two differently-shaped ledgers already exist (`LEDGER.md`, a dev-log, vs. `LOTVUE_CANONICAL_LEDGER.md`, a numbered capability table). This PRD and its siblings `README.md` / `LEDGER_LOG.md` are a second naming convention, not a replacement — **Ahmad needs to decide which convention the project runs on.**
+- **License status corrected in this checkout:** tracked `LICENSE` is proprietary ABUZ8 LLC / All Rights Reserved, not MIT and not uncommitted. Owner/legal review should confirm the terms cover the intended hosted product and any future downloadable build.
+
+## Local verification — 2026-10-03
+
+The current checkout's automated checks are recorded in [`ENGINEERING_AUDIT_2026-10-03.md`](./ENGINEERING_AUDIT_2026-10-03.md). They establish source-level and isolated-test behavior only; they do not establish live production uptime, paid transactions, outbound email, Google validation against live inventory, or a stranger-dealer run.
 
 ## What "finished" looks like
 

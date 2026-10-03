@@ -6,12 +6,15 @@ Cloning best of 360autoai's reputation management.
 Zero cloud cost — AI responses via Ollama local models.
 """
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-DB_PATH = Path(r"E:\ABU\360Car\app\lotvue.db")
+from app_paths import BASE_DIR, configured_path
+
+DB_PATH = configured_path("LOTVUE_REPUTATION_DB", BASE_DIR / "lotvue.db")
 
 
 # =============================================================================
@@ -212,13 +215,15 @@ def respond_to_review(review_id: int, response_text: str) -> dict:
     """Save a response to a review."""
     init_reviews_db()
     conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("""
+    cur = conn.execute("""
         UPDATE reviews
         SET response_text=?, response_status='responded', responded_at=?
         WHERE id=?
     """, (response_text, datetime.now().isoformat(), review_id))
     conn.commit()
     conn.close()
+    if cur.rowcount == 0:
+        return {"error": "Review not found", "review_id": review_id}
     return {"status": "ok", "review_id": review_id}
 
 

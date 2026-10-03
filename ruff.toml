@@ -1,0 +1,13 @@
+target-version = "py311"
+line-length = 120
+extend-exclude = [
+  "app/main_before_op6.py",
+  "app/main_original.py",
+  "app/main_v1.py",
+]
+
+[lint]
+# Keep the repository's default lint gate deterministic across Ruff releases.
+# Focus on ASGI blocking calls, bare catches, undefined names, and accidental
+# function redefinitions; legacy style cleanup is tracked separately in the audit.
+select = ["ASYNC", "E722", "F811", "F821", "F823"]

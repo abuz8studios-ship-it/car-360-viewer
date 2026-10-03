@@ -16,8 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-STORAGE_DIR = Path(r"E:\ABU\360Car\app\storage")
-DB_PATH = Path(r"E:\ABU\360Car\app\lotvue.db")
+from app_paths import STORAGE_DIR
 
 
 def generate_video_ad_script(vehicle: dict, ad_type: str = "listing",

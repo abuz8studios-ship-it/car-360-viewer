@@ -3,14 +3,20 @@ viewer_api.py — LotVue Pro unified viewer backend (P2)
 Serves the per-vehicle render manifest that <lotvue-viewer> consumes, and the
 embeddable VDP page. One manifest, three tiers: spin / splat / glb.
 """
+import heapq
+import html
 import json
+import math
+import os
+import re
 import sqlite3
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+from app_paths import BASE_DIR, DB_PATH, STORAGE_DIR
 from fastapi import HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
-STORAGE_ROOTS = (Path(__file__).parent / "storage", Path(__file__).parent / "vehicles")
-DB_PATH = Path(__file__).parent / "vehicles.db"
+STORAGE_ROOTS = (STORAGE_DIR, BASE_DIR / "vehicles")
 
 SEV_ORDER = {"major": 0, "moderate": 1, "minor": 2}
 
@@ -18,57 +24,132 @@ SEV_ORDER = {"major": 0, "moderate": 1, "minor": 2}
 def _db_hotspots(vin: str):
     """Dealer-placed hotspots (feature + damage) from the DB — the same rows
     /api/hotspot writes. Returns [] on any error so the viewer never breaks."""
+    conn = None
     try:
-        conn = sqlite3.connect(str(DB_PATH))
+        conn = sqlite3.connect(str(DB_PATH), timeout=2)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT id, photo_filename, tag, hotspot_x, hotspot_y, condition_type,"
-            " severity, note, close_up FROM hotspots WHERE vin=?", (vin.upper(),)
+            " severity, note, close_up FROM hotspots WHERE vin=? ORDER BY id DESC LIMIT 500",
+            (vin.upper(),)
         ).fetchall()
-        conn.close()
         return [dict(r) for r in rows]
-    except Exception:
+    except sqlite3.Error:
         return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+def validate_vehicle_id(vin: str) -> str:
+    """Constrain public viewer identifiers before using them in paths/markup."""
+    value = str(vin or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{1,32}", value):
+        raise HTTPException(400, "Invalid vehicle identifier")
+    return value
+
+
+def _read_json_limited(path: Path, max_bytes: int):
+    """Read bounded JSON without trusting a prior stat check."""
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            return None
+        return json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return None
+
+
+def _safe_vehicle_path(vehicle_dir: Path, relative: str | Path) -> Path | None:
+    """Resolve a child without following symlinks within or out of a vehicle tree."""
+    try:
+        relative_path = PurePosixPath(str(relative).replace("\\", "/"))
+        if relative_path.is_absolute():
+            return None
+        root = vehicle_dir.resolve(strict=True)
+        candidate = root
+        for part in relative_path.parts:
+            if part in {"", ".", ".."}:
+                return None
+            candidate = candidate / part
+            if candidate.is_symlink():
+                return None
+        resolved = candidate.resolve(strict=True)
+        return resolved if resolved.is_relative_to(root) else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
 
 def _vehicle_dir(vin: str) -> Path:
+    vin = validate_vehicle_id(vin)
+    try:
+        with sqlite3.connect(str(DB_PATH), timeout=2) as conn:
+            row = conn.execute("SELECT status FROM vehicles WHERE vin=?", (vin,)).fetchone()
+    except sqlite3.Error as exc:
+        raise HTTPException(503, "Vehicle listing is unavailable") from exc
+    if not row or row[0] != "active":
+        raise HTTPException(404, "Vehicle not found")
     for root in STORAGE_ROOTS:
-        d = root / vin
-        if d.exists():
-            return d
-    raise HTTPException(404, f"unknown vin {vin}")
+        resolved_root = root.resolve()
+        candidate = resolved_root / vin
+        try:
+            if candidate.is_symlink():
+                continue
+            directory = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if directory.parent == resolved_root and directory.name == vin and directory.is_dir():
+            return directory
+    raise HTTPException(404, "Vehicle not found")
 
 def _spin_frames(d: Path, vin: str):
     # polished set wins when present (borders + dealer banner stripped,
-    # locked-off framing, non-orbit frames removed)
-    spin = d / "spin_hd"
-    if not spin.exists():
-        spin = d / "spin"
-    if not spin.exists():
+    # locked-off framing, non-orbit frames removed). Bound the public manifest
+    # to 120 assets to match the viewer's client-side memory limit.
+    spin = _safe_vehicle_path(d, "spin_hd")
+    if spin is None or not spin.is_dir():
+        spin = _safe_vehicle_path(d, "spin")
+    if spin is None or not spin.is_dir():
         return []
-    frames = sorted(p.name for p in spin.iterdir()
-                    if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"))
-    return [f"/storage/{vin}/{spin.name}/{n}" for n in frames]
+    allowed = (".jpg", ".jpeg", ".png", ".webp")
+    try:
+        with os.scandir(spin) as entries:
+            names = heapq.nsmallest(
+                120,
+                (entry.name for entry in entries
+                 if not entry.is_symlink()
+                 and entry.is_file(follow_symlinks=False)
+                 and entry.name.rsplit(".", 1)[-1].lower() in {"jpg", "jpeg", "png", "webp"}
+                 and not entry.name.startswith(".")
+                 and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", entry.name)
+                 and "." in entry.name
+                 and Path(entry.name).suffix.lower() in allowed),
+            )
+    except OSError:
+        return []
+    return [f"/storage/{vin}/{spin.name}/{name}" for name in names]
 
 def build_manifest(vin: str) -> dict:
+    vin = validate_vehicle_id(vin)
     d = _vehicle_dir(vin)
     man = {"vin": vin, "spin_frames": _spin_frames(d, vin)}
-    for cand in (d / "splat" / "scene.ply", d / "model.ply", d / "3d" / "model.ply"):
-        if cand.exists() and cand.stat().st_size > 100_000:
-            man["splat_url"] = f"/storage/{vin}/{cand.relative_to(d).as_posix()}"
+    for relative in ("splat/scene.ply", "model.ply", "3d/model.ply"):
+        candidate = _safe_vehicle_path(d, relative)
+        if candidate and candidate.is_file() and candidate.stat().st_size > 100_000:
+            man["splat_url"] = f"/storage/{vin}/{relative}"
             break
-    glb = d / "model.glb"
-    if glb.exists():
+    glb = _safe_vehicle_path(d, "model.glb")
+    if glb and glb.is_file():
         man["glb_url"] = f"/storage/{vin}/model.glb"
         man["paint"] = ["#0b1f3a", "#7a0d16", "#101010", "#c9ccd2", "#f2f3f5"]
-    interior = d / "interior.jpg"
-    if interior.exists():
+    interior = _safe_vehicle_path(d, "interior.jpg")
+    if interior and interior.is_file():
         man["interior_url"] = f"/storage/{vin}/interior.jpg"
-    hs = d / "hotspots.json"
-    if hs.exists():
-        try:
-            man["hotspots"] = json.loads(hs.read_text("utf-8"))
-        except Exception:
-            pass
+    hs = _safe_vehicle_path(d, "hotspots.json")
+    if hs:
+        payload = _read_json_limited(hs, 1_000_000)
+        if isinstance(payload, list):
+            man["hotspots"] = payload[:500]
     # merge dealer-placed DB hotspots (feature pins + damage layer)
     db_hs = _db_hotspots(vin)
     if db_hs:
@@ -87,25 +168,35 @@ def build_manifest(vin: str) -> dict:
                            "damage": bool(h["condition_type"]),
                            "severity": h["severity"] or ""})
         man["hotspots"] = merged
-    meta = d / "meta.json"
-    if meta.exists():
-        try:
-            man["vehicle"] = json.loads(meta.read_text("utf-8"))
-        except Exception:
-            pass
+    meta = _safe_vehicle_path(d, "meta.json")
+    if meta:
+        payload = _read_json_limited(meta, 1_000_000)
+        vehicle = payload.get("vehicle", payload) if isinstance(payload, dict) else {}
+        public_fields = {
+            "vin", "year", "make", "model", "trim", "trim_level", "price", "mileage",
+            "color", "description", "engine", "transmission", "drivetrain", "fuel_type",
+            "body_style", "stock_number", "video_url", "video_type", "show_video",
+            "show_interior", "show_gallery", "turntable_style", "background_id",
+        }
+        if isinstance(vehicle, dict):
+            man["vehicle"] = {
+                key: value[:4000] if isinstance(value, str) else value
+                for key, value in vehicle.items()
+                if key in public_fields and isinstance(value, (str, int, float, bool))
+            }
     if not man.get("vehicle"):
         # upload flow writes the DB row, not meta.json — fall back so a fresh
         # dealer's first vehicle gets a real title on /vdp, not a bare VIN
         try:
-            conn = sqlite3.connect(str(DB_PATH))
-            conn.row_factory = sqlite3.Row
-            r = conn.execute("SELECT year, make, model, price, mileage "
-                             "FROM vehicles WHERE vin=?", (vin.upper(),)).fetchone()
-            conn.close()
-            if r:
-                man["vehicle"] = {k: r[k] for k in r.keys() if r[k]}
-        except Exception:
-            pass
+            with sqlite3.connect(str(DB_PATH), timeout=2) as conn:
+                conn.row_factory = sqlite3.Row
+                r = conn.execute("SELECT year, make, model, price, mileage "
+                                 "FROM vehicles WHERE vin=?", (vin.upper(),)).fetchone()
+                if r:
+                    fields = ("year", "make", "model", "price", "mileage")
+                    man["vehicle"] = {key: r[key] for key in fields if r[key]}
+        except sqlite3.Error as exc:
+            print(f"[Viewer-API] vehicle metadata unavailable for {vin}: {exc}")
     return man
 
 VDP_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -142,68 +233,106 @@ document.getElementById('q').addEventListener('keydown', async e => {{
   if (e.key !== 'Enter' || !e.target.value.trim()) return;
   const q = e.target.value.trim(); e.target.value = '';
   const log = document.getElementById('log');
-  log.insertAdjacentHTML('beforeend', '<div class="q">You: ' + q.replace(/</g,'&lt;') + '</div>');
+  const questionLine = document.createElement('div');
+  questionLine.className = 'q';
+  questionLine.textContent = 'You: ' + q;
+  log.appendChild(questionLine);
   try {{
     const r = await fetch('/api/chat/' + vin, {{method:'POST', headers:{{'Content-Type':'application/json'}},
       body: JSON.stringify({{message: q}})}});
     const j = await r.json();
-    log.insertAdjacentHTML('beforeend', '<div>' + (j.reply || j.response || j.answer || 'One moment…').replace(/</g,'&lt;') + '</div>');
-  }} catch (err) {{ log.insertAdjacentHTML('beforeend', '<div>Connection hiccup — try again.</div>'); }}
+    const answerLine = document.createElement('div');
+    answerLine.textContent = String(j.reply || j.response || j.answer || 'One moment…');
+    log.appendChild(answerLine);
+  }} catch (err) {{
+    const errorLine = document.createElement('div');
+    errorLine.textContent = 'Connection hiccup — try again.';
+    log.appendChild(errorLine);
+  }}
   log.scrollTop = log.scrollHeight;
 }});
 </script></div></body></html>"""
 
 def register_viewer(app):
     @app.get("/api/viewer/{vin}/manifest")
-    async def viewer_manifest(vin: str):
-        return JSONResponse(build_manifest(vin))
+    def viewer_manifest(vin: str):
+        return JSONResponse(build_manifest(validate_vehicle_id(vin)))
 
     @app.get("/vdp/{vin}", response_class=HTMLResponse)
-    async def vdp_page(vin: str):
+    def vdp_page(vin: str):
+        vin = validate_vehicle_id(vin)
         man = build_manifest(vin)
         v = man.get("vehicle", {})
-        title = " ".join(str(v.get(k, "")) for k in ("year", "make", "model")).strip() or f"VIN {vin}"
-        bits = [str(v[k]) for k in ("trim", "mileage", "price") if v.get(k)]
-        return VDP_HTML.format(vin=vin, vin_js=json.dumps(vin), title=title,
-                               sub=" · ".join(bits) or "LotVue Pro 3D listing")
+        title = " ".join(str(v.get(k, "") or "") for k in ("year", "make", "model")).strip() or f"VIN {vin}"
+        bits = [str(v[k]) for k in ("trim", "trim_level", "mileage", "price") if v.get(k)]
+        return VDP_HTML.format(vin=html.escape(vin, quote=True), vin_js=json.dumps(vin),
+                               title=html.escape(title, quote=True),
+                               sub=html.escape(" · ".join(bits) or "LotVue Pro 3D listing", quote=True))
 
     @app.get("/vdp/{vin}/damage-report", response_class=HTMLResponse)
-    async def damage_report(vin: str):
+    def damage_report(vin: str):
         """Printable condition/damage summary — damage-tagged hotspots with
         severity, notes, close-ups, and dot-marked frames. Public read."""
+        vin = validate_vehicle_id(vin)
         man = build_manifest(vin)
         v = man.get("vehicle", {})
-        title = " ".join(str(v.get(k, "")) for k in ("year", "make", "model")).strip() or f"VIN {vin}"
-        rows = [h for h in _db_hotspots(vin) if h["condition_type"]]
-        rows.sort(key=lambda h: SEV_ORDER.get(h["severity"], 3))
+        title = " ".join(str(v.get(k, "") or "") for k in ("year", "make", "model")).strip() or f"VIN {vin}"
+        rows = [h for h in _db_hotspots(vin) if h.get("condition_type")]
+        rows.sort(key=lambda h: SEV_ORDER.get(h.get("severity"), 3))
         frames = man.get("spin_frames", [])
-        counts = {s: sum(1 for h in rows if h["severity"] == s)
+        frame_by_name = {PurePosixPath(u).name: u for u in frames}
+        counts = {s: sum(1 for h in rows if h.get("severity") == s)
                   for s in ("major", "moderate", "minor")}
         chips = " ".join(f'<span class="chip {s}">{counts[s]} {s}</span>'
                          for s in ("major", "moderate", "minor") if counts[s])
+
+        def safe_image_name(value):
+            name = str(value or "")
+            if (PurePosixPath(name).name != name
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name)
+                    or name.startswith(".")
+                    or PurePosixPath(name).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}):
+                return ""
+            return name
+
+        def safe_percent(value):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return 50.0
+            if not math.isfinite(number):
+                return 50.0
+            return min(100.0, max(0.0, number * 100))
+
         items = []
         for i, h in enumerate(rows, 1):
-            frame_url = ""
-            for u in frames:
-                if u.endswith("/" + h["photo_filename"]):
-                    frame_url = u
-                    break
-            img = (f'<div class="shot"><img src="{frame_url}" alt="frame">'
-                   f'<span class="dot" style="left:{h["hotspot_x"]*100:.1f}%;'
-                   f'top:{h["hotspot_y"]*100:.1f}%"></span></div>') if frame_url else ""
-            close = (f'<img class="close" src="/storage/{vin}/hotspot_photos/{h["close_up"]}" '
-                     'alt="close-up">') if h["close_up"] else ""
-            note = (h["note"] or "").replace("<", "&lt;")
+            photo_name = safe_image_name(h.get("photo_filename"))
+            frame_url = frame_by_name.get(photo_name, "")
+            if frame_url:
+                x = safe_percent(h.get("hotspot_x", 0.5))
+                y = safe_percent(h.get("hotspot_y", 0.5))
+                img = (f'<div class="shot"><img src="{html.escape(frame_url, quote=True)}" alt="frame">'
+                       f'<span class="dot" style="left:{x:.1f}%;top:{y:.1f}%"></span></div>')
+            else:
+                img = ""
+            close_name = safe_image_name(h.get("close_up"))
+            close = (f'<img class="close" src="/storage/{vin}/hotspot_photos/{close_name}" '
+                     'alt="close-up">') if close_name else ""
+            tag = html.escape(str(h.get("tag") or ""), quote=True)
+            severity = h.get("severity") if h.get("severity") in SEV_ORDER else "minor"
+            condition = html.escape(str(h.get("condition_type") or ""), quote=True)
+            note = html.escape(str(h.get("note") or ""), quote=False)
             items.append(
-                f'<div class="item"><div class="head"><b>#{i} {h["tag"]}</b>'
-                f'<span class="chip {h["severity"]}">{h["severity"]} {h["condition_type"]}</span></div>'
+                f'<div class="item"><div class="head"><b>#{i} {tag}</b>'
+                f'<span class="chip {severity}">{severity} {condition}</span></div>'
                 f'{img}{close}<p>{note}</p></div>')
         body = "".join(items) or ('<p class="clean">No damage recorded. Every hotspot on '
                                   'this vehicle is a feature callout — nothing tagged as '
                                   'scratch, dent, chip, rust or crack.</p>')
+        title_html = html.escape(title, quote=True)
         return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Condition report — {title}</title><style>
+<title>Condition report — {title_html}</title><style>
  body{{margin:0;background:#fff;color:#16202e;font-family:-apple-system,'Segoe UI',Roboto,sans-serif}}
  .wrap{{max-width:820px;margin:0 auto;padding:28px 22px}}
  h1{{font-size:22px;margin:0 0 2px}} .sub{{color:#5c6c82;font-size:13px;margin-bottom:14px}}
@@ -221,20 +350,10 @@ def register_viewer(app):
  .print{{margin:16px 0}} @media print{{.print{{display:none}}}}
  p{{font-size:14px;line-height:1.5;color:#39485c}}
 </style></head><body><div class="wrap">
-<h1>Condition report — {title}</h1>
+<h1>Condition report — {title_html}</h1>
 <div class="sub">VIN {vin} · generated by LotVue Pro {chips}</div>
 <button class="print" onclick="window.print()">Print / save as PDF</button>
 {body}
 </div></body></html>"""
-
-    @app.get("/embed/{vin}", response_class=HTMLResponse)
-    async def embed_page(vin: str):
-        return ('<!DOCTYPE html><html><head><meta charset="utf-8">'
-                '<meta name="viewport" content="width=device-width,initial-scale=1">'
-                '<style>html,body{margin:0;height:100%;background:#0a1226}'
-                'lotvue-spin{display:block;height:100%}</style></head><body>'
-                f'<lotvue-spin vin="{vin}"></lotvue-spin>'
-                '<script type="module">import "/static/lotvue_spin.js";</script>'
-                '</body></html>')
 
     print("[Viewer-API] registered: /api/viewer/{vin}/manifest, /vdp/{vin}, /embed/{vin} (3-tier unified viewer)")
