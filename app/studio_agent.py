@@ -6,6 +6,7 @@ sends messages, changes pricing, or contacts external providers automatically.
 """
 from __future__ import annotations
 
+import heapq
 import importlib.util
 import os
 import re
@@ -39,7 +40,7 @@ STUDIO_HTML = r"""<!doctype html>
     .small{font-size:12px;color:var(--muted)}.notice{border-radius:10px;padding:11px 12px;font-size:13px;margin-top:12px;background:#edf4fc;color:#21496f}.notice.warn{background:#fff5e6;color:#80500b}.notice.bad{background:#fff0f0;color:#873030}
     .cap-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.cap{border:1px solid var(--line);border-radius:11px;padding:12px;background:#fff}.cap-top{display:flex;justify-content:space-between;gap:8px;align-items:center}.state{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.45px;border-radius:999px;padding:4px 7px;white-space:nowrap}.state.ready{background:#e8f5ee;color:var(--green)}.state.degraded,.state.setup_required,.state.owner_action_required,.state.not_configured{background:#fff3dd;color:var(--amber)}.state.error{background:#ffeaea;color:var(--red)}.state.configured{background:#edf4fc;color:#345b80}
     .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:9px}.metric{background:#f6f8fb;border-radius:9px;padding:10px}.metric b{display:block;font-size:17px}.metric span{font-size:11px;color:var(--muted)}
-    .vehicle-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}.vehicle-vin{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted)}.job{border-top:1px solid var(--line);padding:9px 0;display:flex;justify-content:space-between;gap:12px;font-size:13px}.job:first-child{border-top:0}.job b{font-weight:700}.hidden{display:none!important}
+    .vehicle-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}.vehicle-vin{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted)}.job{border-top:1px solid var(--line);padding:9px 0;display:flex;justify-content:space-between;gap:12px;font-size:13px}.job:first-child{border-top:0}.job b{font-weight:700}.scene-preview{display:block;max-width:100%;max-height:500px;object-fit:contain;background:#f6f8fb;border:1px solid var(--line);border-radius:10px;margin-top:10px}.hidden{display:none!important}
     @media(max-width:800px){.span8,.span4{grid-column:span 12}.cap-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metrics{grid-template-columns:repeat(2,1fr)}}@media(max-width:500px){main{padding:20px 13px 42px}.row{grid-template-columns:1fr}.cap-grid{grid-template-columns:1fr}h1{font-size:25px}}
   </style>
 </head>
@@ -56,6 +57,14 @@ STUDIO_HTML = r"""<!doctype html>
       <div id="vehicleSummary" class="notice">Select a vehicle to see the next safe action.</div>
       <div class="actions"><button class="btn" id="buildBtn" disabled>Build / refresh 360</button><button class="btn secondary" id="photoBtn" disabled>Prepare Photo Studio images</button><a class="btn secondary hidden" id="viewBtn" target="_blank" rel="noopener">Review buyer page</a></div>
       <div class="small" style="margin-top:10px">Background removal is optional. When it is not installed, the 360 renderer keeps photographed backgrounds and marks the result as degraded rather than claiming a cut-out.</div>
+      <div class="scene-tools" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+        <h3>Render one stored photo</h3>
+        <div class="row" style="margin-top:10px"><div><label for="sceneImage">Source photo</label><select id="sceneImage" disabled><option value="">Choose a vehicle first…</option></select></div><div><label for="sceneSelect">Scene</label><select id="sceneSelect"><option value="clean-studio">Clean Studio</option></select></div></div>
+        <div class="row" style="margin-top:10px"><div><label for="sceneEngine">Renderer</label><select id="sceneEngine"><option value="local">Local deterministic composite</option><option value="comfyui">ComfyUI AI workflow</option></select></div><div class="actions" style="align-items:end;margin-top:20px"><button class="btn secondary" id="sceneBtn" disabled>Render selected scene</button></div></div>
+        <p class="small" id="sceneHelp">Local rendering requires a transparent vehicle cut-out. ComfyUI requires an owner-configured workflow and may change vehicle details.</p>
+        <div class="small notice warn">Generated files are served from the existing public vehicle-media path. AI output is not held in a private review queue; review the result before sharing it.</div>
+        <div id="sceneOutput" class="notice hidden" aria-live="polite"></div>
+      </div>
     </section>
     <section class="card span4"><h2>Recommended next steps</h2><div id="actionList" class="small">Choose a vehicle to generate a deterministic workflow plan.</div><div class="actions"><a class="btn secondary" href="/api/vehicles" target="_blank" rel="noopener">Inventory API</a><a class="btn secondary" href="/api/backgrounds" target="_blank" rel="noopener">Background catalog</a></div></section>
     <section class="card span12" id="system-health"><div class="vehicle-head"><div><h2>System & engine readiness</h2><p class="small">Configuration-only snapshot. “Configured” is not a live integration check, production uptime claim, or visual-quality sign-off.</p></div><button class="btn secondary" id="refreshHealth">Refresh</button></div><div id="capabilities" class="cap-grid" style="margin-top:13px"><div class="small">Loading local readiness…</div></div><div id="resourceCaps" class="metrics" style="margin-top:14px"></div><p class="small" style="margin:12px 0 0">Pricing and billing remain closed pending owner approval. No feed, email, payment, social post, or external AI request is initiated by this page.</p></section>
@@ -63,23 +72,128 @@ STUDIO_HTML = r"""<!doctype html>
   </div>
 </main>
 <script>
-const $=id=>document.getElementById(id);let activeVin='';let polling=null;
+const $=id=>document.getElementById(id);let activeVin='';let polling=null;let sceneInputRequest=0;
 function node(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e;}
 async function getJson(url,options={}){const response=await fetch(url,{credentials:'same-origin',...options});let data={};try{data=await response.json();}catch(_){}if(!response.ok)throw new Error(data.detail||('Request failed ('+response.status+')'));return data;}
 function renderCapabilityCard(item){const card=node('article','cap');const top=node('div','cap-top');top.append(node('h3','',item.label));const state=node('span','state '+item.status,item.status.replaceAll('_',' '));top.append(state);card.append(top);card.append(node('p','small',item.detail));return card;}
 async function loadHealth(){const box=$('capabilities');box.replaceChildren(node('div','small','Checking local configuration…'));try{const data=await getJson('/api/system/health');box.replaceChildren();Object.values(data.subsystems).forEach(item=>box.append(renderCapabilityCard(item)));const m=data.limits||{};$('resourceCaps').replaceChildren();[[m.spin_frames,'360 frames / spin'],[m.viewer_frames,'viewer frame cap'],[m.photo_batch_mb+' MiB','photo batch cap'],[m.background_workers+' / '+m.background_jobs,'workers / admitted jobs'],[m.comfyui_scene_generation_jobs,'ComfyUI scenes / process']].forEach(([v,l])=>{const d=node('div','metric');d.append(node('b','',String(v)));d.append(node('span','',l));$('resourceCaps').append(d);});$('probeMode').textContent=data.external_services_contacted?'Probe performed':'Local configuration snapshot · no external services contacted';}catch(e){box.replaceChildren(node('div','notice bad',e.message));}}
 async function loadBackgrounds(){try{const data=await getJson('/api/backgrounds');const select=$('backgroundSelect');select.replaceChildren();data.filter(x=>x.slug!=='none').forEach(bg=>{const opt=node('option','',bg.name);opt.value=bg.slug;select.append(opt);});}catch(_){}}
-async function loadVehicles(){const select=$('vehicleSelect');try{const rows=await getJson('/api/vehicles');select.replaceChildren(node('option','','Select a vehicle…'));rows.forEach(v=>{const label=[v.year,v.make,v.model].filter(Boolean).join(' ')||'Vehicle';const opt=node('option','',label+' · '+v.vin);opt.value=v.vin;select.append(opt);});if(!rows.length)select.replaceChildren(node('option','','No vehicles yet — capture one to begin'));if(location.hash.startsWith('#vin=')){const wanted=decodeURIComponent(location.hash.slice(5));select.value=wanted;}if(select.value)await selectVehicle();}catch(e){select.replaceChildren(node('option','',e.message));}}
+async function loadSceneCatalog(){const select=$('sceneSelect');try{const data=await getJson('/api/backgrounds/scenes');select.replaceChildren();(data.scenes||[]).forEach(scene=>{const opt=node('option','',scene.name);opt.value=scene.id;select.append(opt);});if(!select.options.length){const empty=node('option','','No scenes available');empty.value='';empty.disabled=true;select.replaceChildren(empty);}syncSceneButton();}catch(e){const empty=node('option','',e.message);empty.value='';empty.disabled=true;select.replaceChildren(empty);syncSceneButton();}}
+function syncSceneButton(){const btn=$('sceneBtn');if(btn)btn.disabled=!activeVin||!$('sceneImage').value||!$('sceneSelect').value||btn.dataset.busy==='true';}
+function updateSceneHelp(){const help=$('sceneHelp');if(!help)return;if($('sceneEngine').value==='comfyui'){help.textContent='ComfyUI AI mode requires the owner-configured API workflow; results may alter the vehicle and are written to public vehicle storage for manual review.';}else{help.textContent='Local mode is deterministic and requires a transparent vehicle cut-out. Opaque originals are rejected; use a transparent PNG or the existing Photo Studio pipeline.';}}
+async function loadSceneInputs(vin){const requestId=++sceneInputRequest;const select=$('sceneImage');select.disabled=true;select.replaceChildren(node('option','','Loading vehicle photos…'));try{const data=await getJson('/api/studio/vehicles/'+encodeURIComponent(vin)+'/scene-inputs');if(requestId!==sceneInputRequest||vin!==activeVin)return;select.replaceChildren(node('option','','Choose a source photo…'));(data.images||[]).forEach(image=>{const opt=node('option','',image.label);opt.value=image.path;select.append(opt);});if(!(data.images||[]).length)select.replaceChildren(node('option','','No stored photos found'));select.disabled=!(data.images||[]).length;}catch(e){if(requestId!==sceneInputRequest||vin!==activeVin)return;select.replaceChildren(node('option','',e.message));select.disabled=true;}syncSceneButton();}
+async function loadVehicles(){
+const select=$('vehicleSelect');try{const rows=await getJson('/api/vehicles');select.replaceChildren(node('option','','Select a vehicle…'));rows.forEach(v=>{const label=[v.year,v.make,v.model].filter(Boolean).join(' ')||'Vehicle';const opt=node('option','',label+' · '+v.vin);opt.value=v.vin;select.append(opt);});if(!rows.length)select.replaceChildren(node('option','','No vehicles yet — capture one to begin'));if(location.hash.startsWith('#vin=')){const wanted=decodeURIComponent(location.hash.slice(5));select.value=wanted;}if(select.value)await selectVehicle();}catch(e){select.replaceChildren(node('option','',e.message));}}
 function appendAction(container,label,description){const row=node('div','job');row.append(node('span','',label));row.append(node('b','',description));container.append(row);}
 async function loadVehicleJobs(vin){const data=await getJson('/api/studio/vehicles/'+encodeURIComponent(vin)+'/jobs');return data.jobs||[];}
-async function selectVehicle(){activeVin=$('vehicleSelect').value;const build=$('buildBtn'),photo=$('photoBtn'),view=$('viewBtn');build.disabled=!activeVin;photo.disabled=!activeVin;view.classList.toggle('hidden',!activeVin);if(!activeVin){$('vehicleSummary').textContent='Select a vehicle to see the next safe action.';$('actionList').textContent='Choose a vehicle to generate a workflow plan.';return;}view.href='/view/'+encodeURIComponent(activeVin);$('interiorLink').href='/interior-studio/'+encodeURIComponent(activeVin);try{const plan=await getJson('/api/studio/vehicles/'+encodeURIComponent(activeVin)+'/plan');$('vehicleSummary').className='notice'+(plan.warnings.length?' warn':'');$('vehicleSummary').textContent=plan.stage+' · '+plan.assets.exterior_frames+' source frames · '+plan.assets.spin_frames+' rendered 360 frames · '+plan.assets.studio_photos+' Photo Studio images';const list=$('actionList');list.replaceChildren();plan.actions.forEach(a=>appendAction(list,a.label,a.state));plan.warnings.forEach(w=>list.append(node('div','notice warn',w)));const jobs=await loadVehicleJobs(activeVin);jobs.forEach(j=>appendAction(list,j.kind.replaceAll('_',' '),j.status+' · '+(j.step||'')+' · '+(j.message||'')));}catch(e){$('vehicleSummary').className='notice bad';$('vehicleSummary').textContent=e.message;}}
+async function selectVehicle(){activeVin=$('vehicleSelect').value;const build=$('buildBtn'),photo=$('photoBtn'),view=$('viewBtn');build.disabled=!activeVin;photo.disabled=!activeVin;view.classList.toggle('hidden',!activeVin);if(!activeVin){sceneInputRequest++;$('sceneImage').disabled=true;$('sceneImage').replaceChildren(node('option','','Choose a vehicle first…'));syncSceneButton();$('vehicleSummary').textContent='Select a vehicle to see the next safe action.';$('actionList').textContent='Choose a vehicle to generate a workflow plan.';return;}view.href='/view/'+encodeURIComponent(activeVin);$('interiorLink').href='/interior-studio/'+encodeURIComponent(activeVin);loadSceneInputs(activeVin);try{const plan=await getJson('/api/studio/vehicles/'+encodeURIComponent(activeVin)+'/plan');$('vehicleSummary').className='notice'+(plan.warnings.length?' warn':'');$('vehicleSummary').textContent=plan.stage+' · '+plan.assets.exterior_frames+' source frames · '+plan.assets.spin_frames+' rendered 360 frames · '+plan.assets.studio_photos+' Photo Studio images';const list=$('actionList');list.replaceChildren();plan.actions.forEach(a=>appendAction(list,a.label,a.state));plan.warnings.forEach(w=>list.append(node('div','notice warn',w)));const jobs=await loadVehicleJobs(activeVin);jobs.forEach(j=>appendAction(list,j.kind.replaceAll('_',' '),j.status+' · '+(j.step||'')+' · '+(j.message||'')));}catch(e){$('vehicleSummary').className='notice bad';$('vehicleSummary').textContent=e.message;}}
 $('vehicleSelect').addEventListener('change',selectVehicle);
 $('refreshHealth').addEventListener('click',loadHealth);
+$('sceneImage').addEventListener('change',syncSceneButton);
+$('sceneSelect').addEventListener('change',syncSceneButton);
+$('sceneEngine').addEventListener('change',updateSceneHelp);
+$('sceneBtn').addEventListener('click',async()=>{if(!activeVin||!$('sceneImage').value)return;const btn=$('sceneBtn'),box=$('sceneOutput');btn.dataset.busy='true';syncSceneButton();box.className='notice';box.textContent='Rendering the selected photo…';try{const result=await getJson('/api/photo/composite',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image_path:$('sceneImage').value,scene:$('sceneSelect').value,engine:$('sceneEngine').value})});box.className='notice'+(result.ai_generated?' warn':'');box.replaceChildren(node('div','',result.ai_generated?'AI-generated result ready. Review vehicle identity and details before sharing.':'Local composite ready.'));const preview=node('img','scene-preview');preview.src=result.output;preview.alt=result.ai_generated?'AI-generated vehicle scene for manual review':'Locally composited vehicle scene';preview.loading='lazy';preview.decoding='async';const link=node('a','btn secondary','Open rendered image');link.href=result.output;link.target='_blank';link.rel='noopener';box.append(preview,link);}catch(e){box.className='notice bad';box.textContent=e.message;}finally{delete btn.dataset.busy;syncSceneButton();}});
 $('buildBtn').addEventListener('click',async()=>{if(!activeVin)return;const btn=$('buildBtn');btn.disabled=true;try{const fd=new FormData();fd.append('background_slug',$('backgroundSelect').value);fd.append('turntable_style','studio_shadow');await getJson('/api/vehicle/'+encodeURIComponent(activeVin)+'/background',{method:'POST',body:fd});const result=await getJson('/api/studio/vehicles/'+encodeURIComponent(activeVin)+'/run',{method:'POST'});$('vehicleSummary').className='notice';$('vehicleSummary').textContent=result.message||'360 build started.';if(polling)clearInterval(polling);polling=setInterval(async()=>{try{const s=await getJson('/api/finalize-status/'+encodeURIComponent(activeVin));$('vehicleSummary').textContent=s.status+' · '+s.spin_frames+' frames · '+(s.message||'');if(s.status==='completed'||s.status==='degraded'||s.status==='error'){clearInterval(polling);polling=null;btn.disabled=false;await selectVehicle();}}catch(e){clearInterval(polling);polling=null;btn.disabled=false;$('vehicleSummary').className='notice bad';$('vehicleSummary').textContent=e.message;}},1800);}catch(e){btn.disabled=false;$('vehicleSummary').className='notice bad';$('vehicleSummary').textContent=e.message;}});
 $('photoBtn').addEventListener('click',async()=>{if(!activeVin)return;const btn=$('photoBtn');btn.disabled=true;try{const result=await getJson('/api/vehicle/'+encodeURIComponent(activeVin)+'/process-photos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({background:$('backgroundSelect').value,upscale:false})});$('vehicleSummary').className='notice';$('vehicleSummary').textContent=result.message||'Photo Studio job started. Check the job summary below.';setTimeout(selectVehicle,1300);}catch(e){$('vehicleSummary').className='notice bad';$('vehicleSummary').textContent=e.message;}finally{btn.disabled=false;}});
-loadHealth();loadBackgrounds();loadVehicles();
+updateSceneHelp();loadHealth();loadBackgrounds();loadSceneCatalog();loadVehicles();
 </script>
 </body></html>"""
+
+
+_SCENE_INPUT_DIRECTORIES = ("exterior", "raw", "source", "studio")
+_SCENE_INPUT_LIMIT = 72
+_SCENE_INPUT_SCAN_LIMIT = 4096
+_SCENE_INPUT_VALIDATION_BYTES = 200 * 1024 * 1024
+_SCENE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
+
+
+def _list_vehicle_scene_inputs(main_module, vin: str) -> list[dict]:
+    """Enumerate a bounded list of verified image references for an owned vehicle."""
+    from PIL import Image
+
+    directories: dict[str, Path] = {}
+
+    def candidates():
+        scanned = 0
+        for directory_name in _SCENE_INPUT_DIRECTORIES:
+            try:
+                directory = main_module._ensure_safe_vehicle_subdir(vin, directory_name)
+            except HTTPException as exc:
+                if exc.status_code == 404:
+                    continue
+                raise
+            directories[directory_name] = directory
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        if scanned >= _SCENE_INPUT_SCAN_LIMIT:
+                            return
+                        scanned += 1
+                        try:
+                            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                                continue
+                        except OSError:
+                            continue
+                        filename = entry.name
+                        if filename.startswith("."):
+                            continue
+                        candidate = Path(filename)
+                        if (
+                            candidate.suffix.lower() not in _SCENE_IMAGE_SUFFIXES
+                            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", candidate.stem)
+                        ):
+                            continue
+                        yield directory_name, filename
+            except OSError:
+                continue
+
+    selected = heapq.nsmallest(_SCENE_INPUT_SCAN_LIMIT, candidates())
+    images = []
+    validated_bytes = 0
+    max_file_bytes = int(main_module.MAX_PHOTO_MB) * 1024 * 1024
+    for directory_name, filename in selected:
+        directory = directories.get(directory_name)
+        if directory is None:
+            continue
+        candidate = directory / filename
+        if candidate.is_symlink():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            file_size = resolved.stat().st_size
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if (
+            resolved.parent != directory
+            or not resolved.is_file()
+            or file_size <= 0
+            or file_size > max_file_bytes
+            or validated_bytes + file_size > _SCENE_INPUT_VALIDATION_BYTES
+        ):
+            continue
+        validated_bytes += file_size
+        try:
+            with Image.open(resolved) as image:
+                width, height = image.size
+                if (
+                    width <= 0
+                    or height <= 0
+                    or width * height > int(main_module.MAX_UPLOAD_IMAGE_PIXELS)
+                ):
+                    continue
+                image.verify()
+        except Exception:
+            continue
+        image_ref = f"/storage/{vin}/{directory_name}/{filename}"
+        images.append({
+            "path": image_ref,
+            "directory": directory_name,
+            "filename": filename,
+            "label": f"{directory_name.title()} · {filename}",
+        })
+        if len(images) >= _SCENE_INPUT_LIMIT:
+            break
+    return images
 
 
 def _binary_available(value: str) -> bool:
@@ -429,6 +543,24 @@ def register_studio_agent(app: FastAPI) -> None:
         if not vehicle or vehicle.get("status", "active") != "active":
             raise HTTPException(status_code=404, detail="Vehicle not found")
         return {"vin": normalized, "jobs": main_module._read_pipeline_jobs(normalized)}
+
+    @app.get("/api/studio/vehicles/{vin}/scene-inputs")
+    def vehicle_scene_inputs(vin: str, request: Request):
+        import main as main_module
+        normalized = main_module.validate_vehicle_id(vin)
+        main_module._require_vehicle_owner(request, normalized)
+        vehicle = main_module.db_get_vehicle(normalized)
+        if not vehicle or vehicle.get("status", "active") != "active":
+            raise HTTPException(status_code=404, detail="Vehicle not found")
+        images = _list_vehicle_scene_inputs(main_module, normalized)
+        return {
+            "vin": normalized,
+            "images": images,
+            "count": len(images),
+            "limit": _SCENE_INPUT_LIMIT,
+            "scan_limit": _SCENE_INPUT_SCAN_LIMIT,
+            "validation_bytes_limit": _SCENE_INPUT_VALIDATION_BYTES,
+        }
 
     @app.post("/api/studio/vehicles/{vin}/run")
     def run_vehicle_studio(vin: str, request: Request):
