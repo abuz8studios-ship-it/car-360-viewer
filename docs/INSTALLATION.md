@@ -2,15 +2,18 @@
 
 **Historical hosted verification (2026-10-03):** [CI run 37140754753](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37140754753) and the [hosted matrix run 37140754758](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37140754758) passed on commit `7fa13aa`. The matrix built Windows x64, Intel macOS x64, and Apple Silicon macOS arm64 with the explicit ComfyUI scene bridge. Each ZIP's checksum, manifest, FFmpeg notices/binary hashes, and exclusions for user secrets and model weights were verified before native installer/runtime smoke tests and artifact upload. The three ZIPs and SHA-256 sidecars are in that run's **Artifacts** section with 30-day retention (through 2026-11-02 UTC). This earlier build does not include the current Dealer Studio scene-render UI action. CI run `37175397809` and desktop run `37175397877` for source commit `a35eeab` were blocked before runner steps because GitHub reported that the Actions budget prevents further use; this script-draft addition has local verification only. The preceding scene-action commit `a2352c4` was blocked for the same reason, and earlier attempts on `894bd84` were blocked by an account payment/spending-limit message. The optional ComfyUI workflow and model weights remain owner-supplied and are not packaged. No tag-triggered GitHub Release has been published. Builds are unsigned and macOS artifacts are not notarized; hosted runner smoke tests are not owner acceptance on end-user machines.
 
-## Get a Windows or Mac build from GitHub
+**Current packaging status (2026-10-04):** Linux x86_64 install, archive-verification, and native smoke-test code has been added, but no current-source package is complete. The Linux build staged the app and 40 backgrounds, then stopped before PyInstaller because this sandbox could not download the Git-LFS-backed static FFmpeg 8.0 archive from GitHub's media host (TLS verification/EOF); no ZIP or checksum was produced. Windows and macOS cannot be natively frozen on this Linux host, and the last current-source hosted runs were blocked before runner steps by the Actions budget. The old `7fa13aa` artifacts therefore are not substitutes for current-source installers.
 
-1. Open **Actions → Desktop releases**, then choose a successful run on this branch. The matrix builds and smoke-tests Windows x64, Intel macOS x64, and Apple Silicon macOS arm64; its three ZIPs and SHA-256 sidecars are in the run's **Artifacts** section (30-day retention). A formal GitHub Release is published only by a reviewed `v*` tag; no tag release has been published yet.
+## Get a desktop build
+
+1. Open **Actions → Desktop releases**, then choose a successful run for the exact source commit you intend to install. The current matrix targets Windows x64, Intel macOS x64, Apple Silicon macOS arm64, and Linux x86_64; each job uploads its ZIP and SHA-256 sidecar to the run's **Artifacts** section (30-day retention). The older successful run `37140754758` is only three-platform and does not include current Dealer Studio changes. A formal GitHub Release is published only by a reviewed `v*` tag; no tag release has been published yet.
 2. Download the ZIP matching the computer:
    - `LotVue360-windows-x64.zip` for 64-bit Windows.
    - `LotVue360-macOS-x64.zip` for Intel Macs.
    - `LotVue360-macOS-arm64.zip` for Apple Silicon Macs.
-3. Download its adjacent `.zip.sha256` file and verify the checksum before running the installer. On macOS, run `shasum -a 256 -c LotVue360-macOS-x64.zip.sha256` for Intel or `shasum -a 256 -c LotVue360-macOS-arm64.zip.sha256` for Apple Silicon, beside the matching ZIP. On Windows, run `certutil -hashfile LotVue360-windows-x64.zip SHA256` and compare its hash with the first value in the sidecar. A checksum verifies file integrity, not publisher identity or a digital signature.
-4. Extract the complete ZIP and open its top-level folder (`LotVue360` on Windows; `LotVue360-macOS-x64` or `LotVue360-macOS-arm64` on Mac).
+   - `LotVue360-linux-x64.zip` for 64-bit x86 Linux.
+3. Download its adjacent `.zip.sha256` file and verify the checksum before running the installer. On Linux, run `sha256sum -c LotVue360-linux-x64.zip.sha256` beside the matching ZIP. On macOS, run `shasum -a 256 -c LotVue360-macOS-x64.zip.sha256` for Intel or `shasum -a 256 -c LotVue360-macOS-arm64.zip.sha256` for Apple Silicon. On Windows, run `certutil -hashfile LotVue360-windows-x64.zip SHA256` and compare its hash with the first value in the sidecar. A checksum verifies file integrity, not publisher identity or a digital signature.
+4. Extract the complete ZIP and open its top-level folder (`LotVue360` on Windows/Linux; `LotVue360-macOS-x64` or `LotVue360-macOS-arm64` on Mac).
 
 ### Windows
 
@@ -23,6 +26,12 @@ Windows may display a SmartScreen warning because these builds are not Authentic
 Double-click `Install-LotVue360.command` or run `bash install-lotvue.sh`. By default, the app is installed for the current user in `~/Applications/LotVue360.app`; no administrator permission is needed. `bash install-lotvue.sh --no-open` installs without opening it. `--applications` targets `/Applications` and may require an administrator account. The installer intentionally does **not** remove macOS quarantine attributes.
 
 The app is not Developer ID-signed or notarized. If Gatekeeper blocks it, use Finder to right-click **LotVue360.app**, choose **Open**, and confirm the dialog. If the dialog is not available, stop and obtain a signed build from the owner; do not disable Gatekeeper globally.
+
+### Linux x86_64
+
+Extract the complete `LotVue360-linux-x64.zip`, then run `Install-LotVue360.sh` from its top-level `LotVue360` folder (double-click it if your file manager offers **Run**, or use `./Install-LotVue360.sh` in a terminal). The installer does not need `sudo` or a separate Python install: it places the self-contained app under `~/.local/opt/LotVue360`, adds a desktop-menu entry under `${XDG_DATA_HOME:-$HOME/.local/share}/applications`, and starts Dealer Studio in the system browser. It supports x86_64 Linux only; a browser and a usable graphical desktop session are still required.
+
+Run `~/.local/opt/LotVue360/Uninstall-LotVue360.sh` to remove the app and menu entry. The uninstall keeps the database, settings, local secret, and uploads under `${XDG_DATA_HOME:-~/.local/share}/LotVue360`. Data removal is a separate destructive action: add `--remove-data` and confirm the prompt, or use `--remove-data --yes` only when you deliberately want to delete that data. If you installed to a custom prefix, pass the same `--prefix DIR` to the uninstaller.
 
 ## What is bundled (and what is not)
 
@@ -40,7 +49,8 @@ The embedded app opens Dealer Studio and serves the web UI only on the local mac
 |---|---|---|
 | Windows | `%LOCALAPPDATA%\Programs\LotVue360` | `%LOCALAPPDATA%\LotVue360` |
 | macOS | `~/Applications/LotVue360.app` | `~/Library/Application Support/LotVue360` |
-| Linux source/frozen fallback | bundle/source directory | `${XDG_DATA_HOME:-~/.local/share}/LotVue360` for frozen builds |
+| Linux x86_64 | `~/.local/opt/LotVue360` | `${XDG_DATA_HOME:-$HOME/.local/share}/LotVue360` |
+| Linux source run | repository app directory | `app/` by default; override with `LOTVUE_DATA_DIR` |
 
 On Windows/macOS the first run makes `%LOCALAPPDATA%\LotVue360\.env` or `~/Library/Application Support/LotVue360/.env` from the bundled blank template. The app creates a private per-install JWT secret if one is not configured. Back up the complete user-data folder before uninstalling or changing computers. Do not copy that folder into GitHub issues, diagnostic bundles, or public storage.
 
@@ -91,10 +101,11 @@ Build only on the target OS/architecture with Python 3.11–3.13 and the matchin
 python -m pip install -c requirements-release-constraints.txt -r requirements-desktop.txt
 python scripts/build_desktop.py --platform windows  # Windows x64
 python scripts/build_desktop.py --platform macos    # macOS Intel or Apple Silicon host
+python scripts/build_desktop.py --platform linux    # Linux x86_64
 ```
 
-The script stages app source into a temporary clean directory, generates background assets there, obtains static FFmpeg/FFprobe for the current OS, runs PyInstaller, and emits a ZIP plus SHA-256 checksum under `dist/desktop-release/`. GitHub Actions installs the CPython 3.11 package constraints in `requirements-release-constraints.txt`, verifies the ZIP checksum, manifest, bundled FFmpeg binaries/notices, and excluded secrets/models, then extracts and smoke-tests the app before uploading. Platform-only runner dependencies may resolve separately. The script never runs `app/build_env.py` and does not copy `.env`, JWT keys, database files, uploads, Android signing keys, or old workstation build outputs. Building locally is not a signature or notarization step.
+The script stages app source into a temporary clean directory, generates background assets there, obtains static FFmpeg/FFprobe for the current OS, runs PyInstaller, and emits a ZIP plus SHA-256 checksum under `dist/desktop-release/`. The release matrix includes Windows x64, Intel and Apple Silicon macOS, and Linux x86_64; each job verifies the ZIP checksum, manifest, bundled FFmpeg binaries/notices, and excluded secrets/models, then extracts, installs, and smoke-tests the app before upload. Platform-only runner dependencies may resolve separately. The script never runs `app/build_env.py` and does not copy `.env`, JWT keys, database files, uploads, Android signing keys, or old workstation build outputs. Building locally is not a signature or notarization step.
 
 ## Owner actions still required
 
-The hosted matrix has passed, but before a customer-facing `v*` release the owner should independently download and inspect the artifacts, review their manifests, FFmpeg notices, and checksums; generate/review a version-specific dependency-license or SBOM report; and test install/update/removal on representative end-user Windows and Intel/Apple-Silicon Mac computers. If signed public installers are intended, the owner must provide Apple Developer ID/Notary and Windows code-signing credentials through GitHub secrets; this workflow does not fabricate signatures or claim notarization. External provider credentials, account approvals, pricing decisions, and model-license clearance remain owner-provided.
+The hosted matrix has passed, but before a customer-facing `v*` release the owner should independently download and inspect the artifacts, review their manifests, FFmpeg notices, and checksums; generate/review a version-specific dependency-license or SBOM report; and test install/update/removal on representative end-user Windows, Intel/Apple-Silicon Mac, and Linux x86_64 computers. If signed public installers are intended, the owner must provide Apple Developer ID/Notary and Windows code-signing credentials through GitHub secrets; this workflow does not fabricate signatures or claim notarization. External provider credentials, account approvals, pricing decisions, and model-license clearance remain owner-provided.

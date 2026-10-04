@@ -50,6 +50,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x64
           - runner: windows-2022
             platform: windows
             arch: x64
@@ -141,8 +144,10 @@ jobs:
         run: |
           if [[ "${{ matrix.platform }}" == "windows" ]]; then
             archive='dist/desktop-release/LotVue360-windows-x64.zip'
-          else
+          elif [[ "${{ matrix.platform }}" == "macos" ]]; then
             archive="dist/desktop-release/LotVue360-macOS-${{ matrix.arch }}.zip"
+          else
+            archive="dist/desktop-release/LotVue360-linux-${{ matrix.arch }}.zip"
           fi
           python scripts/verify_desktop_artifact.py \
             --archive "$archive" \
@@ -217,6 +222,40 @@ jobs:
           test -d "$HOME/Library/Application Support/LotVue360"
           rm -rf "$HOME/Applications/LotVue360.app"
           test ! -e "$HOME/Applications/LotVue360.app"
+      - name: Smoke-test Linux installer and frozen runtime
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke="$RUNNER_TEMP/lotvue-linux-smoke"
+          home="$smoke/home with spaces"
+          data_home="$home/XDG data"
+          prefix="$home/local app"
+          mkdir -p "$smoke/extracted" "$home"
+          export HOME="$home" XDG_DATA_HOME="$data_home"
+          unzip -q "dist/desktop-release/LotVue360-linux-${{ matrix.arch }}.zip" -d "$smoke/extracted"
+          PACKAGE="$smoke/extracted/LotVue360"
+          HOME="$home" XDG_DATA_HOME="$data_home" \
+            "$PACKAGE/Install-LotVue360.sh" --prefix "$prefix" --no-open
+
+          INSTALL_ROOT="$prefix/LotVue360"
+          DATA="$data_home/LotVue360"
+          test -x "$INSTALL_ROOT/LotVue360"
+          LOTVUE_DATA_DIR="$DATA" "$INSTALL_ROOT/LotVue360" --self-test
+          grep -q 'packaged self-test passed:' "$DATA/desktop_launch.log"
+          printf 'keep on normal uninstall\n' > "$DATA/uninstall-check.txt"
+          HOME="$home" XDG_DATA_HOME="$data_home" \
+            "$INSTALL_ROOT/Uninstall-LotVue360.sh" --prefix "$prefix"
+          test ! -e "$INSTALL_ROOT"
+          test -f "$DATA/uninstall-check.txt"
+          test ! -e "$data_home/applications/lotvue360.desktop"
+
+          HOME="$home" XDG_DATA_HOME="$data_home" \
+            "$PACKAGE/Install-LotVue360.sh" --prefix "$prefix" --no-open
+          HOME="$home" XDG_DATA_HOME="$data_home" \
+            "$INSTALL_ROOT/Uninstall-LotVue360.sh" --prefix "$prefix" --remove-data --yes
+          test ! -e "$INSTALL_ROOT"
+          test ! -e "$DATA"
       - name: Upload verified platform artifact
         uses: actions/upload-artifact@v4
         with:

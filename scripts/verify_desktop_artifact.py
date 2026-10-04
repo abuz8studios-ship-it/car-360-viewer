@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -99,6 +100,16 @@ def _require(entries: set[str], path: str) -> None:
         raise ArtifactVerificationError(f"Required archive file is missing: {path}")
 
 
+def _require_executable(archive: zipfile.ZipFile, path: str) -> None:
+    try:
+        info = archive.getinfo(path)
+    except KeyError as exc:
+        raise ArtifactVerificationError(f"Required executable is missing: {path}") from exc
+    mode = (info.external_attr >> 16) & 0o777
+    if info.create_system != 3 or not mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+        raise ArtifactVerificationError(f"Linux installer payload is not marked executable: {path}")
+
+
 def _text(archive: zipfile.ZipFile, path: str) -> str:
     try:
         return archive.read(path).decode("utf-8")
@@ -115,12 +126,19 @@ def _app_bundle_paths(platform_name: str, package_root: str) -> tuple[str, str, 
             f"{package_root}/Install-LotVue360.cmd",
             f"{package_root}/Uninstall-LotVue360.ps1",
         )
-    else:
+    elif platform_name == "macos":
         app_prefix = f"{package_root}/LotVue360.app/Contents/Resources/app"
         launcher = f"{package_root}/LotVue360.app/Contents/MacOS/LotVue360"
         installers = (
             f"{package_root}/install-lotvue.sh",
             f"{package_root}/Install-LotVue360.command",
+        )
+    else:
+        app_prefix = f"{package_root}/app"
+        launcher = f"{package_root}/LotVue360"
+        installers = (
+            f"{package_root}/Install-LotVue360.sh",
+            f"{package_root}/Uninstall-LotVue360.sh",
         )
     return app_prefix, launcher, installers
 
@@ -133,12 +151,14 @@ def verify_desktop_artifact(
     expected_build_id: str,
 ) -> dict[str, object]:
     """Verify a platform archive and return a compact summary for CI logs."""
-    if platform_name not in {"windows", "macos"}:
+    if platform_name not in {"windows", "macos", "linux"}:
         raise ArtifactVerificationError(f"Unsupported desktop platform: {platform_name}")
     if platform_name == "windows" and architecture != "x64":
         raise ArtifactVerificationError("The current Windows desktop build supports x64 only")
     if platform_name == "macos" and architecture not in {"x64", "arm64"}:
         raise ArtifactVerificationError(f"Unsupported macOS architecture: {architecture}")
+    if platform_name == "linux" and architecture != "x64":
+        raise ArtifactVerificationError("The current Linux desktop release supports x64 only")
 
     archive_path = archive_path.resolve()
     if not archive_path.is_file():
@@ -154,16 +174,19 @@ def verify_desktop_artifact(
     if actual_checksum.lower() != sidecar[0].lower():
         raise ArtifactVerificationError("Artifact ZIP SHA-256 does not match its sidecar")
 
-    expected_archive_name = (
-        "LotVue360-windows-x64.zip"
-        if platform_name == "windows"
-        else f"LotVue360-macOS-{architecture}.zip"
-    )
+    if platform_name == "windows":
+        expected_archive_name = "LotVue360-windows-x64.zip"
+        package_root = "LotVue360"
+    elif platform_name == "macos":
+        expected_archive_name = f"LotVue360-macOS-{architecture}.zip"
+        package_root = f"LotVue360-macOS-{architecture}"
+    else:
+        expected_archive_name = f"LotVue360-linux-{architecture}.zip"
+        package_root = "LotVue360"
     if archive_path.name != expected_archive_name:
         raise ArtifactVerificationError(
             f"Artifact name does not match target platform: expected {expected_archive_name}"
         )
-    package_root = "LotVue360" if platform_name == "windows" else f"LotVue360-macOS-{architecture}"
     app_prefix, launcher, installer_paths = _app_bundle_paths(platform_name, package_root)
 
     try:
@@ -255,6 +278,9 @@ def verify_desktop_artifact(
             ]
             for path in required_files:
                 _require(file_entries, path)
+            if platform_name == "linux":
+                for path in (launcher, *installer_paths):
+                    _require_executable(archive, path)
 
             # Scan the complete archive, not only staged app source: a frozen runtime or
             # root-level installer payload must not smuggle in a model or user secret.
@@ -309,7 +335,7 @@ def verify_desktop_artifact(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, required=True)
-    parser.add_argument("--platform", choices=("windows", "macos"), required=True)
+    parser.add_argument("--platform", choices=("windows", "macos", "linux"), required=True)
     parser.add_argument("--architecture", choices=("x64", "arm64"), required=True)
     parser.add_argument("--build-id", required=True)
     args = parser.parse_args()
