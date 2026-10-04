@@ -343,7 +343,11 @@ def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, mo
     import a2_extensions
 
     storage = tmp_path / "storage"
-    (storage / VIN / "exterior").mkdir(parents=True)
+    exterior = storage / VIN / "exterior"
+    exterior.mkdir(parents=True)
+    source_photo = Image.new("RGBA", (8, 8), (190, 40, 35, 255))
+    source_photo.save(exterior / "frame_0001.png")
+    source_photo.close()
     db_path = tmp_path / "studio-auth.sqlite3"
     monkeypatch.setattr(main, "STORAGE_DIR", storage)
     monkeypatch.setattr(main, "DB_PATH", db_path)
@@ -364,9 +368,69 @@ def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, mo
     assert client.get(f"/api/studio/vehicles/{VIN}/plan").status_code == 401
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
     other_headers = {"Authorization": f"Bearer {other_token}"}
-    assert client.get("/studio", headers=owner_headers).status_code == 200
+    studio_page = client.get("/studio", headers=owner_headers)
+    assert studio_page.status_code == 200
+    assert 'id="sceneImage"' in studio_page.text
+    assert 'id="sceneEngine"' in studio_page.text
+    assert "scene-preview" in studio_page.text
+    assert "'/api/photo/composite'" in studio_page.text
     assert client.get(f"/api/studio/vehicles/{VIN}/plan", headers=owner_headers).status_code == 200
+    scene_inputs = client.get(f"/api/studio/vehicles/{VIN}/scene-inputs", headers=owner_headers)
+    assert scene_inputs.status_code == 200
+    assert scene_inputs.json()["images"][0]["path"] == f"/storage/{VIN}/exterior/frame_0001.png"
+    assert scene_inputs.json()["limit"] == 72
+    assert scene_inputs.json()["scan_limit"] == 4096
+    assert scene_inputs.json()["validation_bytes_limit"] == 200 * 1024 * 1024
     assert client.get(f"/api/studio/vehicles/{VIN}/plan", headers=other_headers).status_code == 404
+    assert client.get(f"/api/studio/vehicles/{VIN}/scene-inputs", headers=other_headers).status_code == 404
+
+
+def test_scene_input_enumeration_skips_symlinks_and_caps_results(tmp_path, monkeypatch) -> None:
+    storage = tmp_path / "storage"
+    vehicle = storage / VIN
+    exterior = vehicle / "exterior"
+    raw = vehicle / "raw"
+    exterior.mkdir(parents=True)
+    raw.mkdir(parents=True)
+    monkeypatch.setattr(main, "STORAGE_DIR", storage)
+
+    jpg_template = tmp_path / "valid.jpg"
+    jpg_sample = Image.new("RGB", (8, 8), (180, 35, 25))
+    jpg_sample.save(jpg_template, format="JPEG")
+    jpg_sample.close()
+    jpg_bytes = jpg_template.read_bytes()
+    jpg_template.unlink()
+    png_template = tmp_path / "valid.png"
+    png_sample = Image.new("RGBA", (8, 8), (180, 35, 25, 255))
+    png_sample.save(png_template, format="PNG")
+    png_sample.close()
+    png_bytes = png_template.read_bytes()
+    png_template.unlink()
+    for index in range(60):
+        (exterior / f"ext_{index:03d}.jpg").write_bytes(jpg_bytes)
+    for index in range(30):
+        (raw / f"raw_{index:03d}.png").write_bytes(png_bytes)
+    (exterior / "notes.txt").write_text("not an image", encoding="utf-8")
+    (exterior / ".hidden.png").write_bytes(png_bytes)
+    (exterior / "broken.jpg").write_bytes(b"not actually an image")
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(png_bytes)
+    (exterior / "aaa_link.png").symlink_to(outside)
+
+    images = studio_agent._list_vehicle_scene_inputs(main, VIN)
+
+    assert len(images) == 72
+    assert images[0]["path"] == f"/storage/{VIN}/exterior/ext_000.jpg"
+    assert all(image["path"].startswith(f"/storage/{VIN}/") for image in images)
+    assert not any("aaa_link" in image["filename"] for image in images)
+    assert not any(image["filename"].startswith(".") for image in images)
+    assert not any(image["filename"] == "broken.jpg" for image in images)
+
+    monkeypatch.setattr(studio_agent, "_SCENE_INPUT_SCAN_LIMIT", 5)
+    assert len(studio_agent._list_vehicle_scene_inputs(main, VIN)) <= 5
+    monkeypatch.setattr(studio_agent, "_SCENE_INPUT_SCAN_LIMIT", 4096)
+    monkeypatch.setattr(studio_agent, "_SCENE_INPUT_VALIDATION_BYTES", 10)
+    assert studio_agent._list_vehicle_scene_inputs(main, VIN) == []
 
 
 def test_google_feed_readiness_matches_static_route_requirements(monkeypatch) -> None:

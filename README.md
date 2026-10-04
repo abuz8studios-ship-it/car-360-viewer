@@ -8,6 +8,8 @@ Built by Ahmad Odeh / ABUZ8 LLC (Dayton, Ohio). Product price remains **undecide
 
 The cross-platform PyInstaller workflow has produced Windows x64, Intel macOS x64, and Apple Silicon macOS arm64 ZIP artifacts. [CI run 37140754753](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37140754753) and [desktop matrix run 37140754758](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37140754758) passed on commit `7fa13aa`, including the explicit ComfyUI scene bridge. Each ZIP's checksum, manifest, FFmpeg/FFprobe hashes and notices, and secret/model exclusions were verified before native installer/runtime smoke tests and artifact upload. These are 30-day Actions artifacts (through 2026-11-02 UTC); no tag-triggered GitHub Release has been published. A push to this session branch triggers the matrix, and only a `v*` tag publishes a release. The workflow can also be run manually after it is present on the default branch.
 
+**Current source update (2026-10-03):** Dealer Studio now has a per-vehicle scene-render action that reuses `POST /api/photo/composite`, with an authenticated, owner-scoped image picker, explicit local/ComfyUI choice, scene selection, and a public-storage/manual-review warning. The current edit passed 176 local tests plus lint, compilation, dependency, diff, and inline-JavaScript syntax checks. No hosted build is claimed for this UI change: the last successful three-platform artifacts are from `7fa13aa` and do not contain it. CI run `37142425343` and desktop run `37142425376` on `894bd84` were blocked before runner steps by GitHub's account payment/spending-limit message.
+
 The installers are per-user, keep writable data outside read-only bundle resources, include the Python runtime, declared core dependencies, FFmpeg/FFprobe, and the generated 40-background catalog. RemBG/ONNX runtime libraries are included, but **no background-removal checkpoint is selected or bundled by default**; operators must verify a model's commercial terms and explicitly enable it before weights are fetched. CUDA/ComfyUI/WAN model weights, COLMAP/Brush, paid service credentials, dealership/provider approvals, signatures, and notarization are not bundled.
 
 For exact platform install steps and limitations, see [`docs/INSTALLATION.md`](docs/INSTALLATION.md). For evidence boundaries, resource caps, tests, and remaining owner-gated risks, see [`ENGINEERING_AUDIT_2026-10-03.md`](ENGINEERING_AUDIT_2026-10-03.md). Historical workstation notes remain dated evidence; see [`LEDGER_LOG.md`](LEDGER_LOG.md).
@@ -19,7 +21,7 @@ Dealer Studio is a deterministic control plane over the existing engines and rou
 The codebase includes routes and UI for:
 
 - Dealer inventory and capture uploads with request, image-size, pixel, file-count, and worker limits.
-- Photo processing, backdrop catalog, 360-frame/viewer routes, public vehicle pages, and interior/hotspot experiences. Optional ComfyUI scene generation is an explicit API engine at `POST /api/photo/composite`; it requires an owner-supplied API-format workflow, is not yet a Dealer Studio UI action, and labels generated results for review. The default renderer is deterministic and rejects opaque photos when a transparent cut-out is required.
+- Photo processing, backdrop catalog, 360-frame/viewer routes, public vehicle pages, and interior/hotspot experiences. Dealer Studio now connects to `POST /api/photo/composite`: an authenticated vehicle owner selects a stored photo, scene, and explicit local or ComfyUI renderer. The picker returns at most 72 image references while scanning at most 4,096 entries across exterior/raw/source/studio folders; candidate validation is limited to 200 MiB cumulatively, with the existing 30 MiB/file and 40 MP/image guards. ComfyUI requires an owner-supplied API-format workflow; AI results are marked for review but remain on the publicly served `/storage` path, so the warning is advisory—not private staging or access control. The default local renderer is deterministic and rejects opaque photos when a transparent cut-out is required.
 - CRM and lead workflows, import/export routes, and optional marketplace/feed connectors.
 - Optional video, background-removal, and Gaussian/COLMAP integrations whose engines, models, hardware, credentials, and real-world quality vary by installation.
 
@@ -27,7 +29,7 @@ Synthetic route tests verify representative behavior (including tenant isolation
 
 ## Install a desktop build from GitHub
 
-1. Open **Actions → Desktop releases**, choose a successful run on this branch (the current verified build is [37137768181](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37137768181)), and download the matching ZIP plus `.sha256` sidecar from its **Artifacts** section. No tag-triggered GitHub Release has been published yet.
+1. Open **Actions → Desktop releases**, choose a successful run on this branch (the last verified three-platform build is [37140754758](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37140754758), on commit `7fa13aa`), and download the matching ZIP plus `.sha256` sidecar from its **Artifacts** section. These artifacts do not include the newer Dealer Studio scene-action source update. No tag-triggered GitHub Release has been published yet.
 2. Choose the artifact matching the computer:
    - `LotVue360-windows-x64.zip`
    - `LotVue360-macOS-x64.zip` (Intel)
@@ -74,7 +76,7 @@ Stripe remains disabled, public prices remain hidden, and no tier or amount is a
 - Video upload: **500 MiB**; individual photo: **30 MiB**; photo batch: **400 MiB**.
 - Uploaded-image decode limit: **40 megapixels**; a single decoded RGB buffer at that size is already about **114 MiB**, before processing copies.
 - Photo capture/Studio route limit: up to **72 photos**; background jobs default to **2 worker threads / 4 admitted jobs**.
-- Public spin viewer: up to **120 frames**; public media-directory enumeration: up to **300 names**. These are application caps, not total disk quotas.
+- Public spin viewer: up to **120 frames**; public media-directory enumeration: up to **300 names**. The Dealer Studio scene picker returns at most **72 verified image references**, scans at most **4,096 directory entries**, and limits candidate validation to **200 MiB** per request (besides the existing **30 MiB/file / 40 MP** guards). These are application caps, not total disk quotas.
 - Large/file-upload concurrency: **2 per process**; multi-process aggregate load requires separate sizing.
 - ComfyUI scene generation: **1 active job per process**; additional concurrent requests receive `429 Retry-After: 30` rather than building an unbounded queue.
 
