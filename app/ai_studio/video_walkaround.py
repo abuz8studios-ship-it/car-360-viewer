@@ -257,3 +257,11 @@ def generate_walkaround(vin: str, vehicle_info: dict) -> Optional[str]:
 def get_walkaround_status(vin: str) -> dict:
     """Get current walkaround generation status."""
     return _walkaround_status.get(vin, {"status": "none"})
+
+
+def mark_walkaround_failed(vin: str) -> None:
+    """Expose an unexpected worker exception without leaking exception details."""
+    _walkaround_status[vin] = {
+        "status": "error",
+        "error": "Walkaround generation stopped unexpectedly",
+    }

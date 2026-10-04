@@ -401,20 +401,51 @@ def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, mo
     assert client.post(
         f"/api/vehicle/{VIN}/video-ad", headers=other_headers, json={"type": "listing"}
     ).status_code == 404
+    video_walkaround._walkaround_status.pop(VIN, None)
+    previous_video = storage / VIN / "walkaround" / "walkaround.mp4"
+    previous_video.parent.mkdir(parents=True)
+    previous_video.write_bytes(b"previous public walkaround")
     submitted = []
-    monkeypatch.setattr(video_walkaround, "get_walkaround_status", lambda _vin: {"status": "none"})
+    active_job = {"value": False}
+    monkeypatch.setattr(
+        main, "_background_job_running", lambda _key: active_job["value"]
+    )
     monkeypatch.setattr(
         main, "_submit_background_job",
         lambda name, callback: (submitted.append((name, callback)), "started")[1],
     )
+
+    def failed_walkaround(_vin, _vehicle_info):
+        raise RuntimeError("private implementation detail")
+
+    monkeypatch.setattr(video_walkaround, "generate_walkaround", failed_walkaround)
     assert client.post(f"/api/vehicle/{VIN}/walkaround").status_code == 401
     walkaround_start = client.post(f"/api/vehicle/{VIN}/walkaround", headers=owner_headers)
     assert walkaround_start.status_code == 200
     assert walkaround_start.json()["status"] == "started"
     assert submitted[0][0] == f"walkaround:{VIN}"
-    assert client.get(
+    active_job["value"] = True
+    queued_status = client.get(
         f"/api/vehicle/{VIN}/walkaround-status", headers=owner_headers
-    ).json()["status"] == "none"
+    ).json()
+    assert queued_status["status"] == "queued"
+    assert "url" not in queued_status
+    already_running = client.post(
+        f"/api/vehicle/{VIN}/walkaround", headers=owner_headers
+    )
+    assert already_running.status_code == 200
+    assert already_running.json()["status"] == "already_running"
+    try:
+        submitted[0][1]()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Expected the stubbed walkaround engine to fail")
+    failed_status = client.get(
+        f"/api/vehicle/{VIN}/walkaround-status", headers=owner_headers
+    ).json()
+    assert failed_status["status"] == "error"
+    assert failed_status["error"] == "Walkaround generation stopped unexpectedly"
     assert client.get(
         f"/api/vehicle/{VIN}/walkaround-status", headers=other_headers
     ).status_code == 404

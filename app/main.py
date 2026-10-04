@@ -8333,16 +8333,24 @@ def generate_vehicle_walkaround(vin: str, request: Request):
     if not info or info.get("status", "active") != "active":
         raise HTTPException(status_code=404, detail="Vehicle not found")
 
-    from ai_studio.video_walkaround import generate_walkaround, get_walkaround_status
+    from ai_studio.video_walkaround import (
+        generate_walkaround, get_walkaround_status, mark_walkaround_failed,
+    )
 
     status = get_walkaround_status(vin)
-    if status.get("status") == "processing":
+    job_key = f"walkaround:{vin}"
+    active_states = {"starting", "queued", "processing"}
+    if status.get("status") in active_states or _background_job_running(job_key):
         return {"status": "already_running", "progress": status.get("progress", 0)}
 
     def _run():
-        generate_walkaround(vin, info)
+        try:
+            generate_walkaround(vin, info)
+        except Exception:
+            mark_walkaround_failed(vin)
+            raise
 
-    submission = _submit_background_job(f"walkaround:{vin}", _run)
+    submission = _submit_background_job(job_key, _run)
     if submission == "already_running":
         return {"status": "already_running", "progress": status.get("progress", 0)}
     if submission == "busy":
@@ -8361,10 +8369,15 @@ def walkaround_status(vin: str, request: Request):
         raise HTTPException(status_code=404, detail="Vehicle not found")
     from ai_studio.video_walkaround import get_walkaround_status
     status = get_walkaround_status(vin)
+    status_name = status.get("status")
+    active_states = {"starting", "queued", "processing"}
+    job_running = _background_job_running(f"walkaround:{vin}")
+    if job_running and status_name not in active_states and status_name != "error":
+        return {"status": "queued", "progress": 0, "step": "Waiting for a background worker"}
 
-    # Also check if video already exists
+    # A previous public output must not hide an active job or a newer failure.
     video_path = STORAGE_DIR / vin / "walkaround" / "walkaround.mp4"
-    if video_path.exists() and status.get("status") != "processing":
+    if video_path.exists() and status_name not in active_states and status_name != "error":
         size_mb = round(video_path.stat().st_size / (1024 * 1024), 1)
         return {
             "status": "done",
