@@ -374,6 +374,8 @@ def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, mo
     assert 'id="sceneEngine"' in studio_page.text
     assert "scene-preview" in studio_page.text
     assert "'/api/photo/composite'" in studio_page.text
+    assert 'id="videoScriptBtn"' in studio_page.text
+    assert "'/api/vehicle/'+encodeURIComponent(vin)+'/video-ad'" in studio_page.text
     assert client.get(f"/api/studio/vehicles/{VIN}/plan", headers=owner_headers).status_code == 200
     scene_inputs = client.get(f"/api/studio/vehicles/{VIN}/scene-inputs", headers=owner_headers)
     assert scene_inputs.status_code == 200
@@ -381,6 +383,20 @@ def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, mo
     assert scene_inputs.json()["limit"] == 72
     assert scene_inputs.json()["scan_limit"] == 4096
     assert scene_inputs.json()["validation_bytes_limit"] == 200 * 1024 * 1024
+    assert client.post(f"/api/vehicle/{VIN}/video-ad", json={"type": "listing"}).status_code == 401
+    video_script = client.post(
+        f"/api/vehicle/{VIN}/video-ad", headers=owner_headers, json={"type": "social"}
+    )
+    assert video_script.status_code == 200
+    assert video_script.json()["script"]["ad_type"] == "social"
+    assert video_script.json()["script"]["total_duration"] == 15
+    assert len(video_script.json()["script"]["scenes"]) == 4
+    assert client.post(
+        f"/api/vehicle/{VIN}/video-ad", headers=owner_headers, json={"type": "unknown"}
+    ).status_code == 422
+    assert client.post(
+        f"/api/vehicle/{VIN}/video-ad", headers=other_headers, json={"type": "listing"}
+    ).status_code == 404
     assert client.get(f"/api/studio/vehicles/{VIN}/plan", headers=other_headers).status_code == 404
     assert client.get(f"/api/studio/vehicles/{VIN}/scene-inputs", headers=other_headers).status_code == 404
 
