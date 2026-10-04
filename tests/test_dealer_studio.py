@@ -415,6 +415,13 @@ def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, mo
     public_media = client.get(f"/storage/{VIN}/walkaround/walkaround.mp4")
     assert public_media.status_code == 200
     assert public_media.content == b"previous public walkaround"
+    hidden_work_dir = previous_video.parent / ".walkaround-work-regression"
+    hidden_work_dir.mkdir()
+    hidden_clip = hidden_work_dir / "clip_front.mp4"
+    hidden_clip.write_bytes(b"private intermediate")
+    hidden_url = f"/storage/{VIN}/walkaround/.walkaround-work-regression/clip_front.mp4"
+    assert client.get(hidden_url).status_code == 404
+    assert client.get(hidden_url, headers=owner_headers).status_code == 404
     submitted = []
     active_job = {"value": False}
     monkeypatch.setattr(
