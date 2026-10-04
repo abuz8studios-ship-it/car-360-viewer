@@ -15,8 +15,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from PIL import Image
@@ -120,6 +121,32 @@ def _source_photo_is_valid(path: Path, max_image_pixels: int) -> bool:
     except Exception:
         return False
     return True
+
+
+def _safe_comfy_output_file(filename: str) -> Path | None:
+    """Resolve a service-returned filename beneath ComfyUI output, rejecting links."""
+    if not isinstance(filename, str) or not filename or len(filename) > 512:
+        return None
+    normalized = filename.replace("\\", "/")
+    relative = PurePosixPath(normalized)
+    if relative.is_absolute() or any(
+        part in {"", ".", ".."} or part.startswith(".") or ":" in part
+        for part in relative.parts
+    ):
+        return None
+    try:
+        root = Path(COMFY_OUTPUT).resolve(strict=True)
+        candidate = root
+        for part in relative.parts:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                return None
+        resolved = candidate.resolve(strict=True)
+        if resolved.is_relative_to(root) and resolved.is_file():
+            return resolved
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return None
 
 
 def _angles_from_names(
@@ -240,9 +267,11 @@ def generate_tts_voiceover(text: str, output_path: str) -> bool:
                 if status.get("completed"):
                     for _, o in h[prompt_id].get("outputs", {}).items():
                         for a in o.get("audio", []):
-                            src = os.path.join(str(COMFY_OUTPUT), a["filename"])
-                            shutil.copy2(src, output_path)
-                            return True
+                            src = _safe_comfy_output_file(a.get("filename", ""))
+                            if src is not None:
+                                shutil.copy2(src, output_path)
+                                if Path(output_path).is_file() and Path(output_path).stat().st_size > 0:
+                                    return True
                 if status.get("status_str") == "error":
                     break
     except Exception as e:
@@ -250,13 +279,158 @@ def generate_tts_voiceover(text: str, output_path: str) -> bool:
 
     # Fallback: generate 5 seconds of silence
     try:
-        subprocess.run([
+        result = subprocess.run([
             FFMPEG, "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
             "-t", "5", "-y", output_path
         ], capture_output=True, timeout=10)
-        return True
+        output = Path(output_path)
+        return result.returncode == 0 and output.is_file() and output.stat().st_size > 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def _assemble_walkaround(
+    clips: list[Path],
+    voiceover_path: Path,
+    output_video: Path,
+    working_dir: Path,
+) -> bool:
+    """Assemble to a hidden staging file and atomically replace the public video."""
+    if not clips:
+        return False
+    staging_path = None
+    try:
+        concat_file = working_dir / "concat.txt"
+        with concat_file.open("w", encoding="utf-8") as stream:
+            for clip in clips:
+                concat_path = str(clip).replace("\\", "\\\\").replace("'", "\\'")
+                stream.write(f"file '{concat_path}'\n")
+
+        descriptor, staging_name = tempfile.mkstemp(
+            prefix=".walkaround-", suffix=".pending.mp4", dir=working_dir
+        )
+        os.close(descriptor)
+        staging_path = Path(staging_name)
+        command = [
+            FFMPEG,
+            "-f", "concat", "-safe", "0", "-i", str(concat_file),
+        ]
+        if voiceover_path.is_file() and voiceover_path.stat().st_size > 0:
+            command += ["-i", str(voiceover_path), "-map", "0:v", "-map", "1:a", "-shortest"]
+        command += [
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", "-y", str(staging_path),
+        ]
+
+        result = subprocess.run(command, capture_output=True, timeout=120)
+        if result.returncode != 0:
+            return False
+        output_info = os.stat(staging_path, follow_symlinks=False)
+        if not stat.S_ISREG(output_info.st_mode) or output_info.st_size <= 0:
+            return False
+        os.replace(staging_path, output_video)
+        return True
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    finally:
+        if staging_path is not None:
+            try:
+                staging_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _generate_walkaround_in_workdir(
+    vin: str,
+    vehicle_info: dict,
+    angles: dict,
+    walkaround_dir: Path,
+    working_dir: Path,
+) -> Optional[str]:
+    clips = []
+    total_angles = len(angles)
+    factory_dir = str(Path(FACTORY_DIR).resolve())
+    if factory_dir not in sys.path:
+        sys.path.insert(0, factory_dir)
+
+    for index, (angle_name, photo_path) in enumerate(angles.items()):
+        _walkaround_status[vin] = {
+            "status": "processing",
+            "progress": int((index / total_angles) * 70),
+            "step": f"Generating {angle_name} clip ({index + 1}/{total_angles})",
+        }
+        clip_path = working_dir / f"clip_{angle_name}.mp4"
+        try:
+            from factory import render_one
+
+            output_filename = render_one(
+                str(photo_path), ANGLE_PROMPTS.get(angle_name, ANGLE_PROMPTS["front"])
+            )
+            source_clip = _safe_comfy_output_file(output_filename)
+            if source_clip is None:
+                continue
+            shutil.copy2(source_clip, clip_path)
+            if clip_path.is_file() and clip_path.stat().st_size > 0:
+                clips.append(clip_path)
+        except Exception as exc:
+            print(f"[Walkaround] Clip generation failed for {angle_name}: {type(exc).__name__}")
+
+    if not clips:
+        _walkaround_status[vin] = {"status": "error", "error": "No clips generated"}
+        return None
+
+    _walkaround_status[vin] = {
+        "status": "processing", "progress": 75, "step": "Generating voiceover"
+    }
+    tts_text = " ".join(
+        str(vehicle_info.get(field, "") or "").strip()
+        for field in ("year", "make", "model")
+    ).strip()
+    trim = str(vehicle_info.get("trim_level", "") or "").strip()
+    mileage = str(vehicle_info.get("mileage", "") or "").strip()
+    price = str(vehicle_info.get("price", "") or "").strip()
+    if trim:
+        tts_text += f", {trim}"
+    if mileage:
+        tts_text += f", {mileage} miles"
+    if price:
+        tts_text += f", ${price}"
+
+    voiceover_path = working_dir / "voiceover.wav"
+    generate_tts_voiceover(tts_text, str(voiceover_path))
+    _walkaround_status[vin] = {
+        "status": "processing", "progress": 85, "step": "Assembling walkaround video"
+    }
+
+    output_video = walkaround_dir / "walkaround.mp4"
+    if _assemble_walkaround(clips, voiceover_path, output_video, working_dir):
+        size_mb = round(output_video.stat().st_size / (1024 * 1024), 1)
+        _walkaround_status[vin] = {
+            "status": "done",
+            "progress": 100,
+            "step": "complete",
+            "url": f"/storage/{vin}/walkaround/walkaround.mp4",
+            "size_mb": size_mb,
+        }
+        return str(output_video)
+
+    _walkaround_status[vin] = {"status": "error", "error": "Video assembly failed"}
+    return None
+
+
+def _remove_legacy_public_intermediates(walkaround_dir: Path) -> bool:
+    """Remove artifacts left in public storage by earlier walkaround versions."""
+    names = [*(f"clip_{angle}.mp4" for angle in ANGLE_PROMPTS), "voiceover.wav", "concat.txt"]
+    succeeded = True
+    for name in names:
+        legacy_file = walkaround_dir / name
+        try:
+            if legacy_file.is_symlink() or legacy_file.is_file():
+                legacy_file.unlink()
+        except OSError:
+            succeeded = False
+    return succeeded
 
 
 def generate_walkaround(
@@ -270,9 +444,8 @@ def generate_walkaround(
     """
     Generate a full AI walkaround video using bounded, verified source photos.
 
-    Returns path to output video or None on failure. The default input limits
-    match the standard photo-upload configuration; the application route passes
-    its effective photo and pixel limits explicitly.
+    Intermediate clips/audio are kept in a hidden, temporary directory. Only a
+    successfully assembled final MP4 is atomically published under the vehicle.
     """
     _walkaround_status[vin] = {"status": "starting", "progress": 0, "step": "Initializing"}
     validation_bytes_limit = min(
@@ -287,6 +460,11 @@ def generate_walkaround(
         _walkaround_status[vin] = {"status": "error", "error": "Unsafe vehicle media path"}
         return None
     walkaround_dir.mkdir(exist_ok=True)
+    if not _remove_legacy_public_intermediates(walkaround_dir):
+        _walkaround_status[vin] = {
+            "status": "error", "error": "Unable to clean legacy walkaround intermediates"
+        }
+        return None
 
     # Prefer a bounded studio JPEG set; fall back to exterior only when none exist.
     studio_names = _bounded_jpeg_names(studio_dir)
@@ -309,104 +487,18 @@ def generate_walkaround(
         _walkaround_status[vin] = {"status": "error", "error": "No usable photos found"}
         return None
 
-    # Generate video clips for each angle
-    clips = []
-    total_angles = len(angles)
-
-    for i, (angle_name, photo_path) in enumerate(angles.items()):
-        _walkaround_status[vin] = {
-            "status": "processing",
-            "progress": int((i / total_angles) * 70),
-            "step": f"Generating {angle_name} clip ({i+1}/{total_angles})"
-        }
-
-        prompt = ANGLE_PROMPTS.get(angle_name, ANGLE_PROMPTS["front"])
-        clip_path = walkaround_dir / f"clip_{angle_name}.mp4"
-
-        try:
-            # Use factory.py render pattern
-            import sys
-            sys.path.insert(0, str(FACTORY_DIR))
-            from factory import stage_image, render_one
-
-            output_filename = render_one(str(photo_path), prompt)
-            if output_filename:
-                src = COMFY_OUTPUT / output_filename
-                if src.exists():
-                    shutil.copy2(str(src), str(clip_path))
-                    clips.append(str(clip_path))
-        except Exception as e:
-            print(f"[Walkaround] Clip generation failed for {angle_name}: {e}")
-
-    if not clips:
-        _walkaround_status[vin] = {"status": "error", "error": "No clips generated"}
-        return None
-
-    # Generate voiceover
-    _walkaround_status[vin] = {"status": "processing", "progress": 75, "step": "Generating voiceover"}
-
-    year = vehicle_info.get("year", "")
-    make = vehicle_info.get("make", "")
-    model = vehicle_info.get("model", "")
-    trim = vehicle_info.get("trim_level", "")
-    mileage = vehicle_info.get("mileage", "")
-    price = vehicle_info.get("price", "")
-
-    tts_text = f"{year} {make} {model}"
-    if trim:
-        tts_text += f", {trim}"
-    if mileage:
-        tts_text += f", {mileage} miles"
-    if price:
-        tts_text += f", ${price}"
-
-    voiceover_path = str(walkaround_dir / "voiceover.wav")
-    generate_tts_voiceover(tts_text, voiceover_path)
-
-    # FFmpeg stitch
-    _walkaround_status[vin] = {"status": "processing", "progress": 85, "step": "Assembling walkaround video"}
-
-    output_video = str(walkaround_dir / "walkaround.mp4")
-
     try:
-        # Create concat file
-        concat_file = str(walkaround_dir / "concat.txt")
-        with open(concat_file, "w") as f:
-            for clip in clips:
-                f.write(f"file '{clip}'\n")
-
-        cmd = [
-            FFMPEG,
-            "-f", "concat", "-safe", "0", "-i", concat_file,
-        ]
-        if os.path.exists(voiceover_path):
-            cmd += ["-i", voiceover_path, "-map", "0:v", "-map", "1:a", "-shortest"]
-        cmd += [
-            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            "-y", output_video
-        ]
-
-        subprocess.run(cmd, capture_output=True, timeout=120)
-
-        if os.path.exists(output_video):
-            size_mb = round(os.path.getsize(output_video) / (1024 * 1024), 1)
-            _walkaround_status[vin] = {
-                "status": "done",
-                "progress": 100,
-                "step": "complete",
-                "url": f"/storage/{vin}/walkaround/walkaround.mp4",
-                "size_mb": size_mb,
-            }
-            return output_video
-
-    except Exception as e:
-        print(f"[Walkaround] FFmpeg stitch failed: {e}")
-
-    _walkaround_status[vin] = {"status": "error", "error": "Video assembly failed"}
-    return None
-
+        with tempfile.TemporaryDirectory(
+            prefix=".walkaround-work-", dir=walkaround_dir, ignore_cleanup_errors=True
+        ) as temporary_directory:
+            return _generate_walkaround_in_workdir(
+                vin, vehicle_info, angles, walkaround_dir, Path(temporary_directory)
+            )
+    except Exception:
+        _walkaround_status[vin] = {
+            "status": "error", "error": "Walkaround generation stopped unexpectedly"
+        }
+        raise
 
 def get_walkaround_status(vin: str) -> dict:
     """Get current walkaround generation status."""

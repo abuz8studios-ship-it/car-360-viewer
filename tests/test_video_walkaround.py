@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import sys
+import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from PIL import Image
 
 APP_DIR = Path(__file__).resolve().parents[1] / "app"
 sys.path.insert(0, str(APP_DIR))
 
 from ai_studio import video_walkaround  # noqa: E402
+
+VIN = "1HGCM82633A004352"
 
 
 def _write_jpeg(path: Path, color: tuple[int, int, int] = (30, 80, 140)) -> None:
@@ -85,7 +90,7 @@ def test_pick_best_angles_ignores_symlinks_corrupt_oversize_and_pixel_limit(tmp_
 
 def test_walkaround_rejects_symlinked_media_directories(tmp_path, monkeypatch) -> None:
     storage = tmp_path / "storage"
-    vehicle_dir = storage / "1HGCM82633A004352"
+    vehicle_dir = storage / VIN
     vehicle_dir.mkdir(parents=True)
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -95,9 +100,9 @@ def test_walkaround_rejects_symlinked_media_directories(tmp_path, monkeypatch) -
     monkeypatch.setattr(video_walkaround, "STORAGE_DIR", storage)
 
     assert video_walkaround.pick_best_angles(vehicle_dir / "studio") == {}
-    assert video_walkaround.generate_walkaround("1HGCM82633A004352", {}) is None
-    assert video_walkaround.get_walkaround_status("1HGCM82633A004352")["status"] == "error"
-    assert video_walkaround.get_walkaround_status("1HGCM82633A004352")["error"] == "Unsafe vehicle media path"
+    assert video_walkaround.generate_walkaround(VIN, {}) is None
+    assert video_walkaround.get_walkaround_status(VIN)["status"] == "error"
+    assert video_walkaround.get_walkaround_status(VIN)["error"] == "Unsafe vehicle media path"
     assert sorted(path.name for path in outside.iterdir()) == ["frame_0001.jpg"]
 
 
@@ -149,3 +154,147 @@ def test_directory_enumeration_stops_exactly_at_scan_cap(tmp_path, monkeypatch) 
     )
     assert entries.read_count == video_walkaround.MAX_WALKAROUND_SCAN_ENTRIES == 4096
     assert len(capped_names) == video_walkaround.MAX_WALKAROUND_FRAMES == 72
+
+
+def test_comfyui_output_paths_are_confined_and_symlink_safe(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "comfy-output"
+    output_dir.mkdir()
+    output_file = output_dir / "clips" / "render.mp4"
+    output_file.parent.mkdir()
+    output_file.write_bytes(b"clip")
+    outside = tmp_path / "private.mp4"
+    outside.write_bytes(b"private")
+    monkeypatch.setattr(video_walkaround, "COMFY_OUTPUT", output_dir)
+
+    assert video_walkaround._safe_comfy_output_file("clips/render.mp4") == output_file
+    assert video_walkaround._safe_comfy_output_file("../private.mp4") is None
+    assert video_walkaround._safe_comfy_output_file(str(outside)) is None
+    try:
+        (output_dir / "linked.mp4").symlink_to(outside)
+    except OSError:
+        return
+    assert video_walkaround._safe_comfy_output_file("linked.mp4") is None
+
+
+@pytest.mark.parametrize(
+    ("returncode", "write_output", "expected"),
+    [(0, True, True), (1, True, False), (0, False, False)],
+)
+def test_silent_voiceover_fallback_requires_successful_nonempty_output(
+    tmp_path, monkeypatch, returncode: int, write_output: bool, expected: bool
+) -> None:
+    output = tmp_path / "voiceover.wav"
+
+    def comfyui_unavailable(*_args, **_kwargs):
+        raise OSError("ComfyUI unavailable")
+
+    def fake_ffmpeg(command, **_kwargs):
+        if write_output:
+            Path(command[-1]).write_bytes(b"silence audio")
+        return SimpleNamespace(returncode=returncode)
+
+    monkeypatch.setattr(urllib.request, "urlopen", comfyui_unavailable)
+    monkeypatch.setattr(video_walkaround.subprocess, "run", fake_ffmpeg)
+
+    assert video_walkaround.generate_tts_voiceover("test vehicle", str(output)) is expected
+
+
+def test_assembly_failure_preserves_the_previous_public_video(tmp_path, monkeypatch) -> None:
+    working_dir = tmp_path / ".walkaround-work"
+    working_dir.mkdir()
+    clip = working_dir / "clip_front.mp4"
+    clip.write_bytes(b"clip")
+    voiceover = working_dir / "voiceover.wav"
+    voiceover.write_bytes(b"generated audio")
+    output = tmp_path / "walkaround.mp4"
+    output.write_bytes(b"previous valid video")
+
+    def failed_ffmpeg(command, **_kwargs):
+        staged = Path(command[-1])
+        assert staged.parent == working_dir
+        assert staged.name.startswith(".walkaround-")
+        staged.write_bytes(b"partial incomplete output")
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(video_walkaround.subprocess, "run", failed_ffmpeg)
+
+    assert video_walkaround._assemble_walkaround(
+        [clip], voiceover, output, working_dir
+    ) is False
+    assert output.read_bytes() == b"previous valid video"
+    assert sorted(path.name for path in working_dir.iterdir()) == ["clip_front.mp4", "concat.txt", "voiceover.wav"]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "write_output", "expected_status"),
+    [(0, True, "done"), (1, True, "error"), (0, False, "error")],
+)
+def test_walkaround_reports_done_only_for_nonempty_successful_assembly(
+    tmp_path, monkeypatch, returncode: int, write_output: bool, expected_status: str
+) -> None:
+    storage = tmp_path / "storage"
+    exterior = storage / VIN / "exterior"
+    exterior.mkdir(parents=True)
+    for index in range(4):
+        _write_jpeg(exterior / f"frame_{index + 1:04d}.jpg")
+    output_dir = storage / VIN / "walkaround"
+    output_dir.mkdir()
+    previous_video = output_dir / "walkaround.mp4"
+    previous_video.write_bytes(b"old video")
+    (output_dir / "clip_front.mp4").write_bytes(b"legacy public intermediate")
+    (output_dir / "voiceover.wav").write_bytes(b"legacy public audio")
+    (output_dir / "concat.txt").write_text("legacy public concat", encoding="utf-8")
+    outside_clip = tmp_path / "outside.mp4"
+    outside_clip.write_bytes(b"outside data")
+    try:
+        (output_dir / "clip_side.mp4").symlink_to(outside_clip)
+    except OSError:
+        outside_clip = None
+    comfy_output = tmp_path / "comfy-output"
+    comfy_output.mkdir()
+    factory_dir = tmp_path / "factory"
+    factory_dir.mkdir()
+    monkeypatch.setattr(video_walkaround, "STORAGE_DIR", storage)
+    monkeypatch.setattr(video_walkaround, "COMFY_OUTPUT", comfy_output)
+    monkeypatch.setattr(video_walkaround, "FACTORY_DIR", factory_dir)
+    monkeypatch.setattr(video_walkaround, "generate_tts_voiceover", lambda _text, _path: False)
+    rendered = []
+
+    def render_one(_photo_path, _prompt):
+        filename = f"clip-{len(rendered)}.mp4"
+        (comfy_output / filename).write_bytes(b"generated clip")
+        rendered.append(filename)
+        return filename
+
+    monkeypatch.setitem(sys.modules, "factory", SimpleNamespace(render_one=render_one))
+    path_entry = str(factory_dir.resolve())
+    try:
+        def fake_ffmpeg(command, **_kwargs):
+            staged = Path(command[-1])
+            assert staged.parent.name.startswith(".walkaround-work-")
+            assert staged.name.startswith(".walkaround-")
+            if write_output:
+                staged.write_bytes(b"complete new walkaround" if returncode == 0 else b"partial output")
+            return SimpleNamespace(returncode=returncode)
+
+        monkeypatch.setattr(video_walkaround.subprocess, "run", fake_ffmpeg)
+        result = video_walkaround.generate_walkaround(
+            VIN, {"year": 2022, "make": "Test", "model": "Car"}
+        )
+    finally:
+        if path_entry in sys.path:
+            sys.path.remove(path_entry)
+
+    assert len(rendered) == 4
+    status = video_walkaround.get_walkaround_status(VIN)
+    assert status["status"] == expected_status
+    if expected_status == "done":
+        assert result == str(previous_video)
+        assert previous_video.read_bytes() == b"complete new walkaround"
+    else:
+        assert result is None
+        assert status["error"] == "Video assembly failed"
+        assert previous_video.read_bytes() == b"old video"
+    assert [path.name for path in output_dir.iterdir()] == ["walkaround.mp4"]
+    if outside_clip is not None:
+        assert outside_clip.read_bytes() == b"outside data"
