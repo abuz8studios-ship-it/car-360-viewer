@@ -315,6 +315,10 @@ def build(platform_name: str, output: Path, build_id: str) -> Path:
         elif platform_name == "macos":
             for script_name in ("install-lotvue.sh", "Install-LotVue360.command"):
                 shutil.copy2(ROOT / script_name, package_root / script_name)
+        else:
+            for script_name in ("Install-LotVue360.sh", "Uninstall-LotVue360.sh"):
+                shutil.copy2(ROOT / script_name, package_root / script_name)
+                (package_root / script_name).chmod(0o755)
 
         constraints_path = ROOT / "requirements-release-constraints.txt"
         if not constraints_path.is_file():

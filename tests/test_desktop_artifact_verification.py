@@ -24,9 +24,10 @@ def _make_archive(
     architecture: str,
     *,
     extra_files: dict[str, bytes] | None = None,
+    non_executable_paths: set[str] | None = None,
 ) -> Path:
-    package_root = "LotVue360" if platform_name == "windows" else f"LotVue360-macOS-{architecture}"
     if platform_name == "windows":
+        package_root = "LotVue360"
         app_prefix = f"{package_root}/app"
         launcher = f"{package_root}/LotVue360.exe"
         installers = (
@@ -36,7 +37,8 @@ def _make_archive(
         )
         suffix = ".exe"
         archive_name = "LotVue360-windows-x64.zip"
-    else:
+    elif platform_name == "macos":
+        package_root = f"LotVue360-macOS-{architecture}"
         app_prefix = f"{package_root}/LotVue360.app/Contents/Resources/app"
         launcher = f"{package_root}/LotVue360.app/Contents/MacOS/LotVue360"
         installers = (
@@ -45,6 +47,16 @@ def _make_archive(
         )
         suffix = ""
         archive_name = f"LotVue360-macOS-{architecture}.zip"
+    else:
+        package_root = "LotVue360"
+        app_prefix = f"{package_root}/app"
+        launcher = f"{package_root}/LotVue360"
+        installers = (
+            f"{package_root}/Install-LotVue360.sh",
+            f"{package_root}/Uninstall-LotVue360.sh",
+        )
+        suffix = ""
+        archive_name = f"LotVue360-linux-{architecture}.zip"
 
     ffmpeg = b"synthetic ffmpeg executable"
     ffprobe = b"synthetic ffprobe executable"
@@ -94,7 +106,14 @@ def _make_archive(
     archive_path = directory / archive_name
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, contents in files.items():
-            archive.writestr(name, contents)
+            if platform_name == "linux" and name in {launcher, *installers}:
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                permission = 0o644 if non_executable_paths and name in non_executable_paths else 0o755
+                info.external_attr = (0o100000 | permission) << 16
+                archive.writestr(info, contents)
+            else:
+                archive.writestr(name, contents)
     digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
     archive_path.with_suffix(archive_path.suffix + ".sha256").write_text(
         f"{digest}  {archive_path.name}\n", encoding="ascii",
@@ -104,7 +123,7 @@ def _make_archive(
 
 @pytest.mark.parametrize(
     ("platform_name", "architecture"),
-    [("windows", "x64"), ("macos", "x64"), ("macos", "arm64")],
+    [("windows", "x64"), ("macos", "x64"), ("macos", "arm64"), ("linux", "x64")],
 )
 def test_verifies_supported_platform_archive_and_notices(
     tmp_path: Path,
@@ -125,6 +144,24 @@ def test_verifies_supported_platform_archive_and_notices(
     assert summary["build_id"] == BUILD_ID
     assert summary["ffmpeg_license"] == LICENSE_ID
     assert summary["sha256"] == hashlib.sha256(archive_path.read_bytes()).hexdigest()
+
+
+def test_rejects_linux_archive_without_executable_installer_bits(tmp_path: Path) -> None:
+    script = "LotVue360/Install-LotVue360.sh"
+    archive_path = _make_archive(
+        tmp_path,
+        "linux",
+        "x64",
+        non_executable_paths={script},
+    )
+
+    with pytest.raises(ArtifactVerificationError, match="not marked executable"):
+        verify_desktop_artifact(
+            archive_path,
+            platform_name="linux",
+            architecture="x64",
+            expected_build_id=BUILD_ID,
+        )
 
 
 def test_rejects_mismatched_checksum_sidecar(tmp_path: Path) -> None:

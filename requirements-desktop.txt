@@ -1,4 +1,4 @@
-# Self-contained Windows/macOS desktop release build.
+# Self-contained Windows/macOS/Linux desktop release build.
 -r requirements.txt
 
 # Frozen as runtime code only. No checkpoint is selected or downloaded unless
