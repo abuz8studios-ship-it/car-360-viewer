@@ -341,6 +341,7 @@ def test_public_viewer_page_returns_at_most_120_frames(tmp_path, monkeypatch) ->
 
 def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, monkeypatch) -> None:
     import a2_extensions
+    from ai_studio import video_walkaround
 
     storage = tmp_path / "storage"
     exterior = storage / VIN / "exterior"
@@ -376,6 +377,9 @@ def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, mo
     assert "'/api/photo/composite'" in studio_page.text
     assert 'id="videoScriptBtn"' in studio_page.text
     assert "'/api/vehicle/'+encodeURIComponent(vin)+'/video-ad'" in studio_page.text
+    assert 'id="walkaroundBtn"' in studio_page.text
+    assert "'/api/vehicle/'+encodeURIComponent(vin)+'/walkaround'" in studio_page.text
+    assert "/walkaround-status" in studio_page.text
     assert client.get(f"/api/studio/vehicles/{VIN}/plan", headers=owner_headers).status_code == 200
     scene_inputs = client.get(f"/api/studio/vehicles/{VIN}/scene-inputs", headers=owner_headers)
     assert scene_inputs.status_code == 200
@@ -396,6 +400,26 @@ def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, mo
     ).status_code == 422
     assert client.post(
         f"/api/vehicle/{VIN}/video-ad", headers=other_headers, json={"type": "listing"}
+    ).status_code == 404
+    submitted = []
+    monkeypatch.setattr(video_walkaround, "get_walkaround_status", lambda _vin: {"status": "none"})
+    monkeypatch.setattr(
+        main, "_submit_background_job",
+        lambda name, callback: (submitted.append((name, callback)), "started")[1],
+    )
+    assert client.post(f"/api/vehicle/{VIN}/walkaround").status_code == 401
+    walkaround_start = client.post(f"/api/vehicle/{VIN}/walkaround", headers=owner_headers)
+    assert walkaround_start.status_code == 200
+    assert walkaround_start.json()["status"] == "started"
+    assert submitted[0][0] == f"walkaround:{VIN}"
+    assert client.get(
+        f"/api/vehicle/{VIN}/walkaround-status", headers=owner_headers
+    ).json()["status"] == "none"
+    assert client.get(
+        f"/api/vehicle/{VIN}/walkaround-status", headers=other_headers
+    ).status_code == 404
+    assert client.post(
+        f"/api/vehicle/{VIN}/walkaround", headers=other_headers
     ).status_code == 404
     assert client.get(f"/api/studio/vehicles/{VIN}/plan", headers=other_headers).status_code == 404
     assert client.get(f"/api/studio/vehicles/{VIN}/scene-inputs", headers=other_headers).status_code == 404
@@ -475,9 +499,13 @@ def test_google_feed_readiness_matches_static_route_requirements(monkeypatch) ->
     assert studio_agent._google_feed_configuration_ready() is False
 
 
-def test_studio_vehicle_routes_are_tenant_scoped_and_health_is_non_probing(monkeypatch) -> None:
+def test_studio_vehicle_routes_are_tenant_scoped_and_health_is_non_probing(tmp_path, monkeypatch) -> None:
     import rembg_runtime
+    from ai_studio import video_walkaround
 
+    monkeypatch.setattr(main, "GPU_INFO", {**main.GPU_INFO, "cuda": False})
+    monkeypatch.delenv("COMFYUI_URL", raising=False)
+    monkeypatch.setattr(video_walkaround, "FACTORY_DIR", tmp_path / "no-factory")
     monkeypatch.setattr(main, "REMBG_AVAILABLE", False)
     monkeypatch.setattr(rembg_runtime, "package_available", lambda: True)
     monkeypatch.delenv("LOTVUE_REMBG_MODEL", raising=False)
@@ -499,4 +527,32 @@ def test_studio_vehicle_routes_are_tenant_scoped_and_health_is_non_probing(monke
     assert "no model is selected" in payload["subsystems"]["background_removal"]["detail"]
     assert payload["subsystems"]["comfyui_scene_generation"]["status"] == "setup_required"
     assert payload["runtime"]["comfyui_scene_workflow_configured"] is False
+    assert payload["subsystems"]["video_walkaround"]["status"] == "setup_required"
+    assert payload["runtime"]["video_walkaround_ready"] is False
     assert "pricing_approved" in payload["runtime"]
+
+
+def test_video_walkaround_readiness_is_static_and_requires_local_prerequisites(tmp_path, monkeypatch) -> None:
+    from ai_studio import video_walkaround
+
+    monkeypatch.setattr(main, "GPU_INFO", {**main.GPU_INFO, "cuda": True})
+    monkeypatch.setenv("COMFYUI_URL", "http://comfy.example.test:8188")
+    monkeypatch.setattr(studio_agent, "_binary_available", lambda _value: True)
+    factory_dir = tmp_path / "factory"
+    factory_dir.mkdir()
+    factory = factory_dir / "factory.py"
+    factory.write_text("# owner-provided factory stub for readiness only\n", encoding="utf-8")
+    monkeypatch.setattr(video_walkaround, "FACTORY_DIR", factory_dir)
+
+    ready = studio_agent.build_system_health(main)
+
+    assert ready["external_services_contacted"] is False
+    assert ready["subsystems"]["video_walkaround"]["status"] == "configured"
+    assert ready["runtime"]["video_walkaround_factory_configured"] is True
+    assert ready["runtime"]["video_walkaround_ready"] is True
+
+    factory.unlink()
+    not_ready = studio_agent.build_system_health(main)
+    assert not_ready["external_services_contacted"] is False
+    assert not_ready["subsystems"]["video_walkaround"]["status"] == "setup_required"
+    assert not_ready["runtime"]["video_walkaround_ready"] is False
