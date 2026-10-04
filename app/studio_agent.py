@@ -78,7 +78,7 @@ const $=id=>document.getElementById(id);let activeVin='';let polling=null;let sc
 function node(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e;}
 async function getJson(url,options={}){const response=await fetch(url,{credentials:'same-origin',...options});let data={};try{data=await response.json();}catch(_){}if(!response.ok)throw new Error(data.detail||('Request failed ('+response.status+')'));return data;}
 function renderCapabilityCard(item){const card=node('article','cap');const top=node('div','cap-top');top.append(node('h3','',item.label));const state=node('span','state '+item.status,item.status.replaceAll('_',' '));top.append(state);card.append(top);card.append(node('p','small',item.detail));return card;}
-async function loadHealth(){const box=$('capabilities');box.replaceChildren(node('div','small','Checking local configuration…'));try{const data=await getJson('/api/system/health');box.replaceChildren();Object.values(data.subsystems).forEach(item=>box.append(renderCapabilityCard(item)));const walk=data.subsystems.video_walkaround||{};videoWalkaroundReady=walk.status==='configured';$('walkaroundReadiness').textContent=walk.detail||'Walkaround prerequisites are not configured.';syncWalkaroundControls();const m=data.limits||{};$('resourceCaps').replaceChildren();[[m.spin_frames,'360 frames / spin'],[m.viewer_frames,'viewer frame cap'],[m.photo_batch_mb+' MiB','photo batch cap'],[m.background_workers+' / '+m.background_jobs,'workers / admitted jobs'],[m.comfyui_scene_generation_jobs,'ComfyUI scenes / process']].forEach(([v,l])=>{const d=node('div','metric');d.append(node('b','',String(v)));d.append(node('span','',l));$('resourceCaps').append(d);});$('probeMode').textContent=data.external_services_contacted?'Probe performed':'Local configuration snapshot · no external services contacted';}catch(e){box.replaceChildren(node('div','notice bad',e.message));videoWalkaroundReady=false;$('walkaroundReadiness').textContent='Readiness check failed; generation remains disabled.';syncWalkaroundControls();}}
+async function loadHealth(){const box=$('capabilities');box.replaceChildren(node('div','small','Checking local configuration…'));try{const data=await getJson('/api/system/health');box.replaceChildren();Object.values(data.subsystems).forEach(item=>box.append(renderCapabilityCard(item)));const walk=data.subsystems.video_walkaround||{};videoWalkaroundReady=walk.status==='configured';$('walkaroundReadiness').textContent=walk.detail||'Walkaround prerequisites are not configured.';syncWalkaroundControls();const m=data.limits||{};$('resourceCaps').replaceChildren();[[m.spin_frames,'360 frames / spin'],[m.viewer_frames,'public viewer frame cap'],[m.photo_mb+' MiB','photo file cap'],[m.photo_batch_mb+' MiB','photo batch cap'],[Math.round((m.image_pixels||0)/1000000)+' MP','photo pixel cap'],[m.background_workers+' / '+m.background_jobs,'workers / admitted jobs'],[m.comfyui_scene_generation_jobs,'ComfyUI scenes / process'],[m.walkaround_frames,'walkaround source cap'],[m.walkaround_angles,'angles rendered / job'],[m.walkaround_scan_entries,'entries / source folder'],[m.walkaround_validation_mb+' MiB','walkaround validation cap']].forEach(([v,l])=>{const d=node('div','metric');d.append(node('b','',String(v)));d.append(node('span','',l));$('resourceCaps').append(d);});$('probeMode').textContent=data.external_services_contacted?'Probe performed':'Local configuration snapshot · no external services contacted';}catch(e){box.replaceChildren(node('div','notice bad',e.message));videoWalkaroundReady=false;$('walkaroundReadiness').textContent='Readiness check failed; generation remains disabled.';syncWalkaroundControls();}}
 async function loadBackgrounds(){try{const data=await getJson('/api/backgrounds');const select=$('backgroundSelect');select.replaceChildren();data.filter(x=>x.slug!=='none').forEach(bg=>{const opt=node('option','',bg.name);opt.value=bg.slug;select.append(opt);});}catch(_){}}
 async function loadSceneCatalog(){const select=$('sceneSelect');try{const data=await getJson('/api/backgrounds/scenes');select.replaceChildren();(data.scenes||[]).forEach(scene=>{const opt=node('option','',scene.name);opt.value=scene.id;select.append(opt);});if(!select.options.length){const empty=node('option','','No scenes available');empty.value='';empty.disabled=true;select.replaceChildren(empty);}syncSceneButton();}catch(e){const empty=node('option','',e.message);empty.value='';empty.disabled=true;select.replaceChildren(empty);syncSceneButton();}}
 function syncSceneButton(){const btn=$('sceneBtn');if(btn)btn.disabled=!activeVin||!$('sceneImage').value||!$('sceneSelect').value||btn.dataset.busy==='true';}
@@ -281,10 +281,27 @@ def build_system_health(main_module) -> dict:
     except Exception:
         comfy_scene_workflow_ready = False
     try:
-        from ai_studio.video_walkaround import FACTORY_DIR as walkaround_factory_dir
+        from ai_studio.video_walkaround import (
+            FACTORY_DIR as walkaround_factory_dir,
+            MAX_WALKAROUND_ANGLES,
+            MAX_WALKAROUND_FRAMES,
+            MAX_WALKAROUND_SCAN_ENTRIES,
+            MAX_WALKAROUND_VALIDATION_BYTES,
+        )
         walkaround_factory_ready = (Path(walkaround_factory_dir) / "factory.py").is_file()
+        walkaround_angle_cap = MAX_WALKAROUND_ANGLES
+        walkaround_frame_cap = MAX_WALKAROUND_FRAMES
+        walkaround_scan_cap = MAX_WALKAROUND_SCAN_ENTRIES
+        walkaround_validation_bytes = min(
+            MAX_WALKAROUND_VALIDATION_BYTES,
+            int(main_module.MAX_PHOTO_BATCH_MB) * 1024 * 1024,
+        )
     except Exception:
         walkaround_factory_ready = False
+        walkaround_angle_cap = 0
+        walkaround_frame_cap = 0
+        walkaround_scan_cap = 0
+        walkaround_validation_bytes = 0
     cuda_ready = bool(main_module.GPU_INFO.get("cuda"))
     walkaround_ready = bool(cuda_ready and comfy_configured and ffmpeg_ready and walkaround_factory_ready)
     stripe_key_ready = bool(getattr(main_module, "STRIPE_KEY", ""))
@@ -439,6 +456,10 @@ def build_system_health(main_module) -> dict:
             "background_workers": int(main_module._BACKGROUND_WORKERS),
             "background_jobs": int(main_module._BACKGROUND_MAX_JOBS),
             "comfyui_scene_generation_jobs": int(getattr(main_module, "_COMFYUI_SCENE_MAX_JOBS", 1)),
+            "walkaround_frames": int(walkaround_frame_cap),
+            "walkaround_angles": int(walkaround_angle_cap),
+            "walkaround_scan_entries": int(walkaround_scan_cap),
+            "walkaround_validation_mb": int(walkaround_validation_bytes // (1024 * 1024)),
             "vehicle_media_entries": 300,
         },
         "runtime": {

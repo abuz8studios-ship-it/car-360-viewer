@@ -8334,7 +8334,10 @@ def generate_vehicle_walkaround(vin: str, request: Request):
         raise HTTPException(status_code=404, detail="Vehicle not found")
 
     from ai_studio.video_walkaround import (
-        generate_walkaround, get_walkaround_status, mark_walkaround_failed,
+        MAX_WALKAROUND_VALIDATION_BYTES,
+        generate_walkaround,
+        get_walkaround_status,
+        mark_walkaround_failed,
     )
 
     status = get_walkaround_status(vin)
@@ -8345,7 +8348,16 @@ def generate_vehicle_walkaround(vin: str, request: Request):
 
     def _run():
         try:
-            generate_walkaround(vin, info)
+            generate_walkaround(
+                vin,
+                info,
+                max_photo_bytes=MAX_PHOTO_MB * 1024 * 1024,
+                max_image_pixels=MAX_UPLOAD_IMAGE_PIXELS,
+                validation_bytes_limit=min(
+                    MAX_PHOTO_BATCH_MB * 1024 * 1024,
+                    MAX_WALKAROUND_VALIDATION_BYTES,
+                ),
+            )
         except Exception:
             mark_walkaround_failed(vin)
             raise
