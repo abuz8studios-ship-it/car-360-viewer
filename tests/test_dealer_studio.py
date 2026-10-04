@@ -380,6 +380,9 @@ def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, mo
     assert 'id="walkaroundBtn"' in studio_page.text
     assert "'/api/vehicle/'+encodeURIComponent(vin)+'/walkaround'" in studio_page.text
     assert "/walkaround-status" in studio_page.text
+    assert "walkaround source cap" in studio_page.text
+    assert "angles rendered / job" in studio_page.text
+    assert "entries / source folder" in studio_page.text
     assert client.get(f"/api/studio/vehicles/{VIN}/plan", headers=owner_headers).status_code == 200
     scene_inputs = client.get(f"/api/studio/vehicles/{VIN}/scene-inputs", headers=owner_headers)
     assert scene_inputs.status_code == 200
@@ -405,6 +408,13 @@ def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, mo
     previous_video = storage / VIN / "walkaround" / "walkaround.mp4"
     previous_video.parent.mkdir(parents=True)
     previous_video.write_bytes(b"previous public walkaround")
+    for route in main.app.routes:
+        if getattr(route, "path", None) == "/storage":
+            monkeypatch.setattr(route.app, "directory", str(storage))
+            monkeypatch.setattr(route.app, "all_directories", [str(storage)])
+    public_media = client.get(f"/storage/{VIN}/walkaround/walkaround.mp4")
+    assert public_media.status_code == 200
+    assert public_media.content == b"previous public walkaround"
     submitted = []
     active_job = {"value": False}
     monkeypatch.setattr(
@@ -415,7 +425,13 @@ def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, mo
         lambda name, callback: (submitted.append((name, callback)), "started")[1],
     )
 
-    def failed_walkaround(_vin, _vehicle_info):
+    def failed_walkaround(_vin, _vehicle_info, **limits):
+        assert limits["max_photo_bytes"] == main.MAX_PHOTO_MB * 1024 * 1024
+        assert limits["max_image_pixels"] == main.MAX_UPLOAD_IMAGE_PIXELS
+        assert limits["validation_bytes_limit"] == min(
+            main.MAX_PHOTO_BATCH_MB * 1024 * 1024,
+            video_walkaround.MAX_WALKAROUND_VALIDATION_BYTES,
+        )
         raise RuntimeError("private implementation detail")
 
     monkeypatch.setattr(video_walkaround, "generate_walkaround", failed_walkaround)
@@ -581,6 +597,13 @@ def test_video_walkaround_readiness_is_static_and_requires_local_prerequisites(t
     assert ready["subsystems"]["video_walkaround"]["status"] == "configured"
     assert ready["runtime"]["video_walkaround_factory_configured"] is True
     assert ready["runtime"]["video_walkaround_ready"] is True
+    assert ready["limits"]["walkaround_frames"] == video_walkaround.MAX_WALKAROUND_FRAMES == 72
+    assert ready["limits"]["walkaround_angles"] == video_walkaround.MAX_WALKAROUND_ANGLES == 4
+    assert ready["limits"]["walkaround_scan_entries"] == video_walkaround.MAX_WALKAROUND_SCAN_ENTRIES == 4096
+    assert ready["limits"]["walkaround_validation_mb"] == 200
+    monkeypatch.setattr(main, "MAX_PHOTO_BATCH_MB", 150)
+    reduced_batch = studio_agent.build_system_health(main)
+    assert reduced_batch["limits"]["walkaround_validation_mb"] == 150
 
     factory.unlink()
     not_ready = studio_agent.build_system_health(main)
