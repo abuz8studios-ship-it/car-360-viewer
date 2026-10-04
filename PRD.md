@@ -2,7 +2,11 @@
 
 > This is a checklist of what "done" means, not a wishlist. DONE rows cite the commit, HTTP probe, or measurement that proved them. OPEN rows say exactly what's missing and who unblocks it.
 >
-> **Audit update: 2026-10-03.** This checkout was tested locally; the recorded August/September production and workstation checks remain historical evidence and were not re-run against live credentials or `lotvue.abuz8ai.com` in this audit. The Windows/macOS desktop workflow and installer scripts are implemented in this branch, but no hosted matrix run or desktop artifact exists yet; do not call the appliance complete until hosted builds and actual installs pass.
+> **Historical audit note: 2026-10-03.** This checkout was tested locally; the recorded August/September production and workstation checks were not re-run against live credentials or `lotvue.abuz8ai.com`. At that point no hosted desktop artifact had been produced. The note is superseded by the dated status below; historical checklist evidence later in this PRD is retained rather than silently refreshed.
+>
+> **Current repository position: 2026-10-04.** The application source currently under review is commit `08b9fcd` on `arena/01a0ffa3-car-360-viewer`; commit `520c335` is a docs-only workflow record, and this ledger/PRD refresh is documentation-only as well. Local checks on the source commit report 189 tests passing, plus configured lint/compile/dependency/diff/inline-JavaScript checks. A three-platform GitHub desktop matrix did pass on older commit `7fa13aa` (runs [CI 37140754753](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37140754753), [desktop matrix 37140754758](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37140754758)); its Windows x64, Intel macOS, and Apple Silicon artifacts are available through 2026-11-02 UTC, but they predate the newer Dealer Studio scene/script/walkaround surface and the current walkaround hardening. Runs for `08b9fcd` ([CI 37177998115](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37177998115), [desktop 37177998121](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37177998121)) were blocked before runner steps because GitHub reported that an Actions budget prevents further use; build jobs were skipped. The docs refresh on `520c335` was blocked for the same reason (runs 37178035732 / 37178035752). Therefore **the current application source still has no hosted test result or installer artifact**.
+>
+> The August 12 stranger-dealer steps 1–6 remain dated historical evidence, not a current live-site check; payment step 7 remains open. No current production uptime, live billing/email/provider connection, actual ComfyUI/WAN/TTS generation, or real-vehicle quality pass is established here. No price is approved. See [`LOTVUE_CANONICAL_LEDGER.md`](./LOTVUE_CANONICAL_LEDGER.md) for the current status and ordered remaining gates.
 
 ## The product, one line
 
@@ -47,11 +51,11 @@ The checks below are retained with their original dates; this audit did not re-r
 | Stranger-dealer 60-second test | PASSED 2026-08-12 for every step except payment (see Definition of Done above) |
 | Real-world dealer run | 2026-09-02: pulled 42 real listing photos from a named live dealer (Select Auto, Dayton OH) and produced a 7-angle studio spin; 4 of 7 angles judged clean on inspection |
 
-## Current Windows/macOS desktop-release acceptance — 2026-10-03
+## Historical Windows/macOS desktop-release snapshot — 2026-10-03 (superseded by current status above)
 
-The session branch contains a PyInstaller launcher/package path, per-user Windows and macOS installers, a 3-platform GitHub Actions matrix, checksums, and CPython 3.11 dependency constraints. The hosted workflow is designed to install, self-test, and uninstall on Windows x64, macOS Intel, and Apple Silicon; pushing this session branch triggers it. The local source launcher passes its smoke test. **The hosted workflow has not yet run, no frozen artifact is available, and no Windows/macOS host has been used to install this branch's package.** The older Windows installer listed in the historical table is not evidence for these new artifacts.
+At the time of this 2026-10-03 snapshot, the branch contained the PyInstaller launcher/package path, per-user installers, a 3-platform GitHub Actions matrix, checksums, and CPython 3.11 constraints, but no hosted matrix run had completed. Later evidence is summarized in the current-status note above: the 3-platform matrix passed on older source commit `7fa13aa`, while the current app source commit `08b9fcd` could not start hosted CI/build jobs because of the GitHub Actions budget. The older Windows installer listed in the historical table is not evidence for this newer package line.
 
-The base bundle contains local Python/runtime libraries and FFmpeg/FFprobe only after the hosted build can download and verify platform binaries. No CUDA/ComfyUI/WAN/COLMAP infrastructure, provider accounts, credentials, signatures, notarization, or model weights are bundled. Background removal stays disabled unless the owner reviews and explicitly selects a checkpoint; the app's acknowledgment flag is not legal verification. The checkpoint's commercial license/provenance, actual FFmpeg license output, dependency notices, and end-user installer behavior remain release gates.
+The verified older artifacts include local Python/runtime libraries and FFmpeg/FFprobe; they do not include CUDA/ComfyUI/WAN/COLMAP infrastructure, provider accounts, credentials, signatures, notarization, or model weights. Background removal stays disabled unless the owner reviews and explicitly selects a checkpoint; the app's acknowledgment flag is not legal verification. Owner installation acceptance, whether to sign/notarize, and commercial license/provenance for any checkpoint remain release gates.
 
 ## Explicitly out of scope — do not resume
 
@@ -71,12 +75,12 @@ The base bundle contains local Python/runtime libraries and FFmpeg/FFprobe only 
 4. **Lead-alert email has not been live-verified in this audit.** The last recorded Gmail SMTP app-password test returned `535 BadCredentials`; this checkout has no `app/.env`. *(Owner action: rotate/test the SMTP app password.)*
 5. **Production uptime is unverified.** The last recorded note says the production server had roughly 3 weeks of 502 downtime through 2026-09-02 and was manually restarted. Whether `LOTVUE\\StartApp` is enabled and survives reboot needs a fresh owner-side check. *(Owner action; persistent system-config change.)*
 
-## Owner-gated — blocked on Ahmad, not on build work
+## Owner-gated — last recorded status; not re-verified in this pass
 
-- iOS app (needs a Mac or a cloud build service)
-- Google Play publishing ($25 registration fee, unpaid)
-- Ricoh Theta interior-capture hardware (not started, hardware-gated)
-- Written permission from DriveSmart Auto Sales to use its 200 scraped vehicles as a demo/GTM dataset (not yet obtained)
+- iOS app (needs a Mac or a cloud build service; no current build proof in this branch)
+- Google Play publishing (the last recorded note said the $25 registration fee was unpaid; current account/payment status is unknown)
+- Ricoh Theta interior-capture hardware (previously marked not started; current hardware status unknown)
+- Written permission from DriveSmart Auto Sales to use its 200 scraped vehicles as a demo/GTM dataset (previously not obtained; current approval status unknown)
 
 ## Smaller open items
 
@@ -86,14 +90,14 @@ The base bundle contains local Python/runtime libraries and FFmpeg/FFprobe only 
 
 ## Repo hygiene — not blocking revenue, but real debt
 
-- **Declared dependencies and release constraints are now present.** Root `requirements.txt`, `requirements-ai.txt`, `requirements-dev.txt`, `requirements-desktop.txt`, and `requirements-release-constraints.txt` replace the old inline-install-only setup and stabilize the CPython 3.11 CI/build package set. Local dry runs passed on Linux; the Windows/macOS wheel resolution remains unverified until the hosted workflow runs.
+- **Declared dependencies and release constraints are present.** Root `requirements.txt`, `requirements-ai.txt`, `requirements-dev.txt`, `requirements-desktop.txt`, and `requirements-release-constraints.txt` define the CPython 3.11 CI/build package set. Local Linux checks pass, and the hosted matrix did resolve/build on Windows x64, Intel macOS, and Apple Silicon for older source `7fa13aa`; current source `08b9fcd` still needs the hosted matrix once the Actions budget permits.
 - **Dormant backup copies remain in `app/`.** The current checkout includes `main.py.bak-*`, `main_before_op6.py`, `main_original.py`, `main_v1.py`, and `.bak-*` copies of other modules. They are not runtime sources; archive or remove them only after Ahmad confirms there is no recovery/deployment dependency.
 - **Doc naming doesn't match the BRAIN/GOAL/LEDGER convention used elsewhere.** There is no literal `GOAL.md` (`LOTVUE_GOAL_ARTIFACT.md` and `LOTVUE_CREATION_ARTIFACT.md` split that role between them), and two differently-shaped ledgers already exist (`LEDGER.md`, a dev-log, vs. `LOTVUE_CANONICAL_LEDGER.md`, a numbered capability table). This PRD and its siblings `README.md` / `LEDGER_LOG.md` are a second naming convention, not a replacement — **Ahmad needs to decide which convention the project runs on.**
 - **License status corrected in this checkout:** tracked `LICENSE` is proprietary ABUZ8 LLC / All Rights Reserved, not MIT and not uncommitted. Owner/legal review should confirm the terms cover the intended hosted product and any future downloadable build.
 
-## Local verification — 2026-10-03
+## Historical local verification snapshot — 2026-10-03
 
-The current checkout's automated checks are recorded in [`ENGINEERING_AUDIT_2026-10-03.md`](./ENGINEERING_AUDIT_2026-10-03.md). They establish source-level and isolated-test behavior only; they do not establish live production uptime, paid transactions, outbound email, Google validation against live inventory, or a stranger-dealer run.
+The 2026-10-03 source audit is recorded in [`ENGINEERING_AUDIT_2026-10-03.md`](./ENGINEERING_AUDIT_2026-10-03.md); the newer local result and remaining gates are in the current-status note and [`LOTVUE_CANONICAL_LEDGER.md`](./LOTVUE_CANONICAL_LEDGER.md). Source tests establish isolated behavior only; neither those results nor the newer 2026-10-04 tests establish live production uptime, paid transactions, outbound email, Google validation against live inventory, or a new stranger-dealer run.
 
 ## What "finished" looks like
 
