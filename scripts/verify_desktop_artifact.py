@@ -106,7 +106,7 @@ def _require_executable(archive: zipfile.ZipFile, path: str) -> None:
     except KeyError as exc:
         raise ArtifactVerificationError(f"Required executable is missing: {path}") from exc
     mode = (info.external_attr >> 16) & 0o777
-    if info.create_system != 3 or not mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+    if info.create_system != 3 or not mode & stat.S_IXUSR:
         raise ArtifactVerificationError(f"Linux installer payload is not marked executable: {path}")
 
 
