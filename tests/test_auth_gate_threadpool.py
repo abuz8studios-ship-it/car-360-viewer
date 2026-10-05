@@ -30,8 +30,13 @@ def test_authentication_database_lookup_runs_off_the_event_loop(tmp_path: Path, 
     original_run_in_threadpool = starlette.concurrency.run_in_threadpool
     original_connect = sqlite3.connect
 
+    def _is_auth_gate_check(func) -> bool:
+        """Identify the gate's verification closure without pinning its name."""
+        code = getattr(func, "__code__", None)
+        return code is not None and Path(code.co_filename).name == "auth_gate.py"
+
     async def tracked_run_in_threadpool(func, *args, **kwargs):
-        if getattr(func, "__name__", "") == "_valid":
+        if _is_auth_gate_check(func):
             event_loop_threads.append(threading.get_ident())
         return await original_run_in_threadpool(func, *args, **kwargs)
 

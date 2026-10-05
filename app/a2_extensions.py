@@ -775,11 +775,27 @@ def auth_logout(response: Response):
 def auth_refresh(body: RefreshRequest):
     try:
         payload = jwt.decode(body.refresh_token, _jwt_secret(), algorithms=[JWT_ALG])
-        if payload.get("type") != "refresh":
-            raise HTTPException(401, "Not a refresh token")
-        return _make_tokens(payload["sub"])
     except JWTError:
         raise HTTPException(401, "Invalid or expired refresh token")
+    if not isinstance(payload, dict) or payload.get("type") != "refresh":
+        raise HTTPException(401, "Not a refresh token")
+    subject = str(payload.get("sub", "")).strip().lower()
+    if not subject:
+        raise HTTPException(401, "Invalid or expired refresh token")
+    # A refresh token must not outlive its account: without this check a removed
+    # user can mint fresh access tokens for the whole refresh lifetime.
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT email FROM users WHERE LOWER(email)=?", (subject,)
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(401, "User no longer exists")
+    return _make_tokens(row["email"])
 
 
 def current_user(authorization: str = Header(default="")):
