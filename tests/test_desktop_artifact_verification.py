@@ -25,6 +25,8 @@ def _make_archive(
     *,
     extra_files: dict[str, bytes] | None = None,
     non_executable_paths: set[str] | None = None,
+    installer_name_override: str | None = None,
+    corrupt_source_archive_hash: bool = False,
 ) -> Path:
     if platform_name == "windows":
         package_root = "LotVue360"
@@ -60,18 +62,43 @@ def _make_archive(
 
     ffmpeg = b"synthetic ffmpeg executable"
     ffprobe = b"synthetic ffprobe executable"
+    license_id = "GPL-2.0-or-later" if platform_name == "linux" else LICENSE_ID
+    license_filename = "GPL-2.0.txt" if platform_name == "linux" else LICENSE_FILENAME
     ffmpeg_files = {
         "ffmpeg": f"ffmpeg{suffix}",
         "ffprobe": f"ffprobe{suffix}",
-        "license": LICENSE_ID,
+        "license": license_id,
         "ffmpeg_sha256": hashlib.sha256(ffmpeg).hexdigest(),
         "ffprobe_sha256": hashlib.sha256(ffprobe).hexdigest(),
     }
+    source_files: dict[str, bytes] = {}
+    source_build_info: dict[str, object] = {}
+    if platform_name == "linux":
+        source_files = {
+            "ffmpeg-8.0.tar.gz": b"synthetic pinned FFmpeg source archive",
+            "x264-c24e06c2e184345ceb33eb20a15d1024d9fd3497.tar.gz": b"synthetic pinned x264 source archive",
+        }
+        source_hashes = {name: hashlib.sha256(contents).hexdigest() for name, contents in source_files.items()}
+        if corrupt_source_archive_hash:
+            source_hashes["ffmpeg-8.0.tar.gz"] = "0" * 64
+        ffmpeg_files["source_archives"] = source_hashes
+        source_build_info = {
+            "ffmpeg_commit": "140fd653aed8cad774f991ba083e2d01e86420c7",
+            "x264_commit": "c24e06c2e184345ceb33eb20a15d1024d9fd3497",
+            "license": "GPL-2.0-or-later (FFmpeg built with GPL x264)",
+            "source_archives": source_hashes,
+        }
+    one_click_installer = installer_name_override or {
+        "windows": "LotVue360-OneClick-windows-x64.exe",
+        "macos": f"LotVue360-OneClick-macOS-{architecture}.dmg",
+        "linux": f"LotVue360-OneClick-linux-{architecture}.run",
+    }[platform_name]
     manifest = {
         "product": "LotVue360",
         "build_id": BUILD_ID,
         "platform": platform_name,
         "architecture": architecture,
+        "one_click_installer": one_click_installer,
         "python_constraints_file": "PYTHON-BUILD-CONSTRAINTS.txt",
         "bundled_engines": ["CPU background removal runtime", "FFmpeg", "FFprobe"],
         "ffmpeg_files": ffmpeg_files,
@@ -93,11 +120,17 @@ def _make_archive(
         f"{app_prefix}/.env.example": b"# blank defaults\n",
         f"{app_prefix}/bin/ffmpeg{suffix}": ffmpeg,
         f"{app_prefix}/bin/ffprobe{suffix}": ffprobe,
-        f"{app_prefix}/bin/FFMPEG-LICENSE.txt": f"Detected license: {LICENSE_ID}\n".encode(),
+        f"{app_prefix}/bin/FFMPEG-LICENSE.txt": f"Detected license: {license_id}\n".encode(),
         f"{app_prefix}/bin/FFMPEG-BUILD-INFO.txt": b"--- ffmpeg -version ---\n",
-        f"{app_prefix}/bin/LICENSE-FFMPEG-{LICENSE_FILENAME}": b"license text\n",
+        f"{app_prefix}/bin/LICENSE-FFMPEG-{license_filename}": b"license text\n",
+        f"{app_prefix}/bin/LICENSE-PYTHON-PSF-2.0.txt": b"Python Software Foundation License\n",
         launcher: b"synthetic frozen launcher",
     }
+    if platform_name == "linux":
+        files[f"{app_prefix}/bin/FFMPEG-SOURCE-BUILD-INFO.json"] = (
+            json.dumps(source_build_info) + "\n"
+        ).encode()
+        files.update({f"{app_prefix}/bin/source/{name}": contents for name, contents in source_files.items()})
     files.update({path: b"installer" for path in installers})
     if extra_files:
         files.update(extra_files)
@@ -142,7 +175,13 @@ def test_verifies_supported_platform_archive_and_notices(
     assert summary["platform"] == platform_name
     assert summary["architecture"] == architecture
     assert summary["build_id"] == BUILD_ID
-    assert summary["ffmpeg_license"] == LICENSE_ID
+    expected_license = "GPL-2.0-or-later" if platform_name == "linux" else LICENSE_ID
+    assert summary["ffmpeg_license"] == expected_license
+    if platform_name == "linux":
+        assert set(summary["ffmpeg_source_archives"]) == {
+            "ffmpeg-8.0.tar.gz",
+            "x264-c24e06c2e184345ceb33eb20a15d1024d9fd3497.tar.gz",
+        }
     assert summary["sha256"] == hashlib.sha256(archive_path.read_bytes()).hexdigest()
 
 
@@ -174,6 +213,40 @@ def test_rejects_mismatched_checksum_sidecar(tmp_path: Path) -> None:
         verify_desktop_artifact(
             archive_path,
             platform_name="windows",
+            architecture="x64",
+            expected_build_id=BUILD_ID,
+        )
+
+
+def test_rejects_wrong_one_click_installer_name_in_manifest(tmp_path: Path) -> None:
+    archive_path = _make_archive(
+        tmp_path,
+        "linux",
+        "x64",
+        installer_name_override="LotVue360-linux.zip",
+    )
+
+    with pytest.raises(ArtifactVerificationError, match="one_click_installer"):
+        verify_desktop_artifact(
+            archive_path,
+            platform_name="linux",
+            architecture="x64",
+            expected_build_id=BUILD_ID,
+        )
+
+
+def test_rejects_linux_source_archive_hash_mismatch(tmp_path: Path) -> None:
+    archive_path = _make_archive(
+        tmp_path,
+        "linux",
+        "x64",
+        corrupt_source_archive_hash=True,
+    )
+
+    with pytest.raises(ArtifactVerificationError, match="source archive hash"):
+        verify_desktop_artifact(
+            archive_path,
+            platform_name="linux",
             architecture="x64",
             expected_build_id=BUILD_ID,
         )

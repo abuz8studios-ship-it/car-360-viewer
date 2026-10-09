@@ -108,9 +108,24 @@ jobs:
             exit "$status"
           fi
           rm -f .desktop-pip-install.log
+      - name: Install Linux x86 assembly optimizer for x264
+        if: matrix.platform == 'linux'
+        run: |
+          if ! command -v nasm >/dev/null 2>&1; then
+            if sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends nasm; then
+              echo 'Installed NASM for optimized x264 assembly.'
+            else
+              echo '::warning::NASM install failed; source builder will use its C-only x264 fallback.'
+            fi
+          fi
+      - name: Build pinned Linux FFmpeg and x264 from source
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: python scripts/build_ffmpeg_linux.py --output build/ffmpeg/linux-x64 --jobs 4
       - name: Build self-contained application and installer archive
         env:
           LOTVUE_BUILD_ID: ${{ github.sha }}
+          LOTVUE_FFMPEG_ROOT: ${{ matrix.platform == 'linux' && 'build/ffmpeg/linux-x64' || '' }}
         shell: bash
         run: |
           set +e
@@ -154,24 +169,74 @@ jobs:
             --platform "${{ matrix.platform }}" \
             --architecture "${{ matrix.arch }}" \
             --build-id "$GITHUB_SHA"
-      - name: Smoke-test Windows installer and frozen runtime
+      - name: Build one-click Windows installer
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compilerPath = (Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue).Source
+          if (-not $compilerPath) {
+            choco install innosetup --no-progress --yes
+            $candidate = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+            if (Test-Path -LiteralPath $candidate) { $compilerPath = $candidate }
+          }
+          if (-not $compilerPath) { throw 'Inno Setup 6 compiler (ISCC.exe) is unavailable.' }
+          & $compilerPath 'LotVue360.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compiler failed with exit code $LASTEXITCODE" }
+          $installer = Get-Item -LiteralPath 'dist/desktop-release/LotVue360-OneClick-windows-x64.exe'
+          $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText(
+            "$($installer.FullName).sha256",
+            "$hash  $($installer.Name)`n",
+            [Text.Encoding]::ASCII
+          )
+      - name: Build one-click macOS disk image
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="build/desktop/dist/LotVue360-macOS-${{ matrix.arch }}"
+          stage="$RUNNER_TEMP/lotvue-one-click-macos"
+          image="dist/desktop-release/LotVue360-OneClick-macOS-${{ matrix.arch }}.dmg"
+          mkdir -p "$stage"
+          ditto "$package/LotVue360.app" "$stage/LotVue360.app"
+          cp "$package/install-lotvue.sh" "$package/Install-LotVue360.command" "$stage/"
+          cp "$package/README-INSTALL.txt" "$package/INSTALLATION.md" "$package/THIRD_PARTY_NOTICES.md" "$stage/"
+          cp "$package/BUILD-MANIFEST.json" "$package/PYTHON-BUILD-CONSTRAINTS.txt" "$stage/"
+          chmod +x "$stage/install-lotvue.sh" "$stage/Install-LotVue360.command"
+          hdiutil create -quiet -volname 'LotVue360 Installer' -srcfolder "$stage" -format UDZO -ov "$image"
+          hdiutil verify "$image"
+          (cd "$(dirname "$image")" && shasum -a 256 "$(basename "$image")") > "$image.sha256"
+      - name: Verify one-click Linux installer checksum
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer='dist/desktop-release/LotVue360-OneClick-linux-x64.run'
+          test -x "$installer"
+          (cd "$(dirname "$installer")" && sha256sum -c "$(basename "$installer").sha256")
+      - name: Smoke-test Windows one-click installer and frozen runtime
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $phase = 'initializing smoke test'
           $data = Join-Path $env:RUNNER_TEMP 'lotvue-desktop-smoke-data'
+          $installRoot = Join-Path $env:LOCALAPPDATA 'Programs/LotVue360'
           try {
-            $phase = 'locating and extracting release archive'
-            $archive = Get-Item -LiteralPath 'dist/desktop-release/LotVue360-windows-x64.zip'
-            $extract = Join-Path $env:RUNNER_TEMP 'lotvue-desktop-smoke'
-            Expand-Archive -LiteralPath $archive.FullName -DestinationPath $extract -Force
+            $phase = 'checking standalone installer checksum'
+            $installer = Get-Item -LiteralPath 'dist/desktop-release/LotVue360-OneClick-windows-x64.exe'
+            $expectedHash = ((Get-Content -LiteralPath "$($installer.FullName).sha256" -Raw) -split '\s+')[0]
+            $actualHash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash
+            if ($actualHash -ine $expectedHash) { throw 'Windows one-click installer checksum mismatch.' }
 
-            $phase = 'running per-user installer'
-            $installer = Join-Path $extract 'LotVue360/Install-LotVue360.ps1'
-            & $installer -NoLaunch
-            $installRoot = Join-Path $env:LOCALAPPDATA 'Programs/LotVue360'
-            if (-not (Test-Path -LiteralPath $installRoot)) { throw 'Windows installer did not create the per-user app directory.' }
+            $phase = 'running per-user one-click installer'
+            if (Test-Path -LiteralPath $installRoot) { Remove-Item -LiteralPath $installRoot -Recurse -Force }
+            $install = Start-Process -FilePath $installer.FullName -ArgumentList @(
+              '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=$installRoot"
+            ) -Wait -PassThru
+            if ($install.ExitCode -ne 0) { throw "Windows installer failed with exit code $($install.ExitCode)" }
+            if (-not (Test-Path -LiteralPath $installRoot)) { throw 'One-click installer did not create the per-user app directory.' }
 
             $phase = 'running frozen application self-test'
             $env:LOTVUE_DATA_DIR = $data
@@ -182,11 +247,12 @@ jobs:
             if (-not (Test-Path -LiteralPath $smokeLog)) { throw 'Windows app self-test did not create its launcher log.' }
             if (-not (Select-String -LiteralPath $smokeLog -Pattern 'packaged self-test passed:' -Quiet)) { throw 'Windows app launcher log did not record a passing self-test.' }
 
-            $phase = 'running uninstaller and checking data retention'
-            $uninstaller = Join-Path $installRoot 'Uninstall-LotVue360.ps1'
-            & $uninstaller
+            $phase = 'running one-click uninstaller and checking data retention'
+            $uninstaller = Join-Path $installRoot 'unins000.exe'
+            $remove = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+            if ($remove.ExitCode -ne 0) { throw "Windows uninstaller failed with exit code $($remove.ExitCode)" }
             if (Test-Path -LiteralPath $installRoot) { throw 'Windows app files remain after uninstall.' }
-            if (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'LotVue360'))) { throw 'Uninstaller unexpectedly removed per-user data.' }
+            if (-not (Test-Path -LiteralPath $data)) { throw 'Uninstaller unexpectedly removed per-user data.' }
           } catch {
             $details = @("phase=$phase", $_.Exception.ToString())
             $logPaths = @(
@@ -209,20 +275,30 @@ jobs:
             Write-Output "::error title=Windows desktop smoke diagnostic::$message"
             throw
           }
-      - name: Smoke-test macOS installer and frozen runtime
+      - name: Smoke-test macOS one-click installer and frozen runtime
         if: matrix.platform == 'macos'
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/lotvue-desktop-smoke"
-          ditto -x -k "dist/desktop-release/LotVue360-macOS-${{ matrix.arch }}.zip" "$RUNNER_TEMP/lotvue-desktop-smoke"
-          PACKAGE="$RUNNER_TEMP/lotvue-desktop-smoke/LotVue360-macOS-${{ matrix.arch }}"
-          bash "$PACKAGE/install-lotvue.sh" --no-open
-          export LOTVUE_DATA_DIR="$RUNNER_TEMP/lotvue-desktop-smoke-data"
-          "$HOME/Applications/LotVue360.app/Contents/MacOS/LotVue360" --self-test
-          test -d "$HOME/Library/Application Support/LotVue360"
-          rm -rf "$HOME/Applications/LotVue360.app"
-          test ! -e "$HOME/Applications/LotVue360.app"
-      - name: Smoke-test Linux installer and frozen runtime
+          set -euo pipefail
+          smoke="$RUNNER_TEMP/lotvue-macos-smoke"
+          mount="$smoke/mounted-installer"
+          home="$smoke/home with spaces"
+          data="$smoke/user data/LotVue360"
+          image="dist/desktop-release/LotVue360-OneClick-macOS-${{ matrix.arch }}.dmg"
+          mkdir -p "$mount" "$home"
+          (cd "$(dirname "$image")" && shasum -a 256 -c "$(basename "$image").sha256")
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$image" >/dev/null
+          detach() { hdiutil detach "$mount" -quiet || true; }
+          trap detach EXIT
+          HOME="$home" LOTVUE_INSTALLER_NO_PAUSE=1 bash "$mount/Install-LotVue360.command" --no-open
+          app="$home/Applications/LotVue360.app"
+          test -d "$app"
+          HOME="$home" LOTVUE_DATA_DIR="$data" "$app/Contents/MacOS/LotVue360" --self-test
+          test -f "$data/desktop_launch.log"
+          grep -q 'packaged self-test passed:' "$data/desktop_launch.log"
+          rm -rf "$app"
+          test ! -e "$app"
+      - name: Smoke-test Linux one-click installer and frozen runtime
         if: matrix.platform == 'linux'
         shell: bash
         run: |
@@ -231,12 +307,11 @@ jobs:
           home="$smoke/home with spaces"
           data_home="$home/XDG data"
           prefix="$home/local app"
-          mkdir -p "$smoke/extracted" "$home"
-          export HOME="$home" XDG_DATA_HOME="$data_home"
-          unzip -q "dist/desktop-release/LotVue360-linux-${{ matrix.arch }}.zip" -d "$smoke/extracted"
-          PACKAGE="$smoke/extracted/LotVue360"
-          HOME="$home" XDG_DATA_HOME="$data_home" \
-            "$PACKAGE/Install-LotVue360.sh" --prefix "$prefix" --no-open
+          installer='dist/desktop-release/LotVue360-OneClick-linux-x64.run'
+          mkdir -p "$smoke/staging" "$home"
+          export HOME="$home" XDG_DATA_HOME="$data_home" TMPDIR="$smoke/staging"
+          (cd "$(dirname "$installer")" && sha256sum -c "$(basename "$installer").sha256")
+          "$installer" --prefix "$prefix" --no-open
 
           INSTALL_ROOT="$prefix/LotVue360"
           DATA="$data_home/LotVue360"
@@ -250,19 +325,17 @@ jobs:
           test -f "$DATA/uninstall-check.txt"
           test ! -e "$data_home/applications/lotvue360.desktop"
 
-          HOME="$home" XDG_DATA_HOME="$data_home" \
-            "$PACKAGE/Install-LotVue360.sh" --prefix "$prefix" --no-open
+          "$installer" --prefix "$prefix" --no-open
           HOME="$home" XDG_DATA_HOME="$data_home" \
             "$INSTALL_ROOT/Uninstall-LotVue360.sh" --prefix "$prefix" --remove-data --yes
           test ! -e "$INSTALL_ROOT"
           test ! -e "$DATA"
+          test -z "$(find "$smoke/staging" -mindepth 1 -maxdepth 1 -print -quit)"
       - name: Upload verified platform artifact
         uses: actions/upload-artifact@v4
         with:
           name: lotvue-desktop-${{ matrix.platform }}-${{ matrix.arch }}
-          path: |
-            dist/desktop-release/*.zip
-            dist/desktop-release/*.zip.sha256
+          path: dist/desktop-release/*
           if-no-files-found: error
           retention-days: 30
 
@@ -286,6 +359,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" release-assets/*.zip release-assets/*.zip.sha256 \
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
             --title "LotVue360 $GITHUB_REF_NAME" \
             --notes-file .github/RELEASE_NOTES.md

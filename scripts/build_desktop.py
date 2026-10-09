@@ -3,8 +3,9 @@
 
 Run on the same OS/architecture as the intended artifact after installing
 requirements-desktop.txt. The build stages clean app source, generates the shared
-background catalog, fetches platform FFmpeg/FFprobe, freezes Python dependencies,
-and writes a checksummed zip for the release workflow.
+background catalog, stages licensed FFmpeg/FFprobe, freezes Python dependencies,
+and writes a checksummed portable ZIP. Linux builds also create a self-extracting
+one-click installer; Windows/macOS native installers are assembled in CI.
 """
 from __future__ import annotations
 
@@ -20,8 +21,19 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+try:
+    from .package_desktop import create_linux_one_click_installer
+except ImportError:  # Direct execution: python scripts/build_desktop.py
+    from package_desktop import create_linux_one_click_installer
+
 ROOT = Path(__file__).resolve().parents[1]
 APP_SOURCE = ROOT / "app"
+LINUX_FFMPEG_COMMIT = "140fd653aed8cad774f991ba083e2d01e86420c7"
+LINUX_X264_COMMIT = "c24e06c2e184345ceb33eb20a15d1024d9fd3497"
+LINUX_FFMPEG_SOURCE_ARCHIVES = {
+    "ffmpeg-8.0.tar.gz",
+    f"x264-{LINUX_X264_COMMIT}.tar.gz",
+}
 
 
 def _run(command: list[str], *, cwd: Path | None = None, env=None) -> None:
@@ -147,12 +159,59 @@ def _identify_ffmpeg_license(license_text: str, build_config: str) -> tuple[str,
     raise RuntimeError("FFmpeg license could not be identified; refusing to create an unreviewed binary")
 
 
-def _stage_ffmpeg(stage_app: Path) -> dict[str, str]:
-    try:
-        from static_ffmpeg.run import get_or_fetch_platform_executables_else_raise
-    except ImportError as exc:
-        raise RuntimeError("Install requirements-desktop.txt before building releases") from exc
-    ffmpeg_source, ffprobe_source = get_or_fetch_platform_executables_else_raise()
+def _stage_ffmpeg(stage_app: Path) -> dict[str, object]:
+    source_root_text = os.getenv("LOTVUE_FFMPEG_ROOT", "").strip()
+    source_archives: dict[str, str] = {}
+    if source_root_text:
+        source_root = Path(source_root_text).expanduser().resolve()
+        ffmpeg_source = source_root / "bin" / "ffmpeg"
+        ffprobe_source = source_root / "bin" / "ffprobe"
+        source_info_path = source_root / "FFMPEG-SOURCE-INFO.txt"
+        build_info_path = source_root / "BUILD-INFO.json"
+        if not all(path.is_file() for path in (ffmpeg_source, ffprobe_source, source_info_path, build_info_path)):
+            raise RuntimeError(f"Pinned Linux FFmpeg bundle is incomplete: {source_root}")
+        try:
+            source_build = json.loads(build_info_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Pinned Linux FFmpeg BUILD-INFO.json is unreadable") from exc
+        if not isinstance(source_build, dict):
+            raise RuntimeError("Pinned Linux FFmpeg BUILD-INFO.json must be a JSON object")
+        expected_source_hashes = source_build.get("source_archives")
+        source_dir = source_root / "source"
+        if not isinstance(expected_source_hashes, dict) or not source_dir.is_dir():
+            raise RuntimeError("Pinned Linux FFmpeg source archives are missing from BUILD-INFO.json")
+        if set(expected_source_hashes) != LINUX_FFMPEG_SOURCE_ARCHIVES:
+            raise RuntimeError("Pinned Linux FFmpeg bundle has an unexpected source archive set")
+        if (
+            source_build.get("ffmpeg_commit") != LINUX_FFMPEG_COMMIT
+            or source_build.get("x264_commit") != LINUX_X264_COMMIT
+            or not str(source_build.get("license", "")).startswith("GPL-2.0-or-later")
+        ):
+            raise RuntimeError("Linux FFmpeg build metadata does not match the pinned GPL source revisions")
+        for name, expected_hash in expected_source_hashes.items():
+            archive_path = source_dir / name
+            if not archive_path.is_file() or _checksum(archive_path).lower() != str(expected_hash).lower():
+                raise RuntimeError(f"Linux FFmpeg source archive is missing or corrupt: {archive_path}")
+            source_archives[name] = _checksum(archive_path)
+        source_info = source_info_path.read_text(encoding="utf-8")
+        build_info_text = build_info_path.read_text(encoding="utf-8")
+    else:
+        try:
+            from static_ffmpeg.run import get_or_fetch_platform_executables_else_raise
+        except ImportError as exc:
+            raise RuntimeError("Install requirements-desktop.txt before building releases") from exc
+        ffmpeg_source, ffprobe_source = map(Path, get_or_fetch_platform_executables_else_raise())
+        source_info = (
+            "FFmpeg/FFprobe are separately invoked command-line programs.\n"
+            "Binary distribution/build project: https://github.com/zackees/ffmpeg_bins\n"
+            "Build project: https://github.com/zackees/static_ffmpeg\n"
+            "FFmpeg source release: https://ffmpeg.org/releases/ffmpeg-8.0.tar.xz\n"
+            "FFmpeg source tag: https://github.com/FFmpeg/FFmpeg/tree/n8.0\n"
+            "Build configuration is recorded in FFMPEG-BUILD-INFO.txt.\n"
+            "The FFmpeg source is separately licensed; it is not covered by the LotVue360 proprietary license.\n"
+        )
+        build_info_text = ""
+
     suffix = ".exe" if os.name == "nt" else ""
     ffmpeg_target = stage_app / "bin" / f"ffmpeg{suffix}"
     ffprobe_target = stage_app / "bin" / f"ffprobe{suffix}"
@@ -175,38 +234,56 @@ def _stage_ffmpeg(stage_app: Path) -> dict[str, str]:
     license_text = capture(ffmpeg_target, "-L")
     build_config = capture(ffmpeg_target, "-buildconf")
     license_id, license_file = _identify_ffmpeg_license(license_text, build_config)
+    if source_archives:
+        if not version_text.startswith("ffmpeg version n8.0"):
+            raise RuntimeError("Pinned Linux FFmpeg bundle does not report the n8.0 release")
+        if not probe_version.startswith("ffprobe version n8.0"):
+            raise RuntimeError("Pinned Linux FFprobe bundle does not report the n8.0 release")
+        if "--enable-gpl" not in build_config or "--enable-libx264" not in build_config:
+            raise RuntimeError("Pinned Linux FFmpeg build lacks the GPL x264 encoder configuration")
+        if "--enable-nonfree" in build_config or license_id != "GPL-2.0-or-later":
+            raise RuntimeError("Pinned Linux FFmpeg bundle has an unexpected or nonfree license")
+        if f"commit {LINUX_FFMPEG_COMMIT}" not in source_info or f"commit {LINUX_X264_COMMIT}" not in source_info:
+            raise RuntimeError("Pinned Linux FFmpeg source notice is missing the exact source commits")
+        if "H.264 MP4 encode/decode" not in str(source_build.get("smoke_test", "")):
+            raise RuntimeError("Pinned Linux FFmpeg build metadata lacks the successful H.264 smoke test")
 
     license_source = ROOT / "docs" / "licenses" / license_file
     if not license_source.is_file():
         raise RuntimeError(f"The matching FFmpeg license text is missing: {license_source}")
     bundled_license = stage_app / "bin" / f"LICENSE-FFMPEG-{license_file}"
     shutil.copy2(license_source, bundled_license)
-    source_info = (
-        "FFmpeg/FFprobe are separately invoked command-line programs.\n"
-        f"Detected license: {license_id}\n"
-        "FFmpeg source release: https://ffmpeg.org/releases/ffmpeg-8.0.tar.xz\n"
-        "FFmpeg source tag: https://github.com/FFmpeg/FFmpeg/tree/n8.0\n"
-        "Binary distribution/build project: https://github.com/zackees/ffmpeg_bins\n"
-        "Build project: https://github.com/zackees/static_ffmpeg\n"
-        "Build configuration is recorded in FFMPEG-BUILD-INFO.txt.\n"
-        "The FFmpeg source is separately licensed; it is not covered by the LotVue360 proprietary license.\n"
-    )
+    python_license_source = ROOT / "docs" / "licenses" / "Python-PSF-2.0.txt"
+    if not python_license_source.is_file():
+        raise RuntimeError(f"The Python Software Foundation license text is missing: {python_license_source}")
+    shutil.copy2(python_license_source, stage_app / "bin" / "LICENSE-PYTHON-PSF-2.0.txt")
+    if source_archives:
+        staged_sources = stage_app / "bin" / "source"
+        staged_sources.mkdir(parents=True, exist_ok=True)
+        for name in sorted(source_archives):
+            shutil.copy2(source_root / "source" / name, staged_sources / name)
+        shutil.copy2(source_root / "BUILD-INFO.json", stage_app / "bin" / "FFMPEG-SOURCE-BUILD-INFO.json")
     (stage_app / "bin" / "FFMPEG-LICENSE.txt").write_text(
         source_info + "\n--- ffmpeg -L ---\n" + license_text + "\n", encoding="utf-8",
     )
     (stage_app / "bin" / "FFMPEG-BUILD-INFO.txt").write_text(
         "--- ffmpeg -version ---\n" + version_text
         + "\n\n--- ffprobe -version ---\n" + probe_version
-        + "\n\n--- ffmpeg -buildconf ---\n" + build_config + "\n",
+        + "\n\n--- ffmpeg -buildconf ---\n" + build_config
+        + ("\n\n--- source build metadata ---\n" + build_info_text if build_info_text else "")
+        + "\n",
         encoding="utf-8",
     )
-    return {
+    result: dict[str, object] = {
         "ffmpeg": ffmpeg_target.name,
         "ffprobe": ffprobe_target.name,
         "license": license_id,
         "ffmpeg_sha256": _checksum(ffmpeg_target),
         "ffprobe_sha256": _checksum(ffprobe_target),
     }
+    if source_archives:
+        result["source_archives"] = source_archives
+    return result
 
 
 def _architecture() -> str:
@@ -297,6 +374,9 @@ def build(platform_name: str, output: Path, build_id: str) -> Path:
                 "First launch creates a private per-user data directory and copies app/.env.example to .env.\n"
                 "Open Dealer Studio and sign in or register. External services require your own approved accounts\n"
                 "and credentials; they are never embedded in this installer.\n\n"
+                "The release workflow also builds a native one-click installer for each supported desktop target.\n"
+                "On Linux x86_64, the single-file .run installer embeds this package; Windows and macOS installers\n"
+                "are separate native workflow outputs.\n\n"
                 "ComfyUI/WAN model weights and CUDA/Gaussian reconstruction tools are optional, hardware-specific\n"
                 "integrations and are not bundled. See INSTALLATION.md and THIRD_PARTY_NOTICES.md for setup and\n"
                 "redistribution notes. The bundle is unsigned and not notarized.\n",
@@ -331,6 +411,11 @@ def build(platform_name: str, output: Path, build_id: str) -> Path:
             "platform": platform_name,
             "architecture": arch,
             "python": platform.python_version(),
+            "one_click_installer": {
+                "windows": "LotVue360-OneClick-windows-x64.exe",
+                "macos": f"LotVue360-OneClick-macOS-{arch}.dmg",
+                "linux": f"LotVue360-OneClick-linux-{arch}.run",
+            }[platform_name],
             "python_constraints_file": "PYTHON-BUILD-CONSTRAINTS.txt",
             "bundled_engines": ["CPU background removal runtime", "FFmpeg", "FFprobe"],
             "ffmpeg_files": binaries,
@@ -356,6 +441,12 @@ def build(platform_name: str, output: Path, build_id: str) -> Path:
     )
     print(f"release artifact: {archive_path} ({archive_path.stat().st_size:,} bytes)")
     print(f"sha256: {checksum}")
+
+    if platform_name == "linux":
+        installer_path = output / f"LotVue360-OneClick-linux-{arch}.run"
+        create_linux_one_click_installer(package_root, installer_path)
+        print(f"one-click installer: {installer_path} ({installer_path.stat().st_size:,} bytes)")
+        print(f"sha256: {_checksum(installer_path)}")
     return archive_path
 
 
