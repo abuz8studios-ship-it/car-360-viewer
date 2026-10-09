@@ -537,11 +537,11 @@ def _make_tokens(email: str, role: str = "user"):
 
 @router.post("/api/auth/token")
 async def auth_token(body: TokenRequest, response: Response):
-    import hashlib
+    from passwords import verify_password
     conn = _db()
-    user = conn.execute("SELECT * FROM users WHERE email=?", (body.email.lower().strip(),)).fetchone()
+    user = conn.execute("SELECT * FROM users WHERE lower(email)=?", (body.email.lower().strip(),)).fetchone()
     conn.close()
-    if not user or user["password_hash"] != hashlib.sha256(body.password.encode()).hexdigest():
+    if not user or not verify_password(body.password, user["password_hash"] or ""):
         raise HTTPException(401, "Invalid email or password")
     tokens = _make_tokens(user["email"])
     # browser sessions: HttpOnly cookie so dashboard fetch() works without headers

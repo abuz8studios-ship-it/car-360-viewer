@@ -15,8 +15,8 @@ from datetime import datetime
 from typing import Optional
 from PIL import Image
 
-STORAGE_DIR = Path(r"E:\ABU\360Car\app\storage")
-SCENES_DIR = Path(r"E:\ABU\360Car\app\static\scenes")
+STORAGE_DIR = Path(__file__).resolve().parents[1] / "storage"
+SCENES_DIR = Path(__file__).resolve().parents[1] / "static" / "scenes"
 
 # Premium showroom scenes (shipped with LotVue Pro)
 PREMIUM_SCENES = {

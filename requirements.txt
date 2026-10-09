@@ -1,0 +1,20 @@
+# LotVue360 — core server dependencies (Python 3.11).
+# Install:  pip install -r requirements.txt
+# Run:      cd app && python -m uvicorn main:app --host 0.0.0.0 --port 8360
+#
+# Lower bounds only; the versions in the comments are what the test suite
+# (tests/) was last run against on 2026-10-09.
+fastapi>=0.110            # 0.143.0
+uvicorn[standard]>=0.29   # 0.54.0
+python-multipart>=0.0.9   # 0.0.32  (form/file uploads)
+pydantic>=2.5             # 2.14.0
+Pillow>=10.0              # 12.3.0
+pillow-heif>=0.16         # 1.8.0   (iPhone HEIC uploads)
+numpy>=1.26               # 2.4.6
+opencv-python-headless>=4.8   # optical flow, ORB ordering + gate (headless: no libGL needed; app never opens windows)
+rembg[cpu]>=2.0.50        # background segmentation (u2net); use rembg[gpu] on CUDA hosts
+stripe>=8.0               # 16.0.0  (subscription checkout + webhooks)
+python-jose[cryptography]>=3.3   # 3.5.0  (JWT sessions)
+qrcode>=7.4               # 8.2     (QR export)
+reportlab>=4.0            # 5.0.1   (condition report / window sticker PDFs)
+requests>=2.31            # 2.34.2

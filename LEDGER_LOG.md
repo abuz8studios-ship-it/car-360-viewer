@@ -22,3 +22,11 @@ Production server had been returning 502 since on/around 2026-08-12 because the 
 
 ## 2026-09-03 — Docs reverse-engineered from disk evidence
 Reverse-engineered README/PRD/LEDGER_LOG from disk evidence during empire inventory pass.
+
+## 2026-10-09 — Step 7 (payment) built, security holes closed, plate blur working
+Commits `97fcf7c`, `243014d` and the follow-up docs commit, all on branch `arena/4d8a2343-car-360-viewer`.
+- `app/billing.py`: Stripe Checkout (subscription), signed + idempotent webhook, `/billing` receipts page, Customer Portal, 402 paywall after `LOTVUE_FREE_VEHICLES`. The price lives in one env var (`LOTVUE_PRICE_MONTHLY_CENTS`, default 9900).
+- Closed: the old webhook accepted **unsigned** JSON when no secret was set, so anyone could forge a credit purchase. Any signed-in dealer could also self-upgrade via `/api/set-plan`. Passwords were unsalted sha256 (now PBKDF2, with legacy hashes upgraded on login). Login had an open redirect, and `/` showed the full inventory dashboard to anonymous visitors.
+- Plate blur: old detector found 0/2 readable plates on real photos. Rewritten detector found 2/2, with 0 false positives on 8 real car photos plus the Select Auto studio sample; full-res before/after inspected. Wired as `POST /api/vehicle/{vin}/blur-plates` and opt-in auto-run after finalize.
+- `tests/`: 21 tests passing, from a fresh venv built off the new `requirements*.txt`. Includes the automated stranger-dealer test with payment.
+- NOT verified live: no access to api.stripe.com from the build sandbox, and the production key is expired (owner gate). Step 7 stays unchecked until one real charge + refund is done on production.

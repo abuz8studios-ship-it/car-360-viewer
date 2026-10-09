@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-DB_PATH = Path(r"E:\ABU\360Car\app\lotvue.db")
+DB_PATH = Path(__file__).resolve().parents[1] / "lotvue.db"
 
 
 # =============================================================================
