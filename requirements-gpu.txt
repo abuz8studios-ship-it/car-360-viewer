@@ -1,0 +1,16 @@
+# Optional heavy features — only needed on the GPU workstation.
+#   CLIP photo classification + whole-car detection (studio_spin.py, clip_*.py),
+#   AI video commercials (WAN 2.2 via ComfyUI), Kokoro TTS voiceover,
+#   dealer-site scraping, desktop tray app.
+# Install torch for your CUDA version first (https://pytorch.org), then:
+#   pip install -r requirements-gpu.txt
+-r requirements.txt
+transformers>=4.40
+diffusers>=0.27
+safetensors>=0.4
+soundfile>=0.12
+kokoro-onnx>=0.3
+trimesh>=4.0
+curl_cffi>=0.6
+pystray>=0.19
+GPUtil>=1.4

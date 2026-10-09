@@ -18,12 +18,14 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-STORAGE_DIR = Path(r"E:\ABU\360Car\app\storage")
+STORAGE_DIR = Path(__file__).resolve().parents[1] / "storage"
 FACTORY_DIR = Path(r"E:\ABU\ComfyUI\revenue_workflows")
 COMFY_INPUT = Path(r"E:\ABU\ComfyUI\input")
 COMFY_OUTPUT = Path(r"E:\ABU\ComfyUI\output")
-FFMPEG = r"E:\ABU\AI\ffmpeg\ffmpeg.exe"
-LOTVUE_PYTHON = r"E:\Miniconda3\envs\lotvue\python.exe"
+FFMPEG = os.environ.get("FFMPEG_PATH") or (r"E:\ABU\AI\ffmpeg\ffmpeg.exe"
+          if os.path.exists(r"E:\ABU\AI\ffmpeg\ffmpeg.exe") else (shutil.which("ffmpeg") or "ffmpeg"))
+LOTVUE_PYTHON = os.environ.get("LOTVUE_PYTHON") or (r"E:\Miniconda3\envs\lotvue\python.exe"
+          if os.path.exists(r"E:\Miniconda3\envs\lotvue\python.exe") else __import__("sys").executable)
 
 # Motion prompts per angle
 ANGLE_PROMPTS = {
