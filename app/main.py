@@ -165,42 +165,8 @@ MAX_VIDEO_MB = 500
 MAX_PHOTO_MB = 30
 
 # =============================================================================
-# PRICING PLANS (Phase 2)
+# PRICING — defined ONLY in billing.py (plan(), catalog()). Do not add prices here.
 # =============================================================================
-PRICING_PLANS = {
-    "free": {
-        "label": "Free",
-        "credits": 10,
-        "price": 0,
-        "features": ["10 free credits", "Watermarked output", "Basic viewer"]
-    },
-    "pay_per_use": {
-        "label": "Pay Per Use",
-        "credits": 1,
-        "price": 2.99,
-        "features": ["Single render", "No watermark", "HD output"]
-    },
-    "pro_bundle": {
-        "label": "Pro Bundle",
-        "credits": 10,
-        "price": 19.99,
-        "per_credit": 1.99,
-        "features": ["10 renders", "No watermark", "HD output", "Priority processing"]
-    },
-    "dealership": {
-        "label": "Dealership Monthly",
-        "credits": -1,  # unlimited
-        "price": 99.99,
-        "features": ["Unlimited renders", "White-label branding", "API access", "Multi-location"]
-    },
-    "enterprise": {
-        "label": "Enterprise",
-        "credits": -1,
-        "price": 299.99,
-        "features": ["Everything in Dealership", "Custom backgrounds", "Dedicated support", "SLA"]
-    }
-}
-
 # =============================================================================
 # PHASE 5: TENANT SYSTEM - BACKGROUND PRESETS
 # =============================================================================
@@ -609,13 +575,19 @@ def ensure_owner_account():
     UPDATEs password_hash — the DB file itself gets clobbered from outside
     the server (external tooling working on file-level copies). So instead
     of trusting the row, re-assert it from .env on every boot: set
-    LOTVUE_OWNER_EMAIL + LOTVUE_OWNER_PASSWORD_HASH (sha256 hex) there.
+    LOTVUE_OWNER_EMAIL + LOTVUE_OWNER_PASSWORD_HASH there — either legacy
+    sha256 hex or a salted hash from:  python -c "from passwords import
+    hash_password as h; print(h('your-password'))"  (run inside app/).
     A clean shipped build regenerates .env without these keys
     (make_clean_build.py), so no personal account ever leaves this machine.
     """
     email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
-    pw_hash = os.getenv("LOTVUE_OWNER_PASSWORD_HASH", "").strip().lower()
-    if not email or len(pw_hash) != 64:
+    pw_hash = os.getenv("LOTVUE_OWNER_PASSWORD_HASH", "").strip()
+    if len(pw_hash) == 64:
+        pw_hash = pw_hash.lower()  # legacy sha256 hex
+    elif not pw_hash.startswith("pbkdf2_sha256$"):
+        return
+    if not email:
         return
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -656,7 +628,8 @@ def db_upsert_vehicle(vin, year="", make="", model="", ext_frames=0, int_count=0
         ON CONFLICT(vin) DO UPDATE SET
             year=excluded.year, make=excluded.make, model=excluded.model,
             exterior_frames=excluded.exterior_frames, interior_count=excluded.interior_count,
-            watermark_mode=excluded.watermark_mode, user_email=excluded.user_email,
+            watermark_mode=excluded.watermark_mode,
+            user_email=CASE WHEN excluded.user_email != '' THEN excluded.user_email ELSE user_email END,
             trim_level=CASE WHEN excluded.trim_level != '' THEN excluded.trim_level ELSE trim_level END,
             engine=CASE WHEN excluded.engine != '' THEN excluded.engine ELSE engine END,
             transmission=CASE WHEN excluded.transmission != '' THEN excluded.transmission ELSE transmission END,
@@ -972,11 +945,12 @@ def db_list_dealers() -> list[dict]:
     conn.close()
     return [dict(r) for r in rows]
 
+import billing as _billing
+# Legacy credit plan table — derived from billing.catalog() so the price exists in ONE place.
 PLANS = {
-    "free": {"credits": 5, "price": 0, "label": "Free"},
-    "single": {"credits": 1, "price": 2.99, "label": "Single ($2.99)"},
-    "starter": {"credits": 10, "price": 19.99, "label": "Starter (10 for $19.99)"},
-    "dealership": {"credits": 999999, "price": 75.00, "label": "Dealership Monthly ($75/mo)"},
+    "free": {"credits": _billing.free_vehicle_limit(), "price": 0, "label": "Free"},
+    "dealership": {"credits": 999999, "price": _billing.plan()["amount"],
+                   "label": f"Dealership ({_billing.plan()['display']}/mo)"},
 }
 
 def check_credits(user_email: str) -> tuple[bool, int]:
@@ -1050,226 +1024,13 @@ async def get_watermark(vin: str):
     return {"watermark_mode": vehicle.get("watermark_mode", "preview")}
 
 
-@app.get("/api/plans")
-async def get_plans():
-    return {"plans": PLANS}
-
-
 # =============================================================================
-# API — STRIPE PAYMENTS
+# PAYMENTS — see billing.py (pricing, Stripe Checkout, signed webhook, receipts,
+# paywall). The old /api/create-checkout-session, /api/stripe/create-subscription
+# and /api/render/unlock handlers were removed: they used placeholder price IDs,
+# relative Stripe redirect URLs, and an unsigned webhook that could be forged.
 # =============================================================================
 STRIPE_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
-STRIPE_PUBLISHABLE = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-
-@app.get("/api/stripe/config")
-async def stripe_config():
-    return {"publishable_key": STRIPE_PUBLISHABLE}
-
-
-@app.post("/api/create-checkout-session")
-async def create_checkout_session(
-    plan_id: str = Form(...),
-    user_email: str = Form("")
-):
-    if not FEATURES_ENABLED.get("payments", False):
-        return {"status": "disabled", "error": "Payments feature is disabled"}
-    if not STRIPE_KEY:
-        return {"status": "error", "error": "Stripe not configured"}
-    
-    plan = PLANS.get(plan_id)
-    if not plan:
-        return {"status": "error", "error": "Invalid plan"}
-    
-    try:
-        import stripe
-        stripe.api_key = STRIPE_KEY
-        
-        price_data = {
-            "single": "price_single_xxxxx",
-            "starter": "price_starter_xxxxx",
-            "dealership": "price_dealership_xxxxx",
-        }
-        
-        session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {"name": f"LotVue Pro - {plan['label']}"},
-                    "unit_amount": int(plan["price"] * 100),
-                },
-                "quantity": 1,
-            }],
-            mode="payment",
-            success_url=f"{os.environ.get('LOTVUE_PUBLIC_URL', 'http://127.0.0.1:8001').rstrip('/')}/?payment=success&plan={plan_id}",
-            cancel_url=f"{os.environ.get('LOTVUE_PUBLIC_URL', 'http://127.0.0.1:8001').rstrip('/')}/?payment=cancelled",
-            customer_email=user_email if user_email else None,
-            metadata={"plan_id": plan_id, "credits": str(plan["credits"]), "user_email": user_email}
-        )
-        return {"status": "ok", "session_url": session.url, "session_id": session.id}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
-@app.post("/api/stripe/webhook")
-async def stripe_webhook(request: Request):
-    if not FEATURES_ENABLED.get("payments", False):
-        return JSONResponse({"status": "disabled", "error": "Payments feature is disabled"}, status_code=503)
-    if not STRIPE_KEY:
-        return JSONResponse({"error": "Stripe not configured"}, status_code=500)
-    
-    import stripe
-    stripe.api_key = STRIPE_KEY
-    
-    payload = await request.body()
-    sig = request.headers.get("stripe-signature", "")
-    
-    try:
-        if STRIPE_WEBHOOK_SECRET:
-            event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
-        else:
-            event = json.loads(payload)
-        
-        if event.get("type") == "checkout.session.completed":
-            session = event["data"]["object"]
-            payment_type = session.get("metadata", {}).get("type", "")
-            plan_id = session.get("metadata", {}).get("plan_id", "single")
-            credits = int(session.get("metadata", {}).get("credits", "1"))
-            user_email = session.get("metadata", {}).get("user_email", session.get("customer_email", ""))
-            
-            if payment_type == "unlock_vehicle":
-                # Vehicle unlock payment
-                vin = session.get("metadata", {}).get("vin", "")
-                if vin:
-                    conn = sqlite3.connect(str(DB_PATH))
-                    conn.execute("UPDATE vehicles SET is_paid=1, watermark_mode='clean', payment_id=? WHERE vin=?", 
-                                  (session.get("id", ""), vin))
-                    conn.commit()
-                    conn.close()
-                    
-                    # Generate clean frames (no watermark)
-                    import threading
-                    threading.Thread(target=generate_clean_frames, args=(vin,)).start()
-                    print(f"[LotVue Pro] Vehicle unlocked: {vin}")
-            
-            elif payment_type == "subscription":
-                # Subscription payment - activate plan
-                plan_type = session.get("metadata", {}).get("plan_type", "dealership")
-                if user_email:
-                    user = db_get_user(user_email)
-                    if user:
-                        conn = sqlite3.connect(str(DB_PATH))
-                        conn.execute("UPDATE users SET is_subscribed=1, plan_type=? WHERE email=?", 
-                                      (plan_type, user_email))
-                        conn.commit()
-                        conn.close()
-            
-            elif user_email:
-                # Credit purchase (default)
-                db_add_credits(user_email, credits, f"stripe_purchase_{plan_id}", "")
-                user = db_get_user(user_email)
-                if user:
-                    db_record_payment(
-                        user["id"],
-                        session.get("amount_total", 0) / 100,
-                        plan_id,
-                        credits,
-                        session.get("id", ""),
-                        "completed"
-                    )
-        
-        return {"status": "received"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-
-# =============================================================================
-# PHASE 3: STRIPE SUBSCRIPTION & RENDER UNLOCK
-# =============================================================================
-@app.post("/api/stripe/create-subscription")
-async def create_subscription(
-    user_email: str = Form(...),
-    plan_type: str = Form("dealership")
-):
-    """Create monthly subscription (dealership/enterprise)."""
-    if not FEATURES_ENABLED.get("payments", False):
-        return {"status": "disabled", "error": "Payments feature is disabled"}
-    if not STRIPE_KEY:
-        return {"error": "Stripe not configured"}
-    
-    plan = PRICING_PLANS.get(plan_type)
-    if not plan:
-        return {"error": "Invalid plan"}
-    
-    try:
-        import stripe
-        stripe.api_key = STRIPE_KEY
-        
-        # Create or get customer
-        customer = None
-        user = db_get_user(user_email)
-        if user and user.get("stripe_customer_id"):
-            customer = stripe.Customer.retrieve(user["stripe_customer_id"])
-        else:
-            customer = stripe.Customer.create(email=user_email)
-        
-        # Create subscription price (you'd create this in Stripe dashboard)
-        price_id = "price_monthly_subscription"  # Replace with actual Stripe price ID
-        
-        subscription = stripe.Subscription.create(
-            customer=customer.id,
-            items=[{"price": price_id, "quantity": 1}],
-            metadata={"user_email": user_email, "plan_type": plan_type}
-        )
-        
-        return {"status": "ok", "subscription_id": subscription.id, "client_secret": subscription.get("latest_invoice", {}).get("payment_intent", {}).get("client_secret")}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/api/render/unlock")
-async def unlock_render(
-    vin: str = Form(...),
-    user_email: str = Form("")
-):
-    """Create payment link to unlock a rendered vehicle (remove watermark)."""
-    if not FEATURES_ENABLED.get("payments", False):
-        return {"status": "disabled", "error": "Payments feature is disabled"}
-    if not STRIPE_KEY:
-        return {"error": "Stripe not configured"}
-    
-    vehicle = db_get_vehicle(vin)
-    if not vehicle:
-        return {"error": "Vehicle not found"}
-    
-    if vehicle.get("is_paid"):
-        return {"status": "already_paid", "message": "Vehicle already unlocked"}
-    
-    try:
-        import stripe
-        stripe.api_key = STRIPE_KEY
-        
-        session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {"name": f"LotVue Pro - Unlock {vin}"},
-                    "unit_amount": 299,  # $2.99
-                },
-                "quantity": 1,
-            }],
-            mode="payment",
-            success_url=f"/view/{vin}?payment=success",
-            cancel_url=f"/view/{vin}?payment=cancelled",
-            metadata={"vin": vin, "user_email": user_email, "type": "unlock_vehicle"}
-        )
-        
-        return {"status": "ok", "payment_url": session.url, "session_id": session.id}
-    except Exception as e:
-        return {"error": str(e)}
-
 
 # =============================================================================
 # PHASE 4: RENDER STATUS API
@@ -1423,65 +1184,92 @@ async def get_user(email: str):
     }
 
 
+def _db_get_user_ci(email: str):
+    """Case-insensitive user lookup (older rows may have mixed-case emails)."""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM users WHERE lower(email)=?", (email.strip().lower(),)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _issue_session_cookie(request: Request, response: Response, email: str):
+    """Set the same HttpOnly JWT cookie the auth gate checks."""
+    from a2_extensions import _make_tokens, ACCESS_TTL_H
+    tokens = _make_tokens(email)
+    secure = (request.headers.get("x-forwarded-proto") or request.url.scheme) == "https"
+    response.set_cookie("lotvue_token", tokens["access_token"], httponly=True,
+                        samesite="lax", secure=secure, max_age=ACCESS_TTL_H * 3600)
+    return tokens
+
+
+def _safe_next(nxt: str) -> str:
+    # only allow same-site relative redirects (no open redirect)
+    if nxt and nxt.startswith("/") and not nxt.startswith("//"):
+        return nxt
+    return "/dashboard"
+
+
 @app.post("/api/register")
 async def register_user(
+    request: Request,
+    response: Response,
     email: str = Form(...),
     name: str = Form(""),
-    password: str = Form("")
+    password: str = Form(""),
+    next: str = Form(""),
 ):
     if not FEATURES_ENABLED.get("auth", False):
-        return {"status": "disabled", "error": "Auth feature is disabled"}
-    import hashlib
-    pw_hash = hashlib.sha256(password.encode()).hexdigest()
-    db_create_user(email, name, pw_hash)
-    return {"status": "ok", "email": email}
+        return JSONResponse({"status": "disabled", "error": "Sign-up is turned off on this server."},
+                            status_code=503)
+    from passwords import hash_password, normalize_email, validate_signup
+    email = normalize_email(email)
+    err = validate_signup(email, password)
+    if err:
+        return JSONResponse({"status": "error", "error": err}, status_code=400)
+    if _db_get_user_ci(email):
+        return JSONResponse({"status": "error",
+                             "error": "An account with this email already exists. Sign in instead."},
+                            status_code=409)
+    db_create_user(email, name.strip(), hash_password(password))
+    # sign the new dealer straight in -> lands on a working dashboard, no second form
+    try:
+        _issue_session_cookie(request, response, email)
+    except Exception as e:
+        print(f"[Auth] cookie issue failed after register: {e}")
+    return {"status": "ok", "email": email, "next": _safe_next(next)}
 
 
 @app.post("/api/login")
 async def login_user(
+    request: Request,
     response: Response,
     email: str = Form(...),
-    password: str = Form("")
+    password: str = Form(""),
 ):
     if not FEATURES_ENABLED.get("auth", False):
-        return {"status": "disabled", "error": "Auth feature is disabled"}
-    import hashlib
-    pw_hash = hashlib.sha256(password.encode()).hexdigest()
-    user = db_get_user(email)
-    if not user or user.get("password_hash") != pw_hash:
-        return {"status": "error", "error": "Invalid credentials"}
-    # issue the same JWT session cookie the auth gate checks
+        return JSONResponse({"status": "disabled", "error": "Sign-in is turned off on this server."},
+                            status_code=503)
+    from passwords import verify_password, is_legacy_hash, hash_password, normalize_email
+    email = normalize_email(email)
+    user = _db_get_user_ci(email)
+    if not user or not verify_password(password, user.get("password_hash") or ""):
+        return JSONResponse({"status": "error", "error": "Invalid email or password"}, status_code=401)
+    # transparently upgrade legacy unsalted sha256 hashes (not the .env-asserted owner row)
+    if is_legacy_hash(user.get("password_hash") or "") and \
+            user["email"].lower() != os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower():
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(password), user["id"]))
+        conn.commit()
+        conn.close()
     try:
-        from a2_extensions import _make_tokens, ACCESS_TTL_H
-        tokens = _make_tokens(user["email"])
-        response.set_cookie("lotvue_token", tokens["access_token"], httponly=True,
-                            samesite="lax", max_age=ACCESS_TTL_H * 3600)
+        _issue_session_cookie(request, response, user["email"])
     except Exception as e:
         print(f"[Auth] cookie issue failed (login still ok): {e}")
     return {"status": "ok", "email": user["email"], "credits": user.get("credits", 5), "plan": user.get("plan", "free")}
 
 
-@app.post("/api/set-plan")
-async def set_user_plan(
-    email: str = Form(...),
-    plan: str = Form("free")
-):
-    if not FEATURES_ENABLED.get("auth", False):
-        return {"status": "disabled", "error": "Auth feature is disabled"}
-    if plan not in PLANS:
-        return {"status": "error", "error": "Invalid plan"}
-    user = db_get_user(email)
-    if not user:
-        db_create_user(email)
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("UPDATE users SET plan=? WHERE email=?", (plan, email))
-    conn.commit()
-    conn.close()
-    if plan == "dealership":
-        db_update_dealer_plan("default", "dealership")
-    return {"status": "ok", "plan": plan}
-
-
+# /api/set-plan lives in billing.py (admin-only; dealers upgrade via Stripe Checkout).
 # =============================================================================
 # API — HEALTH CHECK
 # =============================================================================
@@ -2283,6 +2071,7 @@ async def dashboard(request: Request):
             <a href="/">Dashboard</a>
             <a href="/capture">Upload</a>
             <a href="/settings">Settings</a>
+            <a href="/billing">Billing</a>
             <a href="/health" target="_blank">System</a>
             <a href="/capture" class="btn-add">+ Add Vehicle</a>
         </nav>
@@ -2958,6 +2747,11 @@ async def capture_page():
         showGatePanel(d.detail.gate);
         return null;
       }}
+      if (r.status === 402 && d.detail) {{
+        if (confirm((d.detail.message || 'Free vehicles used up.') + '\n\nOpen pricing to subscribe?'))
+          location.href = d.detail.upgrade_url || '/pricing';
+        return null;
+      }}
       if (!r.ok) {{
         const det = d.detail;
         throw new Error(typeof det === 'string' ? det : (det && JSON.stringify(det)) || 'Upload failed');
@@ -3235,8 +3029,23 @@ async def process_order(job_id: str):
 # =============================================================================
 # API — CREATE VEHICLE (for photo-only mode, no video)
 # =============================================================================
+def _claim_vehicle(request: Request, vin: str):
+    """Tie a vehicle to the signed-in dealer (only claims rows nobody owns yet)."""
+    email = _billing.session_email(request)
+    if not email or not vin:
+        return
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("INSERT OR IGNORE INTO vehicles (vin, created_at, user_email) VALUES (?, ?, ?)",
+                 (vin, datetime.now().isoformat(), email))
+    conn.execute("UPDATE vehicles SET user_email=? WHERE vin=? AND COALESCE(user_email,'')=''",
+                 (email, vin))
+    conn.commit()
+    conn.close()
+
+
 @app.post("/api/create-vehicle")
 async def create_vehicle(
+    request: Request,
     vin: str = Form(...),
     year: str = Form(""),
     make: str = Form(""),
@@ -3246,6 +3055,7 @@ async def create_vehicle(
     mileage: str = Form(""),
 ):
     vin = validate_vin(vin)
+    _billing.require_vehicle_quota(request, vin)  # 402 once free vehicles are used up
 
     vehicle_dir = STORAGE_DIR / vin
     exterior_dir = vehicle_dir / "exterior"
@@ -3303,6 +3113,7 @@ async def create_vehicle(
                  (color, price, mileage, vin))
     conn.commit()
     conn.close()
+    _claim_vehicle(request, vin)
 
     return {"status": "ok", "vin": vin, "decoded": decoded, "workflow_status": "intake"}
 
@@ -3604,6 +3415,7 @@ preload();
 # =============================================================================
 @app.post("/api/upload")
 async def upload_media(
+    request: Request,
     vin: str = Form(""),
     year: str = Form(""),
     make: str = Form(""),
@@ -3622,6 +3434,7 @@ async def upload_media(
         vin = f"LV360{job_id.replace('-','')[:12].upper()}"
 
     vin = validate_vin(vin)
+    _billing.require_vehicle_quota(request, vin)  # 402 once free vehicles are used up
 
     vehicle_dir = STORAGE_DIR / vin
     raw_dir = vehicle_dir / "raw"
@@ -3678,6 +3491,7 @@ async def upload_media(
             print(f"[gate] FORCED past FAIL for {vin}: {gate['reasons']}")
 
         db_upsert_vehicle(vin, year, make, model, photo_count, 0, job_id=job_id)
+        _claim_vehicle(request, vin)
 
         return {"job_id": job_id, "photo_count": photo_count, "status": "uploaded",
                 "vin": vin, "gate": gate_summary(gate)}
@@ -3721,6 +3535,7 @@ async def upload_media(
 
     generate_thumbnail(exterior_dir, vehicle_dir / "thumbnail.jpg")
     db_upsert_vehicle(vin, year, make, model, num_extracted, 0, job_id=job_id)
+    _claim_vehicle(request, vin)
 
     return {"job_id": job_id, "vin": vin, "frames_extracted": num_extracted,
             "status": "uploaded", "gate": gate_summary(gate)}
@@ -7087,167 +6902,7 @@ async def capture_mobile():
     return HTMLResponse(html)
 
 
-# =============================================================================
-# ROUTES — PRICING PAGE (Phase 7)
-# =============================================================================
-@app.get("/pricing")
-async def pricing_page():
-    html = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LotVue Pro — Pricing</title>
-    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', 'Segoe UI', -apple-system, sans-serif; background: #0a1628; color: #f5f0e8; min-height: 100vh; }
-        .header { background: linear-gradient(135deg,#0f2040 0%,#0a1628 100%); padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1a2e50; }
-        .logo { font-family: 'Playfair Display', serif; font-size: 1.4rem; font-weight: 700; color: #c9a84c; }
-        .container { max-width: 900px; margin: 0 auto; padding: 3rem 1.5rem; text-align: center; }
-        h1 { font-family: 'Playfair Display', serif; font-size: 2.2rem; margin-bottom: 1rem; color: #f5f0e8; }
-        .subtitle { color: #a0aab4; font-size: 1.1rem; margin-bottom: 3rem; }
-
-        .plans { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1.5rem; margin: 2rem 0; }
-        .plan { background: #0d1a30; border: 1px solid #1a2e50; border-radius: 12px; padding: 2rem; text-align: center; transition: all 0.2s; }
-        .plan:hover { border-color: #c9a84c40; box-shadow: 0 4px 20px rgba(201,168,76,0.08); }
-        .plan.featured { border-color: #c9a84c; box-shadow: 0 0 20px rgba(201,168,76,0.15); }
-        .plan-badge { background: #c9a84c; color: #0a1628; padding: 0.2rem 0.6rem; border-radius: 20px; font-size: 0.7rem; font-weight: 700; display: inline-block; margin-bottom: 0.5rem; }
-        .plan-name { font-size: 1.2rem; font-weight: 600; color: #f5f0e8; margin-bottom: 0.5rem; }
-        .plan-price { font-size: 2rem; font-weight: 700; color: #c9a84c; margin-bottom: 0.3rem; }
-        .plan-price span { font-size: 0.9rem; font-weight: 400; color: #a0aab4; }
-        .plan-credits { color: #a0aab4; font-size: 0.85rem; margin-bottom: 1.5rem; }
-        .plan-features { text-align: left; margin-bottom: 1.5rem; }
-        .plan-features li { color: #a0aab4; font-size: 0.85rem; margin-bottom: 0.5rem; list-style: none; padding-left: 1.2rem; position: relative; }
-        .plan-features li::before { content: '✓'; position: absolute; left: 0; color: #2ab89a; }
-
-        .btn { display: inline-block; background: #1a8a7a; border: none; padding: 0.8rem 1.5rem; color: white; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 1rem; text-decoration: none; transition: background 0.2s; }
-        .btn:hover { background: #2ab89a; }
-        .btn-outline { background: transparent; border: 1px solid #1a2e50; color: #a0aab4; }
-        .btn-outline:hover { border-color: #c9a84c; color: #c9a84c; }
-        .btn-full { width: 100%; }
-
-        .faq { text-align: left; margin-top: 3rem; }
-        .faq h2 { font-family: 'Playfair Display', serif; color: #f5f0e8; font-size: 1.3rem; margin-bottom: 1.5rem; }
-        .faq-item { background: #0f2040; border: 1px solid #1a2e50; border-radius: 8px; padding: 1.2rem; margin-bottom: 0.8rem; }
-        .faq-q { color: #f5f0e8; font-weight: 600; margin-bottom: 0.5rem; }
-        .faq-a { color: #a0aab4; font-size: 0.9rem; line-height: 1.5; }
-
-        @media (max-width: 600px) { .plans { grid-template-columns: 1fr; } }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="logo">LotVue Pro</div>
-        <a href="/" style="color:#c9a84c;text-decoration:none;">Dashboard</a>
-    </div>
-    <div class="container">
-        <h1>Simple, Transparent Pricing</h1>
-        <p class="subtitle">Start free. Upgrade when you need more.</p>
-        
-        <div class="plans">
-            <div class="plan">
-                <div class="plan-name">Free</div>
-                <div class="plan-price">$0</div>
-                <div class="plan-credits">5 credits included</div>
-                <ul class="plan-features">
-                    <li>5 vehicle 360 views</li>
-                    <li>Background removal</li>
-                    <li>Shareable links</li>
-                    <li>Embed code</li>
-                </ul>
-                <a href="/register" class="btn btn-outline btn-full">Get Started</a>
-            </div>
-            
-            <div class="plan">
-                <div class="plan-name">Single</div>
-                <div class="plan-price">$2.99</div>
-                <div class="plan-credits">1 vehicle</div>
-                <ul class="plan-features">
-                    <li>1 vehicle 360 view</li>
-                    <li>No watermark</li>
-                    <li>All features included</li>
-                </ul>
-                <button class="btn btn-full" onclick="buyPlan('single')">Buy Now</button>
-            </div>
-            
-            <div class="plan">
-                <div class="plan-name">Starter</div>
-                <div class="plan-price">$19.99</div>
-                <div class="plan-credits">10 vehicles</div>
-                <ul class="plan-features">
-                    <li>10 vehicle 360 views</li>
-                    <li>No watermark</li>
-                    <li>Priority processing</li>
-                    <li>Email support</li>
-                </ul>
-                <button class="btn btn-full" onclick="buyPlan('starter')">Buy Now</button>
-            </div>
-            
-            <div class="plan featured">
-                <div class="plan-badge">MOST POPULAR</div>
-                <div class="plan-name">Dealership</div>
-                <div class="plan-price">$75<span>/mo</span></div>
-                <div class="plan-credits">Unlimited vehicles</div>
-                <ul class="plan-features">
-                    <li>Unlimited vehicles</li>
-                    <li>No watermark</li>
-                    <li>Multi-user access</li>
-                    <li>Custom branding</li>
-                    <li>Priority support</li>
-                    <li>API access</li>
-                </ul>
-                <button class="btn btn-full" onclick="buyPlan('dealership')">Start Free Trial</button>
-            </div>
-        </div>
-        
-        <div class="faq">
-            <h2>Frequently Asked Questions</h2>
-            <div class="faq-item">
-                <div class="faq-q">What is a credit?</div>
-                <div class="faq-a">Each vehicle you create a 360 view for uses 1 credit. You get 5 free credits when you sign up.</div>
-            </div>
-            <div class="faq-item">
-                <div class="faq-q">Can I remove the watermark?</div>
-                <div class="faq-a">Yes! Purchase any paid plan to remove watermarks from your 360 views and access clean, professional images.</div>
-            </div>
-            <div class="faq-item">
-                <div class="faq-q">What happens to my vehicles if I cancel?</div>
-                <div class="faq-a">Your vehicles remain accessible. You'll keep any 360 views you've already created. You just won't be able to create new ones without credits.</div>
-            </div>
-            <div class="faq-item">
-                <div class="faq-q">Is there a free trial for Dealership?</div>
-                <div class="faq-a">Yes! Contact us for a 14-day free trial of the Dealership plan with all features enabled.</div>
-            </div>
-        </div>
-    </div>
-    
-    <script>
-        async function buyPlan(planId) {{
-            const email = prompt('Enter your email to purchase:');
-            if (!email) return;
-            try {{
-                const r = await fetch('/api/create-checkout-session', {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                    body: 'plan_id=' + planId + '&user_email=' + encodeURIComponent(email)
-                }});
-                const data = await r.json();
-                if (data.session_url) {{
-                    window.location.href = data.session_url;
-                }} else {{
-                    alert('Stripe not configured yet. Email us at support@auto360.app to purchase.');
-                }}
-            }} catch(e) {{
-                alert('Error: ' + e.message);
-            }}
-        }}
-    </script>
-</body>
-</html>"""
-    return HTMLResponse(html)
-
-
+# /pricing lives in billing.py (single source of truth for price).
 # =============================================================================
 # ROUTES — AUTH PAGES (Phase 7)
 # =============================================================================
@@ -7283,8 +6938,9 @@ async def register_page():
     <div class="card">
         <div class="logo">LotVue Pro</div>
         <h1>Create Account</h1>
-        <p class="subtitle">5 free credits. No credit card required.</p>
-        <div class="success" id="successMsg">Account created! Redirecting...</div>
+        <p class="subtitle">Your first vehicles are free. No credit card required.</p>
+        <div class="success" id="successMsg">Account created! Opening your dashboard…</div>
+        <div class="error" id="errorMsg" style="background:rgba(248,81,73,0.15);border:1px solid #da3633;border-radius:6px;padding:0.8rem;color:#f85149;text-align:center;margin-bottom:1rem;display:none;"></div>
         <form id="regForm" onsubmit="doRegister(event)">
             <div class="fg">
                 <label>Email</label>
@@ -7296,33 +6952,40 @@ async def register_page():
             </div>
             <div class="fg">
                 <label>Password</label>
-                <input type="password" name="password" required placeholder="Create a password">
+                <input type="password" name="password" required minlength="8" placeholder="At least 8 characters">
             </div>
             <button type="submit" class="btn">Create Account</button>
         </form>
         <div class="links">
             <a href="/login">Already have an account? Sign in</a><br>
-            <a href="/">Back to Dashboard</a>
+            <a href="/pricing">See pricing</a>
         </div>
     </div>
     <script>
         async function doRegister(e) {
             e.preventDefault();
+            const btn = e.target.querySelector('button');
+            const err = document.getElementById('errorMsg');
+            err.style.display = 'none';
+            btn.textContent = 'Creating account…'; btn.disabled = true;
             const fd = new FormData(e.target);
             const params = new URLSearchParams();
             for (const [k, v] of fd.entries()) params.append(k, v);
+            params.append('next', new URLSearchParams(location.search).get('next') || '/dashboard');
             try {
-                const r = await fetch('/api/register', { method: 'POST', body: params });
+                const r = await fetch('/api/register', { method: 'POST', body: params, credentials: 'same-origin' });
                 const data = await r.json();
                 if (data.status === 'ok') {
                     document.getElementById('successMsg').style.display = 'block';
-                    setTimeout(() => window.location.href = '/login', 1000);
-                } else {
-                    alert(data.error || 'Registration failed');
+                    window.location.href = data.next || '/dashboard';
+                    return;
                 }
-            } catch (err) {
-                alert('Connection error — try again');
+                err.textContent = data.error || 'Registration failed';
+            } catch (ex) {
+                err.textContent = 'Connection error — try again';
             }
+            err.style.display = 'block';
+            btn.textContent = 'Create Account'; btn.disabled = false;
         }
     </script>
 </body>
@@ -7362,7 +7025,7 @@ async def login_page():
     <div class="card">
         <div class="logo">LotVue Pro</div>
         <h1>Sign In</h1>
-        <p class="subtitle">Welcome back!</p>
+        <p class="subtitle">Welcome back! New dealers: <a href="/register" style="color:#c9a84c">create a free account</a>.</p>
         <div class="error" id="errorMsg">Invalid credentials</div>
         <form id="loginForm" onsubmit="doLogin(event)">
             <div class="fg">
@@ -7376,8 +7039,8 @@ async def login_page():
             <button type="submit" class="btn">Sign In</button>
         </form>
         <div class="links">
-            <a href="/register">Create account</a><br>
-            <a href="/">Back to Dashboard</a>
+            <a href="/register">New here? Create a free account</a><br>
+            <a href="/pricing">See pricing</a>
         </div>
     </div>
     <script>
@@ -7389,10 +7052,11 @@ async def login_page():
             const params = new URLSearchParams();
             for (const [k, v] of fd.entries()) params.append(k, v);
             try {
-                const r = await fetch('/api/login', { method: 'POST', body: params });
+                const r = await fetch('/api/login', { method: 'POST', body: params, credentials: 'same-origin' });
                 const data = await r.json();
                 if (data.status === 'ok') {
-                    const next = new URLSearchParams(location.search).get('next') || '/dashboard';
+                    let next = new URLSearchParams(location.search).get('next') || '/dashboard';
+                    if (!next.startsWith('/') || next.startsWith('//')) next = '/dashboard';
                     window.location.href = next;
                 } else {
                     document.getElementById('errorMsg').textContent = data.error || 'Invalid email or password';
@@ -7978,7 +7642,8 @@ async function go(){
     const r=await fetch('/api/vehicle/'+encodeURIComponent(vin)+'/generate-3d',{method:'POST',body:fd,credentials:'same-origin'});
     if(r.status===401){location.href='/login?next=/3d-studio';return}
     const j=await r.json().catch(function(){return {}});
-    if(!r.ok){document.getElementById('status').textContent='⚠ '+(j.detail||('Upload failed — HTTP '+r.status));btn.disabled=false;btn.textContent='Create 360 / 3D';return}
+    if(r.status===402&&j.detail){document.getElementById('status').innerHTML='⚠ '+String(j.detail.message||'Free vehicles used up.').replace(/</g,'&lt;')+' <a href="/pricing">Subscribe</a>';btn.disabled=false;btn.textContent='Create 360 / 3D';return}
+    if(!r.ok){document.getElementById('status').textContent='⚠ '+(typeof j.detail==='string'?j.detail:(j.detail&&(j.detail.message||JSON.stringify(j.detail)))||('Upload failed — HTTP '+r.status));btn.disabled=false;btn.textContent='Create 360 / 3D';return}
     document.getElementById('bar').style.display='block';
     document.getElementById('status').textContent='Processing on the GPU…';
     btn.textContent='Working…';
@@ -8035,7 +7700,7 @@ async def vehicle_3d_status(vin: str):
 
 
 @app.post("/api/vehicle/{vin}/generate-3d")
-async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
+async def generate_3d(vin: str, request: Request, video: Optional[UploadFile] = File(None),
                       photos: Optional[List[UploadFile]] = File(None),
                       steps: str = Form("7000"),
                       style: str = Form("natural"),
@@ -8047,6 +7712,8 @@ async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
     vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
     if not vin:
         raise HTTPException(status_code=400, detail="Provide a vehicle VIN or ID")
+    _billing.require_vehicle_quota(request, vin)  # 402 once free vehicles are used up
+    _claim_vehicle(request, vin)
     style = (style or "natural").strip().lower()
     if style not in ("natural", "studio", "branded"):
         style = "natural"
@@ -8434,6 +8101,9 @@ async def _start_followup_dispatcher():
     threading.Thread(target=_loop, daemon=True).start()
     print("[Follow-up] autonomous dispatcher ON")
 
+
+from billing import register_billing
+register_billing(app, DB_PATH, FEATURES_ENABLED)
 
 from auth_gate import install_auth_gate
 install_auth_gate(app)
