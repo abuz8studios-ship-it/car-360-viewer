@@ -15,6 +15,7 @@ Wired in from main.py via:  from c_intelligence import register_intelligence; re
 """
 
 import os
+import re
 import json
 import sqlite3
 import statistics
@@ -25,9 +26,9 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
+from starlette.concurrency import run_in_threadpool
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "vehicles.db"
+from app_paths import BASE_DIR, DB_PATH
 
 router = APIRouter()
 
@@ -39,8 +40,11 @@ def _db():
 
 
 def _vehicle(vin: str):
+    vin = (vin or "").strip().upper()
+    if not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", vin):
+        raise HTTPException(404, "Vehicle not found")
     conn = _db()
-    v = conn.execute("SELECT * FROM vehicles WHERE vin=?", (vin.upper(),)).fetchone()
+    v = conn.execute("SELECT * FROM vehicles WHERE vin=? AND status='active'", (vin,)).fetchone()
     conn.close()
     if not v:
         raise HTTPException(404, "Vehicle not found")
@@ -49,8 +53,33 @@ def _vehicle(vin: str):
 
 def _fetch_json(url: str, headers: dict = None, timeout: int = 20):
     req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    with urllib.request.urlopen(req, timeout=max(1, min(timeout, 30))) as r:
+        raw = r.read(2 * 1024 * 1024 + 1)
+    if len(raw) > 2 * 1024 * 1024:
+        raise ValueError("External data response is too large")
+    return json.loads(raw)
+
+
+def _epa_fuel_economy(year: str, make: str, model: str) -> dict | None:
+    query = urllib.parse.urlencode({"year": year, "make": make, "model": model})
+    options = _fetch_json(
+        f"https://www.fueleconomy.gov/ws/rest/vehicle/menu/options?{query}",
+        headers={"Accept": "application/json"},
+    )
+    items = options.get("menuItem") or []
+    if isinstance(items, dict):
+        items = [items]
+    if not items:
+        return None
+    vehicle_id = str(items[0].get("value", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", vehicle_id):
+        return None
+    economy = _fetch_json(
+        f"https://www.fueleconomy.gov/ws/rest/vehicle/{vehicle_id}",
+        headers={"Accept": "application/json"},
+    )
+    return {"city": economy.get("city08"), "highway": economy.get("highway08"),
+            "combined": economy.get("comb08"), "fuel": economy.get("fuelType")}
 
 
 # =============================================================================
@@ -61,7 +90,7 @@ MARKETCHECK_HOST = os.getenv("MARKETCHECK_HOST", "https://mc-api.marketcheck.com
 
 
 @router.get("/api/pricing/status")
-async def pricing_status():
+def pricing_status():
     return {
         "marketcheck_configured": bool(MARKETCHECK_KEY),
         "how_to": "Set MARKETCHECK_API_KEY env var. Plans at marketcheck.com/apis "
@@ -84,9 +113,18 @@ def _marketcheck_comps(v: dict, radius: int = 100, zip_code: str = ""):
 
 
 @router.get("/api/pricing/{vin}/market")
-async def market_pricing(vin: str, zip_code: str = "", radius: int = 100):
+def market_pricing(vin: str, zip_code: str = "", radius: int = 100):
     """Market price intelligence for a vehicle. Marketcheck when credentialed,
     otherwise a clearly-labelled local-comps estimate."""
+    vin = (vin or "").strip().upper()
+    if zip_code and (len(zip_code) > 16 or not re.fullmatch(r"[A-Za-z0-9 -]+", zip_code)):
+        raise HTTPException(400, "Invalid location code")
+    try:
+        radius = int(radius)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, "Radius must be between 1 and 500 miles") from exc
+    if not 1 <= radius <= 500:
+        raise HTTPException(400, "Radius must be between 1 and 500 miles")
     v = _vehicle(vin)
     result = {"vin": vin.upper(),
               "vehicle": f"{v.get('year','')} {v.get('make','')} {v.get('model','')}".strip(),
@@ -146,13 +184,15 @@ async def market_pricing(vin: str, zip_code: str = "", radius: int = 100):
 async def vehicle_intel(vin: str):
     """Aggregated vehicle intelligence from legal/public sources:
     NHTSA decode + NHTSA recalls + EPA fuel economy + (Marketcheck if keyed)."""
-    v = _vehicle(vin)
+    v = await run_in_threadpool(_vehicle, vin)
     vin_u = vin.upper()
     out = {"vin": vin_u, "sources_used": [], "generated_at": datetime.now().isoformat()}
 
     # 1. NHTSA vPIC decode (public)
     try:
-        d = _fetch_json(f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{vin_u}?format=json")
+        d = await run_in_threadpool(
+            _fetch_json, f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{vin_u}?format=json"
+        )
         row = (d.get("Results") or [{}])[0]
         out["decode"] = {k: row.get(k) for k in
                          ["ModelYear", "Make", "Model", "Trim", "EngineModel", "EngineCylinders",
@@ -169,8 +209,11 @@ async def vehicle_intel(vin: str):
     # 2. NHTSA recalls (public)
     try:
         if year and make and model:
-            rc = _fetch_json("https://api.nhtsa.gov/recalls/recallsByVehicle?"
-                             + urllib.parse.urlencode({"make": make, "model": model, "modelYear": year}))
+            rc = await run_in_threadpool(
+                _fetch_json,
+                "https://api.nhtsa.gov/recalls/recallsByVehicle?"
+                + urllib.parse.urlencode({"make": make, "model": model, "modelYear": year}),
+            )
             recalls = rc.get("results") or []
             out["recalls"] = {"count": len(recalls),
                               "items": [{"campaign": r.get("NHTSACampaignNumber"),
@@ -184,22 +227,9 @@ async def vehicle_intel(vin: str):
     # 3. EPA fuel economy (public)
     try:
         if year and make and model:
-            q = urllib.parse.urlencode({"year": year, "make": make, "model": model})
-            opts_url = f"https://www.fueleconomy.gov/ws/rest/vehicle/menu/options?{q}"
-            req = urllib.request.Request(opts_url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                opts = json.loads(r.read())
-            items = opts.get("menuItem") or []
-            if isinstance(items, dict):
-                items = [items]
-            if items:
-                vid = items[0].get("value")
-                req2 = urllib.request.Request(f"https://www.fueleconomy.gov/ws/rest/vehicle/{vid}",
-                                              headers={"Accept": "application/json"})
-                with urllib.request.urlopen(req2, timeout=20) as r:
-                    fe = json.loads(r.read())
-                out["fuel_economy"] = {"city": fe.get("city08"), "highway": fe.get("highway08"),
-                                       "combined": fe.get("comb08"), "fuel": fe.get("fuelType")}
+            fuel_economy = await run_in_threadpool(_epa_fuel_economy, year, make, model)
+            if fuel_economy:
+                out["fuel_economy"] = fuel_economy
                 out["sources_used"].append("epa_fueleconomy")
     except Exception as e:
         out["fuel_economy_error"] = str(e)
@@ -207,7 +237,7 @@ async def vehicle_intel(vin: str):
     # 4. Marketcheck pricing (licensed, when keyed)
     if MARKETCHECK_KEY:
         try:
-            mp = await market_pricing(vin)
+            mp = await run_in_threadpool(market_pricing, vin)
             out["market_pricing"] = mp.get("market")
             out["sources_used"].append("marketcheck")
         except Exception as e:
@@ -216,7 +246,7 @@ async def vehicle_intel(vin: str):
     # 5. Black Book valuation (licensed, when keyed)
     if os.getenv("BLACKBOOK_API_TOKEN", ""):
         try:
-            bb = await blackbook_valuation(vin)
+            bb = await run_in_threadpool(blackbook_valuation, vin)
             out["blackbook"] = {k: bb.get(k) for k in ("wholesale", "retail", "trade_in", "as_of")}
             out["sources_used"].append("blackbook")
         except Exception as e:
@@ -225,7 +255,7 @@ async def vehicle_intel(vin: str):
     # 6. AutoCheck history (licensed, when keyed)
     if os.getenv("AUTOCHECK_API_KEY", "") and os.getenv("AUTOCHECK_API_SECRET", ""):
         try:
-            ac = await autocheck_history(vin)
+            ac = await run_in_threadpool(autocheck_history, vin)
             out["autocheck"] = ac.get("report")
             out["sources_used"].append("autocheck")
         except Exception as e:
@@ -297,14 +327,14 @@ _ADAPTERS = {a.name: a for a in [ManheimAdapter(), AdesaAdapter(), CopartAdapter
 
 
 @router.get("/api/auctions/providers")
-async def auction_providers():
+def auction_providers():
     return {"providers": [a.status() for a in _ADAPTERS.values()],
             "note": "Adapters activate automatically once their env credentials are set. "
                     "Dark adapters refuse all operations — no simulated data."}
 
 
 @router.get("/api/auctions/{provider}/status")
-async def auction_status(provider: str):
+def auction_status(provider: str):
     a = _ADAPTERS.get(provider.lower())
     if not a:
         raise HTTPException(404, f"Unknown provider. Available: {list(_ADAPTERS)}")
@@ -312,7 +342,7 @@ async def auction_status(provider: str):
 
 
 @router.get("/api/auctions/{provider}/search")
-async def auction_search(provider: str, make: str = "", model: str = "",
+def auction_search(provider: str, make: str = "", model: str = "",
                          year_min: int = 0, year_max: int = 0):
     a = _ADAPTERS.get(provider.lower())
     if not a:
@@ -328,7 +358,7 @@ BLACKBOOK_HOST = os.getenv("BLACKBOOK_HOST", "https://service.blackbookcloud.com
 
 
 @router.get("/api/valuation/{vin}/blackbook")
-async def blackbook_valuation(vin: str, mileage: int = 0, zip_code: str = ""):
+def blackbook_valuation(vin: str, mileage: int = 0, zip_code: str = ""):
     """Black Book wholesale/retail valuation — UsedCarValues by VIN.
     Activates when BLACKBOOK_API_TOKEN is set (license at blackbook.com/api)."""
     vin = vin.upper()
@@ -375,7 +405,7 @@ AUTOCHECK_HOST = os.getenv("AUTOCHECK_HOST", "https://api.experian.com/automotiv
 
 
 @router.get("/api/history/{vin}/autocheck")
-async def autocheck_history(vin: str):
+def autocheck_history(vin: str):
     """AutoCheck vehicle history score + records via Experian Automotive API.
     Activates when AUTOCHECK_API_KEY/SECRET are set (developer.experian.com)."""
     vin = vin.upper()
@@ -410,7 +440,7 @@ PLATE2VIN_HOST = os.getenv("PLATE2VIN_HOST", "https://platetovin.com/api/convert
 
 
 @router.get("/api/vin/from-plate")
-async def vin_from_plate(plate: str, state: str):
+def vin_from_plate(plate: str, state: str):
     """Reverse VIN from a license plate (licensed plate-to-VIN provider).
     Activates when PLATE2VIN_API_KEY is set. The mobile app's barcode scanner
     covers the no-credential path (door-jamb VIN barcode, client-side ZXing)."""
@@ -431,7 +461,7 @@ async def vin_from_plate(plate: str, state: str):
 
 
 @router.get("/api/intel/status")
-async def intel_status():
+def intel_status():
     """One honest pane: which intelligence integrations are live vs dark."""
     return {
         "marketcheck": {"live": bool(MARKETCHECK_KEY), "env": "MARKETCHECK_API_KEY"},

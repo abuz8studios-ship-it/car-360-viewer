@@ -1,47 +1,68 @@
-# LOTVUE 360 / LOTVUE PRO — CANONICAL LEDGER
-> Single source of truth. REWRITTEN each pass, never appended. Last pass: 2026-08-12 (Cowork: P0 gate + P1a/P1b/P1c shipped).
-> NEVER quote numbers from this file — re-measure live. Snapshots go stale.
+# LotVue360 — Canonical Position Ledger
 
-## CANONICAL
-- **Build**: E:\ABU\01_PRODUCTS\360Car-LotVue — junction E:\ABU\360Car → here.
-- Dead: 01_PRODUCTS\PROJECTS\LOTVUE360 (Apr branch). Nonexistent: E:\ABU\PROJECTS\LOTVUE360.
-- Live: https://lotvue.abuz8ai.com
-- Companion artifacts (same folder): LOTVUE_CREATION_ARTIFACT.md, LOTVUE_GOAL_ARTIFACT.md, COWORK_PROMPT.md
+> **Snapshot:** 2026-10-04 (America/New_York). This ledger is the current repo-level position; dated workstation/production proofs elsewhere remain historical until re-run. Do not treat local tests, configuration checks, or old artifacts as live integration or production proof.
+>
+> **Current code line:** application route/engine source remains `08b9fcd` (`Secure walkaround intermediate artifacts`). Packaging commit `a919b7b` (`Add Linux one-click desktop install path`) on the fixed Arena branch adds Linux packaging scripts, verifier coverage, and workflow steps. No application feature code changed in that packaging commit; later status-only docs may record the current hosted/local build results.
 
-## CAPABILITY LEDGER (DONE rows carry date + commit/probe; re-verify before building on any row)
-| # | Capability | Status | Evidence | Owner gate |
-|---|---|---|---|---|
-| 1 | Cold boot | DONE 08-12 | watchdog relaunches uvicorn :8360 after kill; / 200 local+public | no |
-| 2 | Photo-spin viewer 3-tier | DONE 08-10 bfa8cf1 | /api/viewer, /vdp, /embed all 200 (re-probed 08-12) | no |
-| 3 | Real-3D splat (premium) | DONE 08-10 b1157dd | DSREAL01 live, COLMAP 150/150, Brush scene.ply | no |
-| 4 | DriveSmart scraper+import | DONE 08-10 1ab4643 | 200 vehicles, batches imported | no |
-| 5 | CRM kanban | DONE 08-10 9988f63/7a915b3 | /crm 401 dealer-gated | no |
-| 6 | Desktop installer | DONE 08-10 | LotVue360-Setup 310MB, cold-boot PASS | no |
-| 7 | Android AAB | DONE 08-10 | signed 4.7MB, keystore on disk | Play $25 unpaid |
-| 8 | iOS app | BLOCKED | — | YES: Mac/cloud build |
-| 9 | AI bg replacement | DONE 08-12 | app/studio.py, --probe pixel-verified shadow | no |
-| 10 | Generative mesh (standard) | KILLED 08-11 | 68/118 blob GLBs quarantined. DO NOT RESUME | intentional |
-| 11 | Quality gate validate_video.py | DONE 08-12 | 316 lines; ORB-continuity is the discriminator (aspect-spread + bg-motion measured NON-discriminating: DS8097 spread 0.822, bg 0.154). CLI: DSREAL01 raw PASS / DS8097 FAIL 4/8 weak pairs. Live: /api/upload 422 capture_rejected (DS8097 photos) + 200 gate PASS (real walkaround video, 36 frames). Wired both branches, force=1 override. ALSO wired into /api/vehicle/{vin}/generate-3d photo+video branches (live 422 probed) — the exact route that fed COLMAP 2/N. UI surfaces reasons: /capture gatePanel + /mobile showGateReasons, both with explicit Upload-anyway override (served live, grep=2 each) | no |
-| 12 | Bg asset pack | DONE 08-12 | Disk truth: 40 bgs 1920x1080 in static/backgrounds; studio.py was reading EMPTY static/studio_bg (gradient fallback) — load_bg now falls back to full library. All 40 rendered vs WDDEJ7EB9CA029569 full-res: halo 0.00% (metric injection-validated) + visual pass. NOTE: gradient backdrops, not photo scenes — photoreal pack = upgrade path | no |
-| 13 | Hotspot/damage layer | DONE 08-12 | DB migration close_up; POST/GET carry condition_type/severity/note/close_up (400 without severity); viewer manifest merges DB rows (frame-resolved); /vdp/{vin}/damage-report printable, public 200, headless-Edge screenshot inspected | no |
-| 14 | Google Vehicle Listings feed | DONE 08-12 | /api/feeds/google-vehicle-listings.xml public 200; rebuilt to published spec (fetched 08-12): +g:vin +dealership_name/address +trim, brand→make, color→exterior_color, XML-escaped, unsellable rows skipped; validator 155/155 items pass required attrs | no |
-| 15 | FB Marketplace auto-post | RESEARCHED 08-12 | Marketplace dealer API/feeds DISCONTINUED 2023-01-30; only personal-account assisted posting (~10/day/acct). MVP live: /api/marketplace/facebook/{vin}/pack 200 (guardrailed listing pack) + catalog.csv for Meta vehicle ADS. No partner program to apply to | resolved: no API exists |
-| 16 | Ricoh Theta interior | NOT STARTED | — | YES: hardware |
-| 17 | Stripe checkout | NOT DONE | key expired | YES: refresh key |
-| 18 | Pricing page abuz8ai.com | NOT DONE | needs #17 | no |
-| 19 | DriveSmart written permission | NOT DONE | — | YES: owner obtains |
-| 21 | Universal gallery→studio-spin (Spyne-clone lane) | DONE 08-13 | app/studio_spin.py + clip_fullcar.py: ANY dealer gallery → CLIP exterior/interior/detail → whole-car CLIP (SET-RELATIVE 0.72×median bar — absolute CLIP scores don't transfer between galleries) → matte geometry + set-relative saturation prune (ghost 8.8 vs set median 56; absolute bar killed silver cars) → ORB greedy chain order (chain prune only >12 frames; sparse 45°-apart sets link at 10-20 inliers legitimately) → studio composite → stepped mp4 (NO cross-angle flow — ghosts, re-measured). Proven zero-curation on 3 bodies/colors: Navigator 52→9, Accord 48→9 (interior-through-windshield ghost auto-dropped), Outback 22→8; all sheets eye-verified clean. KNOWN EDGE: CL63 doors-open frames still score as whole-car (29-angle spin has ~8 doors/detail frames) — prompt fine-tune or small detector = next quality step. Demo reel rnd\LOTVUE_SPYNE_CLONE_DEMO.mp4 delivered to owner | no |
-| 20 | 60-SECOND STRANGER-DEALER TEST | PASSED 08-12 (all non-owner-gated steps) | Fresh account dealer60@ → register+login 200 → dashboard 200 (410KB, capture links) → real walkaround upload: gate PASS, 36 frames → order+interpolate 200 → /vdp/<vin> 200 LOCAL+PUBLIC with 360 viewer (screenshot) + real title from DB fallback (viewer_api meta.json→DB) → set-price 200 → vehicle appeared in Google feed, validator 156/156. Bad-capture path: 422 with reasons on same route. Test data cleaned after evidence. REMAINING: payment step = Stripe owner gate (#17→#18) | payment step only |
+## Where we are
 
-## OWNER GATES (Cowork cannot do these)
-- iOS build (Mac or cloud build service)
-- Apple Dev $99/yr + Google Play $25
-- Stripe API key refresh (blocks #17→#18 pricing/checkout, the last big 60-second-test gap)
-- DriveSmart written permission for scraped inventory as GTM dataset
-- Ricoh Theta hardware (if interior prioritized)
-- ~~FB Marketplace partner application~~ resolved: no dealer API exists since 2023 — assisted-posting MVP is the ceiling
+LotVue360 is an actively connected **local application codebase**, not a production-certified or paid product. Dealer Studio now bridges existing inventory/photo/video engines and routes rather than duplicating them. The latest walkaround hardening is locally tested, but no real ComfyUI/WAN/TTS or FFmpeg generation ran, and no current-source Windows, macOS, or Linux installer artifact was produced.
 
-## NEXT ACTION (one sentence)
-Owner refreshes the Stripe key, then wire checkout + pricing page (#17→#18) —
-the ONLY remaining step between a stranger dealer and paid signup; everything
-else in the 60-second test passed on 08-12 with live evidence (row 20).
+| Area | Current status | Evidence / boundary |
+|---|---|---|
+| Current application source | **LOCAL VERIFIED** | `08b9fcd`; application regression set **189 passed in 4.68 s** (subprocess **5.73 s**, peak child RSS **141.8 MiB**). Configured Ruff, Python/spec compilation, `pip check`, diff checks, and Node syntax check passed. Targeted walkaround/static/auth tests: **19 passed in 1.39 s**. |
+| Current packaging changes | **SOURCE + MOCKED INSTALL TESTS; no bundle** | Full repo suite after Linux installer/verifier changes: **193 passed in 3.41 s** (Python-runner wall **3.74 s**, pytest-process peak RSS **142.6 MiB**). Installer/archive targeted tests: **20 passed in 0.16 s**; shell syntax, Ruff, compilation, dependency check, YAML parse, and diff checks passed. The installer was exercised with a synthetic launcher/layout and path names containing spaces, quotes, backslashes, and `%`; no frozen application was installed or smoke-tested. The actual build stopped before PyInstaller at the unavailable FFmpeg LFS download. |
+| Dealer Studio route glue | **LOCALLY TESTED; not live** | Existing composite route, text-only video-ad draft route, and authenticated walkaround start/status route are surfaced in Dealer Studio. Start remains explicit; owner/tenant and queued/error behavior has local tests. No real media generation, provider call, or output-quality test. |
+| Walkaround limits | **CODE + TEST VERIFIED** | Per source directory: scan at most **4,096** entries; worst case up to **8,192** across studio and exterior fallback. Retain at most **72** JPEG candidates; validate at most **4** selected images; cumulative validation is at most `min(200 MiB, configured photo-batch cap)`. Application photo defaults are **30 MiB/file** and **40 MP/image**. |
+| Other application resource caps | **CODE-VERIFIED defaults; not load-tested** | Video upload **500 MiB**; photo batch **400 MiB**; background pool defaults **2 workers / 4 admitted jobs**; public viewer manifest **120 frames**. These are application caps, not disk quotas or production capacity guarantees. |
+| Walkaround intermediates / publication | **MOCKED + HTTP TEST VERIFIED** | ComfyUI-returned filenames are confined beneath configured output and traversal/symlink targets rejected. LotVue working clips/audio/concat/stage live in a hidden per-job temporary directory; legacy public clips, `voiceover.wav`, and `concat.txt` are cleaned. Storage/auth gate returns 404 for hidden intermediates, even to an authenticated vehicle owner; final walkaround remains anonymously served for active inventory. FFmpeg must exit 0 and create a nonempty regular file before atomic replace. Failed/empty rerenders report error and preserve the old final. ComfyUI's own source-output retention remains controlled by ComfyUI. No actual FFmpeg binary or render ran here. |
+| Hosted CI / current installers | **BLOCKED; no artifact** | Latest runs for branch commit `a919b7b`: [CI 37180896436](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37180896436) and [Desktop releases 37180893727](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37180893727) failed before runner steps. GitHub's annotation: “The job was not started because an Actions budget is preventing further use.” Desktop build jobs were skipped. Earlier runs 37177998115 / 37177998121 were blocked the same way. This turn adds Linux x86_64 per-user installer, archive-verifier coverage, and a four-target workflow path, but no frozen artifact. A local Linux build staged the 40-background payload, then stopped before PyInstaller while fetching the Git-LFS-backed static FFmpeg 8.0 archive (`github.com` certificate error; system-CA retry ended in TLS EOF from `media.githubusercontent.com`). **No current-source ZIP, checksum, hosted test, or native Windows/macOS artifact exists.** |
+| Last successful cross-platform artifact | **PASS ON OLDER SOURCE ONLY** | CI run [37140754753](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37140754753) and three-platform matrix [37140754758](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/37140754758) passed on `7fa13aa`. Artifact metadata lists Windows x64, Intel macOS x64, and Apple Silicon macOS arm64 ZIPs, unexpired through **2026-11-02 UTC**. These artifacts predate the newer Dealer Studio scene/script/walkaround UI and the `08b9fcd` hardening. No tag release was published. |
+| Production, providers, billing, email | **NOT RE-VERIFIED** | No production-host probe or live provider test in this pass. Older notes report a Stripe `401 Expired API Key`, SMTP `535 BadCredentials`, and a production restart after an outage; those are historical last-known results, not a current measurement. No price is approved. |
+
+## PRD acceptance position
+
+The PRD's August 12 stranger-dealer run is **historical evidence only**. Its checkboxes are intentionally not rewritten as current passes. No new unaided dealer test or paid transaction has been recorded.
+
+| PRD gate | Position now | What closes it |
+|---|---|---|
+| 1. Account registration and working dashboard | **OPEN / re-verify** | Fresh external dealer account on the actual live service; verify registration, login, and dashboard without agent help. |
+| 2. Upload real walkaround video | **Historical pass 2026-08-12; re-run** | Fresh dealer uploads representative real-car footage on the current deployed version. |
+| 3. Reject bad capture / accept good capture with clear reasons | **Historical pass 2026-08-12; re-run** | Repeat both paths on deployed product and review clarity of surfaced reasons. |
+| 4. Produce usable 360 spin/background result | **Historical pass 2026-08-12; visual QA still open** | Render a current real vehicle and inspect the full-resolution spin, including identity, crop, seams, and backgrounds. |
+| 5. Public VDP works | **Historical pass 2026-08-12; live service not checked** | Verify current public URL, access rules, and media behavior on the deployed domain. |
+| 6. Google Vehicle Listings feed accepts listing | **Historical validator pass; live feed/ingestion not checked** | Re-run on current real inventory and verify Google registration/ingestion with owner-supplied public URL and credentials. |
+| 7. Dealer pays and gets receipt | **OPEN / owner-gated** | Ahmad approves one canonical offer, reconciles every catalog, refreshes/configures valid Stripe credentials and webhook secret, then performs a controlled live transaction and verifies receipt, webhook, entitlement, and refund/rollback behavior. No agent may approve pricing. |
+| End-to-end Definition of Done | **NOT COMPLETE** | One previously unaware dealer completes all seven steps, including payment, without help; the server survives reboot; a submitted lead reaches Ahmad by live-tested email. |
+
+## Remaining work, in practical order
+
+### P0 — unblock release evidence and paid acceptance
+
+1. **Restore or wait for GitHub Actions budget availability.** Re-run CI and the four-target desktop matrix on the latest branch source. Inspect ZIPs/checksums and smoke-test Windows x64, Intel macOS, Apple Silicon macOS, and Linux x86_64. The Linux one-click installer is now source-added but its frozen bundle remains unbuilt; the local Linux attempt was stopped by the blocked FFmpeg LFS download. The older `7fa13aa` three-platform artifacts are not substitutes for current source. Then obtain owner acceptance on supported end-user machines; signing/notarization remains an owner decision and credential gate.
+2. **Owner decision: canonical price.** Reconcile the written offers and code catalogs; keep billing and public price disclosure fail-closed until Ahmad approves. Current code/tests are safety checks, not a pricing decision.
+3. **Owner supplies billing access and verifies a live transaction.** Refresh the expired Stripe key/webhook secret through the owner's secure configuration channel; test charge, receipt, webhook, entitlement, and reversal. No credentials should be sent in chat or committed.
+4. **Run the current stranger-dealer acceptance test on the real service.** Verify registration/dashboard and repeat the recorded upload → quality gate → spin → VDP → Google-feed path, then the approved payment step. The 2026-08-12 pass does not prove current production behavior.
+5. **Recheck production operations and lead delivery.** Owner verifies the live domain, process supervision across reboot, backups/recovery, and lead-email delivery. The last known outage/Stripe/SMTP observations are stale and need fresh checks; provide approved SMTP access before testing.
+
+### P1 — quality, safety, and legal clearance
+
+6. **Real-vehicle visual QA.** Inspect at least one complete, current full-resolution spin set. The current checkout contains no generated VIN set and no walkaround media was created in this pass.
+7. **Plate privacy.** Plate-blur evidence is **synthetic only, not a full pipeline**. Measure false negatives/false positives on a labeled real-dealer dataset, check all relevant capture/render paths, and visually review results before marketing anonymization.
+8. **Background-removal model rights.** No checkpoint is bundled/selected by default. Owner/legal reviewer must confirm provenance and commercial rights for the exact model before enabling or selling that path; acknowledgment in code is not legal approval.
+9. **Data and customer-use permissions.** Obtain written DriveSmart permission before using its scraped dataset for demos/GTM; approve any prospect sample/outbound message; confirm customer-use and redistribution terms against the proprietary root `LICENSE` and packaged dependencies.
+10. **External connectors.** Supply account-owner credentials/approvals and verify live Google feed ingestion, SMTP, SMS, marketplace, DMS, and other paid-provider connections as applicable. A local configuration indicator is not evidence of a live integration.
+
+### P2 — optional product tracks and repo decisions
+
+11. **iOS / app distribution:** iOS build needs Mac/cloud build service and Apple developer access. Android bundle is historical evidence; Google Play publication has not been proven in this branch and requires the owner's Play registration/account.
+12. **Interior capture:** Ricoh Theta workflow remains hardware-gated if prioritized.
+13. **Repo/document hygiene:** owner decides whether to consolidate BRAIN/GOAL/LEDGER conventions; backup source files should only be archived/removed after owner confirms recovery/deployment needs. Do not revive generative-mesh standard-tier work (intentionally killed) or claim Facebook Marketplace auto-posting (the assisted-posting pack is the supported ceiling in the current research).
+
+## Historical proofs (not refreshed by this snapshot)
+
+The 2026-08-12 live viewer/feed/stranger-dealer observations, 2026-09-02 sample and production/credential notes, and prior workstation claims remain in [`PRD.md`](./PRD.md), [`LEDGER_LOG.md`](./LEDGER_LOG.md), and [`ENGINEERING_AUDIT_2026-10-03.md`](./ENGINEERING_AUDIT_2026-10-03.md) with their original dates. This ledger does not upgrade them to current status.
+
+## Immediate next action
+
+**Restore Actions budget availability (or provide native Windows/macOS build runners with access to the official FFmpeg asset), then run current-source CI and the four-target installer matrix; the owner still controls pricing and secure live-test access for Stripe, email, and production acceptance.**

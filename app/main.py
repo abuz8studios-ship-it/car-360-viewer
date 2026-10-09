@@ -4,8 +4,8 @@ Cinematic AI photo studio + 360 viewer + video walkaround + market pricing
 Replaces: DealerCenter + Spyne + vAuto + video service + manual posting
 Features: Multi-tenant, auth, credits, Stripe, AI photo studio, 360 viewer
 
-Requirements (run once):
-  E:\\Miniconda3\\envs\\lotvue\\python.exe -m pip install fastapi uvicorn python-multipart Pillow aiosqlite opencv-python rembg pillow-heif stripe
+Runtime dependencies: install the repository-root requirements.txt with Python 3.11+.
+Optional background-removal/AI dependencies are documented in requirements-ai.txt.
 """
 
 import os
@@ -13,30 +13,58 @@ import sys
 import re
 import io
 import json
+import heapq
+import html as html_lib
 import shutil
 import sqlite3
+import hashlib
 import subprocess
 import threading
+import time
+import uuid
+from contextlib import asynccontextmanager, closing
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional
+from urllib.parse import quote, unquote, urlsplit
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from PIL import Image
+
+from security import hash_password, is_password_hash, needs_rehash, verify_password
+from auth_rate import check_auth_rate
+from video_urls import normalize_video_source
 
 # ── Load app/.env into process env (no python-dotenv dependency) ─────────────
 # Must run before FEATURES_ENABLED / STRIPE_* are read below.
-_ENV_FILE = Path(__file__).resolve().parent / ".env"
+_env_data_root = os.getenv("LOTVUE_DATA_DIR", "").strip()
+_env_root_path = Path(_env_data_root).expanduser() if _env_data_root else None
+if _env_root_path is not None and not _env_root_path.is_absolute():
+    _env_root_path = Path(__file__).resolve().parent / _env_root_path
+_ENV_FILE = (
+    _env_root_path / ".env"
+    if _env_root_path is not None else Path(__file__).resolve().parent / ".env"
+)
 if _ENV_FILE.exists():
     for _line in _ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip())
+
+from app_paths import BASE_DIR, DB_PATH, STORAGE_DIR
+from background_catalog import (
+    STATIC_BACKGROUND_DIR,
+    background_asset_path,
+    list_background_assets,
+    scene_asset_slug,
+)
 
 # --- Try HEIC support, gracefully degrade ---
 HEIC_SUPPORTED = False
@@ -102,38 +130,64 @@ print(f"[LotVue Pro] GPU Config: AI/Background={GPU_0_DEVICE}, Rendering={GPU_1_
 # FEATURES ENABLED
 # =============================================================================
 FEATURES_ENABLED = {
-    "auth": os.environ.get("LOTVUE_FEATURE_AUTH", "0") == "1",
+    # The auth gate is enabled by default, so keep registration/login enabled
+    # unless an operator explicitly disables new-account features.
+    "auth": os.environ.get("LOTVUE_FEATURE_AUTH", "1") == "1",
     "payments": os.environ.get("LOTVUE_FEATURE_PAYMENTS", "0") == "1",
     "watermark": os.environ.get("LOTVUE_FEATURE_WATERMARK", "0") == "1",
 }
+# PRD pricing is still owner-unapproved. Keep both public plan disclosure and
+# all charge paths disabled until a single canonical offer is approved.
+PRICING_APPROVED = os.environ.get("LOTVUE_PRICING_APPROVED", "0") == "1"
+
+
+def _pricing_catalog_consistent() -> bool:
+    """Require one matching amount for checkout and subscription plan tiers."""
+    checkout_plans = globals().get("PLANS")
+    subscription_plans = globals().get("PRICING_PLANS")
+    if not isinstance(checkout_plans, dict) or not isinstance(subscription_plans, dict):
+        return False
+    pairs = (("single", "pay_per_use"), ("starter", "pro_bundle"), ("dealership", "dealership"))
+    try:
+        return all(
+            key in checkout_plans and subscription_key in subscription_plans
+            and round(float(checkout_plans[key]["price"]), 2)
+                == round(float(subscription_plans[subscription_key]["price"]), 2)
+            for key, subscription_key in pairs
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def _pricing_is_approved() -> bool:
+    return bool(PRICING_APPROVED and _pricing_catalog_consistent())
+
+
+def _payments_available() -> bool:
+    return bool(FEATURES_ENABLED.get("payments", False) and _pricing_is_approved())
 
 # --- Background Removal (rembg) ---
-REMBG_AVAILABLE = False
+# The runtime package is not sufficient: a model must be explicitly selected and
+# its license reviewed by the operator before any weights are downloaded or used.
+from rembg_runtime import is_enabled as _rembg_is_enabled
+from rembg_runtime import remove as remove_bg
+from rembg_runtime import require_session as _require_rembg_session
+
+REMBG_AVAILABLE = _rembg_is_enabled()
 _REMBG_SESSION = None
 
+
 def get_rembg_session():
-    """Get rembg session with GPU 0 assignment."""
+    """Return the explicitly selected model session, or None while disabled."""
     global _REMBG_SESSION
+    if not REMBG_AVAILABLE:
+        return None
     if _REMBG_SESSION is None:
-        try:
-            from rembg import remove
-            # Force rembg to use GPU 0
-            _REMBG_SESSION = remove
-        except ImportError:
-            pass
+        _REMBG_SESSION = _require_rembg_session()
     return _REMBG_SESSION
 
-try:
-    from rembg import remove as remove_bg
-    REMBG_AVAILABLE = True
-except ImportError:
-    pass
-
 # Showroom storage
-BASE_DIR = Path(__file__).resolve().parent
-
-# Showroom storage
-SHOWROOM_DIR = BASE_DIR / "storage" / "_showrooms"
+SHOWROOM_DIR = STORAGE_DIR / "_showrooms"
 
 # =============================================================================
 # CONFIG
@@ -151,18 +205,175 @@ def _resolve_tool(env_key, name):
             return str(cand)
     return p or name  # bare name -> resolved via PATH if present
 
-FFMPEG = _resolve_tool("FFMPEG_PATH", "ffmpeg.exe")
-FFPROBE = _resolve_tool("FFPROBE_PATH", "ffprobe.exe")
-STORAGE_DIR = BASE_DIR / "storage"
+_MEDIA_BIN_SUFFIX = ".exe" if os.name == "nt" else ""
+FFMPEG = _resolve_tool("FFMPEG_PATH", f"ffmpeg{_MEDIA_BIN_SUFFIX}")
+FFPROBE = _resolve_tool("FFPROBE_PATH", f"ffprobe{_MEDIA_BIN_SUFFIX}")
 RAW_DIR = STORAGE_DIR / "raw"
 FRAMES_DIR = STORAGE_DIR / "frames"
 PREVIEW_DIR = STORAGE_DIR / "preview"
 CLEAN_DIR = STORAGE_DIR / "clean"
 THUMBNAILS_DIR = STORAGE_DIR / "thumbnails"
-DB_PATH = BASE_DIR / "vehicles.db"
 NUM_EXTERIOR_FRAMES = 36  # 10° per frame = smooth spin
-MAX_VIDEO_MB = 500
-MAX_PHOTO_MB = 30
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+MAX_VIDEO_MB = _bounded_env_int("LOTVUE_MAX_VIDEO_MB", 500, 1, 2048)
+MAX_PHOTO_MB = _bounded_env_int("LOTVUE_MAX_PHOTO_MB", 30, 1, 256)
+MAX_PHOTO_BATCH_MB = _bounded_env_int("LOTVUE_MAX_PHOTO_BATCH_MB", 400, 1, 4096)
+MAX_UPLOAD_IMAGE_PIXELS = _bounded_env_int("LOTVUE_MAX_IMAGE_PIXELS", 40_000_000, 1_000_000, 100_000_000)
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+_LEAD_RATE_BUCKETS: dict[str, tuple[float, int]] = {}
+_LEAD_RATE_LOCK = threading.Lock()
+_DASHBOARD_STORAGE_CACHE: dict[str, tuple[float, int]] = {}
+_DASHBOARD_STORAGE_LOCK = threading.Lock()
+_ANALYTICS_RATE_BUCKETS: dict[str, tuple[float, int]] = {}
+_ANALYTICS_RATE_LOCK = threading.Lock()
+_BACKGROUND_WORKERS = _bounded_env_int("LOTVUE_BACKGROUND_WORKERS", 2, 1, 4)
+_BACKGROUND_MAX_JOBS = _bounded_env_int("LOTVUE_BACKGROUND_MAX_JOBS", 4, _BACKGROUND_WORKERS, 16)
+_MAX_CONCURRENT_UPLOADS = _bounded_env_int("LOTVUE_MAX_CONCURRENT_UPLOADS", 2, 1, 8)
+_BACKGROUND_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_BACKGROUND_WORKERS, thread_name_prefix="lotvue-job"
+)
+_BACKGROUND_JOB_SLOTS = threading.BoundedSemaphore(_BACKGROUND_MAX_JOBS)
+_BACKGROUND_JOBS_LOCK = threading.Lock()
+_BACKGROUND_JOB_KEYS: set[str] = set()
+_COMFYUI_SCENE_MAX_JOBS = 1
+_COMFYUI_SCENE_JOB_SLOTS = threading.BoundedSemaphore(_COMFYUI_SCENE_MAX_JOBS)
+
+
+def _write_gaussian_status(vin: str, payload: dict) -> None:
+    status_file = STORAGE_DIR / vin / "splat" / "status.json"
+    temp_file = status_file.with_name(f".status-{uuid.uuid4().hex}.tmp")
+    try:
+        temp_file.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temp_file, status_file)
+    finally:
+        temp_file.unlink(missing_ok=True)
+
+
+def _run_gaussian_3d_job(vin: str, mode_args: list[str], steps: int,
+                         style: str, backdrop: str) -> None:
+    """Run one bounded Gaussian reconstruction as managed background work."""
+    command = [
+        sys.executable, str(BASE_DIR / "gaussian_3d.py"), "--vin", vin,
+        *mode_args, "--steps", str(steps), "--style", style, "--backdrop", backdrop,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=str(BASE_DIR),
+            timeout=24 * 60 * 60,
+            check=False,
+        )
+        if result.returncode != 0:
+            _write_gaussian_status(vin, {
+                "status": "error", "step": "failed", "progress": 0,
+                "vin": vin, "error": f"3D reconstruction exited with status {result.returncode}",
+            })
+    except Exception as exc:
+        try:
+            _write_gaussian_status(vin, {
+                "status": "error", "step": "failed", "progress": 0,
+                "vin": vin, "error": f"{type(exc).__name__}: {str(exc)[:400]}",
+            })
+        except OSError:
+            pass
+
+
+def _background_job_running(job_key: str) -> bool:
+    with _BACKGROUND_JOBS_LOCK:
+        return str(job_key) in _BACKGROUND_JOB_KEYS
+
+
+def _submit_background_job(job_key: str, target, *args, **kwargs) -> str:
+    """Submit bounded background work with process-local per-key deduplication."""
+    key = str(job_key)
+    with _BACKGROUND_JOBS_LOCK:
+        if key in _BACKGROUND_JOB_KEYS:
+            return "already_running"
+        if not _BACKGROUND_JOB_SLOTS.acquire(blocking=False):
+            return "busy"
+        _BACKGROUND_JOB_KEYS.add(key)
+    try:
+        future = _BACKGROUND_EXECUTOR.submit(target, *args, **kwargs)
+    except Exception:
+        with _BACKGROUND_JOBS_LOCK:
+            _BACKGROUND_JOB_KEYS.discard(key)
+            _BACKGROUND_JOB_SLOTS.release()
+        raise
+
+    def _finished(done):
+        try:
+            error = done.exception()
+            if error:
+                print(f"[Background] job {key} failed: {type(error).__name__}: {error}")
+        except Exception:
+            pass
+        finally:
+            with _BACKGROUND_JOBS_LOCK:
+                _BACKGROUND_JOB_KEYS.discard(key)
+                _BACKGROUND_JOB_SLOTS.release()
+
+    future.add_done_callback(_finished)
+    return "started"
+
+
+def _check_public_analytics_rate(request: Request) -> None:
+    import hashlib
+    import time
+
+    host = request.client.host if request.client else "unknown"
+    key = hashlib.sha256(f"analytics:{host}".encode("utf-8", errors="ignore")).hexdigest()
+    now = time.monotonic()
+    with _ANALYTICS_RATE_LOCK:
+        start, count = _ANALYTICS_RATE_BUCKETS.get(key, (now, 0))
+        if now - start >= 60:
+            start, count = now, 0
+        if count >= 120:
+            raise HTTPException(status_code=429, detail="Too many viewer events", headers={"Retry-After": "60"})
+        _ANALYTICS_RATE_BUCKETS[key] = (start, count + 1)
+        size = len(_ANALYTICS_RATE_BUCKETS)
+        if size > 4096 and size % 256 == 0:
+            expired = [client for client, (window, _) in _ANALYTICS_RATE_BUCKETS.items()
+                       if now - window >= 60]
+            for client in expired:
+                _ANALYTICS_RATE_BUCKETS.pop(client, None)
+            excess = len(_ANALYTICS_RATE_BUCKETS) - 4096
+            for client in list(_ANALYTICS_RATE_BUCKETS)[:max(0, excess)]:
+                _ANALYTICS_RATE_BUCKETS.pop(client, None)
+
+
+def _check_public_lead_rate(request: Request) -> None:
+    """Small per-process anti-spam guard for public lead endpoints (10/min/IP)."""
+    import hashlib
+    import time
+
+    host = request.client.host if request.client else "unknown"
+    key = hashlib.sha256(host.encode("utf-8", errors="ignore")).hexdigest()
+    now = time.monotonic()
+    with _LEAD_RATE_LOCK:
+        start, count = _LEAD_RATE_BUCKETS.get(key, (now, 0))
+        if now - start >= 60:
+            start, count = now, 0
+        if count >= 10:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many inquiries from this network; try again shortly",
+                headers={"Retry-After": "60"},
+            )
+        _LEAD_RATE_BUCKETS[key] = (start, count + 1)
+        if len(_LEAD_RATE_BUCKETS) > 4096:
+            expired = [client for client, (window, _) in _LEAD_RATE_BUCKETS.items()
+                       if now - window >= 60]
+            for client in expired:
+                _LEAD_RATE_BUCKETS.pop(client, None)
 
 # =============================================================================
 # PRICING PLANS (Phase 2)
@@ -250,39 +461,83 @@ SHOWROOM_DIR.mkdir(parents=True, exist_ok=True)
 # =============================================================================
 
 def auto_enhance(img: Image.Image) -> Image.Image:
-    """Auto-enhance like Google Photos/iPhone - better contrast, color, sharpness."""
+    """Apply small photographic corrections while releasing each intermediate."""
     from PIL import ImageEnhance
-    
-    # Slightly boost contrast
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(1.1)
-    
-    # Slight color vibrancy boost
-    enhancer = ImageEnhance.Color(img)
-    img = enhancer.enhance(1.15)
-    
-    # Sharpen a bit
-    enhancer = ImageEnhance.Sharpness(img)
-    img = enhancer.enhance(1.2)
-    
-    return img
+
+    output = img.copy()
+    for enhancer_type, factor in (
+        (ImageEnhance.Contrast, 1.08),
+        (ImageEnhance.Color, 1.08),
+        (ImageEnhance.Sharpness, 1.10),
+    ):
+        enhanced = enhancer_type(output).enhance(factor)
+        output.close()
+        output = enhanced
+    return output
 
 
 def process_exterior_photo(input_bytes: bytes, output_path: Path, showroom_path: Path | None = None, keep_original: bool = False):
-    """Save exterior photo - optionally keep original environment (like Impel)."""
-    # Always keep original - like Impel! No background removal, no changes
-    # Just auto-enhance the original photo
-    img = Image.open(io.BytesIO(input_bytes)).convert("RGB")
-    img = auto_enhance(img)
-    img = img.resize((1920, 1080), Image.LANCZOS)
-    img.save(output_path, "JPEG", quality=92)
+    """Save a landscape viewer frame without distorting the original photo."""
+    from PIL import ImageOps
+
+    img = None
+    canvas = None
+    enhanced = None
+    try:
+        with Image.open(io.BytesIO(input_bytes)) as source:
+            width, height = source.size
+            if width <= 0 or height <= 0 or width * height > MAX_UPLOAD_IMAGE_PIXELS:
+                raise ValueError("Image exceeds the safe pixel limit")
+            source.draft("RGB", (1920, 1080))
+            source.thumbnail((1920, 1080), Image.Resampling.LANCZOS)
+            oriented = ImageOps.exif_transpose(source)
+            try:
+                img = oriented.convert("RGB")
+            finally:
+                if oriented is not source:
+                    oriented.close()
+        # Keep a fixed 16:9 viewer frame, but contain rather than stretch/crop the car.
+        canvas = Image.new("RGB", (1920, 1080), (22, 25, 29))
+        canvas.paste(img, ((1920 - img.width) // 2, (1080 - img.height) // 2))
+        enhanced = auto_enhance(canvas)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        enhanced.save(output_path, "JPEG", quality=90, optimize=True, progressive=True)
+    finally:
+        if img is not None:
+            img.close()
+        if canvas is not None:
+            canvas.close()
+        if enhanced is not None:
+            enhanced.close()
 
 
 def process_interior_photo(input_bytes: bytes, output_path: Path):
-    """Save interior photo - keep original, just enhance."""
-    img = Image.open(io.BytesIO(input_bytes)).convert("RGB")
-    img = auto_enhance(img)
-    img.save(output_path, "JPEG", quality=92)
+    """Save an orientation-corrected, bounded interior photo."""
+    from PIL import ImageOps
+
+    img = None
+    enhanced = None
+    try:
+        with Image.open(io.BytesIO(input_bytes)) as source:
+            width, height = source.size
+            if width <= 0 or height <= 0 or width * height > MAX_UPLOAD_IMAGE_PIXELS:
+                raise ValueError("Image exceeds the safe pixel limit")
+            source.draft("RGB", (1920, 1920))
+            source.thumbnail((1920, 1920), Image.Resampling.LANCZOS)
+            oriented = ImageOps.exif_transpose(source)
+            try:
+                img = oriented.convert("RGB")
+            finally:
+                if oriented is not source:
+                    oriented.close()
+        enhanced = auto_enhance(img)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        enhanced.save(output_path, "JPEG", quality=90, optimize=True)
+    finally:
+        if img is not None:
+            img.close()
+        if enhanced is not None:
+            enhanced.close()
 
 
 WATERMARK_PREVIEW_TEXT = "Preview • LotVue Pro"
@@ -294,37 +549,42 @@ def apply_diagonal_watermark(img: Image.Image, text: str = "LOTVUE PRO PREVIEW",
     try:
         from PIL import ImageDraw
         overlay = img.copy().convert("RGBA")
-        txt_layer = Image.new("RGBA", overlay.size, (255, 255, 255, 0))
+        canvas_size = (max(1, img.width * 2), max(1, img.height * 2))
+        txt_layer = Image.new("RGBA", canvas_size, (255, 255, 255, 0))
         draw = ImageDraw.Draw(txt_layer)
-        
+
         font_size = max(20, img.width // 50)
         try:
             from PIL import ImageFont
             font = ImageFont.truetype("arial.ttf", font_size)
-        except Exception:
+        except OSError:
             font = ImageFont.load_default()
-        
+
         bbox = draw.textbbox((0, 0), text, font=font)
-        text_w = bbox[2] - bbox[0]
-        text_h = bbox[3] - bbox[1]
-        
-        spacing_x = int(text_w * 2.5)
-        spacing_y = int(text_h * 4)
+        text_w = max(1, bbox[2] - bbox[0])
+        text_h = max(1, bbox[3] - bbox[1])
+        spacing_x = max(1, int(text_w * 2.5))
+        spacing_y = max(1, int(text_h * 4))
         angle = -30
-        
-        for y in range(-int(text_h), img.height + int(text_h), spacing_y):
-            for x in range(-int(text_w), img.width + int(text_w), spacing_x):
+
+        for y in range(-text_h, canvas_size[1] + text_h, spacing_y):
+            for x in range(-text_w, canvas_size[0] + text_w, spacing_x):
                 draw.text((x, y), text, font=font, fill=(255, 255, 255, opacity))
-        
+
+        txt_layer = txt_layer.rotate(angle, resample=Image.Resampling.BICUBIC)
+        left, top = img.width // 2, img.height // 2
+        txt_layer = txt_layer.crop((left, top, left + img.width, top + img.height))
+        draw = ImageDraw.Draw(txt_layer)
+
         small_text = "lotvuepro"
         small_size = max(12, img.width // 120)
         try:
             small_font = ImageFont.truetype("arial.ttf", small_size)
-        except:
+        except OSError:
             small_font = ImageFont.load_default()
-        
+
         draw.text((img.width - 100, img.height - 30), small_text, font=small_font, fill=(255, 255, 255, opacity))
-        
+
         composite = Image.alpha_composite(overlay, txt_layer)
         return composite.convert("RGB")
     except Exception as e:
@@ -365,17 +625,34 @@ def apply_watermark(img: Image.Image, text: str = WATERMARK_PREVIEW_TEXT, opacit
         return img
 
 
-def get_dealer_showroom(dealer_name: str = "default") -> Path | None:
-    """Get showroom background for a dealer."""
-    showroom_file = SHOWROOM_DIR / f"{dealer_name}.jpg"
-    if showroom_file.exists():
-        return showroom_file
-    return None
+def _showroom_file(user_email: str, dealer_name: str = "default") -> Path:
+    """Resolve a tenant-specific showroom asset using a nonreversible directory key."""
+    dealer_name = (dealer_name or "default").strip().lower()
+    if not re.fullmatch(r"[a-z0-9_-]{1,64}", dealer_name):
+        raise HTTPException(status_code=400, detail="Invalid showroom name")
+    tenant_key = hashlib.sha256(user_email.strip().lower().encode("utf-8")).hexdigest()[:32]
+    return SHOWROOM_DIR / tenant_key / f"{dealer_name}.jpg"
+
+
+def get_dealer_showroom(user_email: str, dealer_name: str = "default") -> Path | None:
+    """Get only the authenticated tenant's showroom background, if uploaded."""
+    showroom_file = _showroom_file(user_email, dealer_name)
+    return showroom_file if showroom_file.is_file() else None
 
 # =============================================================================
 # APP
 # =============================================================================
-app = FastAPI(title="LotVue Pro — AI-Powered Dealer Platform")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    stop_event = _start_followup_dispatcher()
+    try:
+        yield
+    finally:
+        if stop_event is not None:
+            stop_event.set()
+
+
+app = FastAPI(title="LotVue Pro — AI-Powered Dealer Platform", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -428,14 +705,23 @@ def init_db():
             display_name TEXT DEFAULT '',
             phone TEXT DEFAULT '',
             email TEXT DEFAULT '',
+            user_email TEXT DEFAULT '',
             address TEXT DEFAULT '',
             website TEXT DEFAULT '',
             logo_url TEXT DEFAULT '',
             brand_color TEXT DEFAULT '#58a6ff',
+            background_preset TEXT DEFAULT 'showroom',
             plan TEXT DEFAULT 'free',
             created_at TEXT DEFAULT ''
         )
     """)
+    dealer_cols = {row[1] for row in conn.execute("PRAGMA table_info(dealers)")}
+    for col_name, col_ddl in (
+        ("user_email", "TEXT DEFAULT ''"),
+        ("background_preset", "TEXT DEFAULT 'showroom'"),
+    ):
+        if col_name not in dealer_cols:
+            conn.execute(f"ALTER TABLE dealers ADD COLUMN {col_name} {col_ddl}")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -471,6 +757,21 @@ def init_db():
             vin TEXT DEFAULT '',
             created_at TEXT DEFAULT '',
             FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    for col_def in ("plan_type TEXT DEFAULT 'free'", "is_subscribed INTEGER DEFAULT 0"):
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stripe_webhook_events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'processing',
+            received_at TEXT NOT NULL DEFAULT '',
+            processed_at TEXT DEFAULT '',
+            error TEXT DEFAULT ''
         )
     """)
     conn.execute("""
@@ -551,6 +852,8 @@ def init_db():
         "stock_number TEXT DEFAULT ''",
         "description TEXT DEFAULT ''",
         "workflow_status TEXT DEFAULT 'intake'",
+        "is_paid INTEGER DEFAULT 0",
+        "payment_id TEXT DEFAULT ''",
     ]:
         try:
             conn.execute(f"ALTER TABLE vehicles ADD COLUMN {col_def}")
@@ -573,28 +876,70 @@ def init_db():
         )
     """)
 
-    # Seed system backgrounds if empty
-    bg_count = conn.execute("SELECT COUNT(*) FROM backgrounds WHERE is_system=1").fetchone()[0]
-    if bg_count == 0:
-        system_bgs = [
-            ('Studio Shadow', 'studio_shadow', '/static/backgrounds/studio_shadow.jpg', '/static/backgrounds/thumbs/studio_shadow.jpg', 'studio'),
-            ('Studio White', 'studio_white', '/static/backgrounds/studio_white.jpg', '/static/backgrounds/thumbs/studio_white.jpg', 'studio'),
-            ('Studio Dark', 'studio_dark', '/static/backgrounds/studio_dark.jpg', '/static/backgrounds/thumbs/studio_dark.jpg', 'studio'),
-            ('Showroom Floor', 'showroom_floor', '/static/backgrounds/showroom_floor.jpg', '/static/backgrounds/thumbs/showroom_floor.jpg', 'showroom'),
-            ('Outdoor Sunset', 'outdoor_sunset', '/static/backgrounds/outdoor_sunset.jpg', '/static/backgrounds/thumbs/outdoor_sunset.jpg', 'outdoor'),
-            ('Outdoor Overcast', 'outdoor_overcast', '/static/backgrounds/outdoor_overcast.jpg', '/static/backgrounds/thumbs/outdoor_overcast.jpg', 'outdoor'),
-            ('Concrete Floor', 'concrete_floor', '/static/backgrounds/concrete_floor.jpg', '/static/backgrounds/thumbs/concrete_floor.jpg', 'studio'),
-            ('Glossy Black', 'glossy_black', '/static/backgrounds/glossy_black.jpg', '/static/backgrounds/thumbs/glossy_black.jpg', 'studio'),
-            ('None (Transparent)', 'none', '', '', 'studio'),
-        ]
-        for name, slug, url, thumb, cat in system_bgs:
-            try:
+    # Seed/migrate every packaged studio asset, not just the stale eight-row
+    # catalog. The same filesystem-backed catalog drives Photo Studio and the
+    # 360 compositor; nonexistent thumbnails are never published.
+    for asset in list_background_assets(include_none=True):
+        values = (
+            asset["name"], asset["slug"], asset["url"], asset["thumbnail_url"],
+            asset["category"],
+        )
+        try:
+            existing = conn.execute(
+                "SELECT is_system FROM backgrounds WHERE slug=?", (asset["slug"],)
+            ).fetchone()
+            if existing and int(existing[0] or 0) == 1:
                 conn.execute(
-                    "INSERT OR IGNORE INTO backgrounds (name, slug, url, thumbnail_url, category, is_system) VALUES (?,?,?,?,?,1)",
-                    (name, slug, url, thumb, cat)
+                    "UPDATE backgrounds SET name=?,url=?,thumbnail_url=?,category=?,is_active=1 "
+                    "WHERE slug=? AND is_system=1",
+                    (asset["name"], asset["url"], asset["thumbnail_url"],
+                     asset["category"], asset["slug"]),
                 )
-            except Exception:
-                pass
+            elif not existing:
+                conn.execute(
+                    "INSERT OR IGNORE INTO backgrounds "
+                    "(name,slug,url,thumbnail_url,category,is_system) VALUES (?,?,?,?,?,1)",
+                    values,
+                )
+        except sqlite3.Error as exc:
+            print(f"[Database] background catalog seed skipped: {type(exc).__name__}")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS vehicle_pipeline_jobs (
+            vin TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            step TEXT NOT NULL DEFAULT 'queued',
+            progress INTEGER NOT NULL DEFAULT 0,
+            total INTEGER NOT NULL DEFAULT 0,
+            succeeded INTEGER NOT NULL DEFAULT 0,
+            degraded INTEGER NOT NULL DEFAULT 0,
+            failed INTEGER NOT NULL DEFAULT 0,
+            message TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (vin, kind)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_vehicle_pipeline_jobs_updated "
+        "ON vehicle_pipeline_jobs(vin, updated_at DESC)"
+    )
+
+    # Common tenant/status filters use composite indexes so inventory and feed
+    # queries stay bounded as dealers add vehicles and posting history grows.
+    for index_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_vehicles_user_status ON vehicles(user_email, status)",
+        "CREATE INDEX IF NOT EXISTS idx_vehicles_lower_user_status "
+        "ON vehicles(LOWER(COALESCE(user_email,'')), status, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_vehicles_status_created ON vehicles(status, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_dealers_user_email ON dealers(user_email)",
+        "CREATE INDEX IF NOT EXISTS idx_leads_vin_created ON leads(vin, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_hotspots_vin ON hotspots(vin)",
+    ):
+        try:
+            conn.execute(index_sql)
+        except sqlite3.Error as exc:
+            print(f"[Database] index creation skipped: {exc}")
 
     conn.commit()
     conn.close()
@@ -614,8 +959,11 @@ def ensure_owner_account():
     (make_clean_build.py), so no personal account ever leaves this machine.
     """
     email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
-    pw_hash = os.getenv("LOTVUE_OWNER_PASSWORD_HASH", "").strip().lower()
-    if not email or len(pw_hash) != 64:
+    pw_hash = os.getenv("LOTVUE_OWNER_PASSWORD_HASH", "").strip()
+    if not email:
+        return
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or not is_password_hash(pw_hash):
+        print("[Auth] owner bootstrap disabled: configure a valid LOTVUE_OWNER_EMAIL and password hash")
         return
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -629,9 +977,14 @@ def ensure_owner_account():
         drift = True
         print(f"[Auth] owner account was MISSING - recreated {email} from .env")
     elif row["password_hash"] != pw_hash:
-        conn.execute("UPDATE users SET password_hash=? WHERE email=?", (pw_hash, email))
-        drift = True
-        print(f"[Auth] owner credential DRIFT detected (user id {row['id']}) - re-asserted from .env")
+        # Do not downgrade a password upgraded during login when the deployment
+        # still has its legacy SHA-256 bootstrap hash in the environment.
+        if re.fullmatch(r"[0-9a-fA-F]{64}", pw_hash) and not needs_rehash(row["password_hash"]):
+            print("[Auth] stored owner hash is stronger than the legacy bootstrap hash; update LOTVUE_OWNER_PASSWORD_HASH")
+        else:
+            conn.execute("UPDATE users SET password_hash=? WHERE email=?", (pw_hash, email))
+            drift = True
+            print(f"[Auth] owner credential DRIFT detected (user id {row['id']}) - re-asserted from .env")
     if drift:
         try:
             conn.execute("""
@@ -656,7 +1009,8 @@ def db_upsert_vehicle(vin, year="", make="", model="", ext_frames=0, int_count=0
         ON CONFLICT(vin) DO UPDATE SET
             year=excluded.year, make=excluded.make, model=excluded.model,
             exterior_frames=excluded.exterior_frames, interior_count=excluded.interior_count,
-            watermark_mode=excluded.watermark_mode, user_email=excluded.user_email,
+            watermark_mode=excluded.watermark_mode,
+            user_email=CASE WHEN COALESCE(user_email,'')='' THEN excluded.user_email ELSE user_email END,
             trim_level=CASE WHEN excluded.trim_level != '' THEN excluded.trim_level ELSE trim_level END,
             engine=CASE WHEN excluded.engine != '' THEN excluded.engine ELSE engine END,
             transmission=CASE WHEN excluded.transmission != '' THEN excluded.transmission ELSE transmission END,
@@ -684,8 +1038,9 @@ def db_get_vehicles_by_dealer(dealer_name: str) -> list[dict]:
         return []
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM vehicles WHERE user_email=? AND status='active' ORDER BY created_at DESC", 
-                        (dealer.get("email", ""),)).fetchall()
+    tenant_email = str(dealer.get("user_email") or dealer.get("email") or "").strip().lower()
+    rows = conn.execute("SELECT * FROM vehicles WHERE LOWER(COALESCE(user_email,''))=? "
+                        "AND status='active' ORDER BY created_at DESC", (tenant_email,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -693,8 +1048,8 @@ def db_get_vehicles_by_email(user_email: str) -> list[dict]:
     """Get vehicles for a specific user email."""
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM vehicles WHERE user_email=? AND status='active' ORDER BY created_at DESC", 
-                        (user_email,)).fetchall()
+    rows = conn.execute("SELECT * FROM vehicles WHERE LOWER(COALESCE(user_email,''))=? "
+                        "AND status='active' ORDER BY created_at DESC", ((user_email or "").strip().lower(),)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -708,7 +1063,7 @@ def db_get_vehicle(vin):
 def db_get_vehicle_by_job_id(job_id: str):
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM vehicles WHERE job_id=?", (job_id,)).fetchone()
+    row = conn.execute("SELECT * FROM vehicles WHERE job_id=? AND status='active'", (job_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -727,32 +1082,20 @@ def db_update_counts(vin):
     conn.commit()
     conn.close()
 
-def db_get_dealer(name: str = "default"):
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM dealers WHERE name=?", (name,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-def db_upsert_dealer(name: str, display_name="", phone="", email="", address="", website="", logo_url="", brand_color="#58a6ff"):
+def db_upsert_dealer(name: str, display_name="", phone="", email="", address="", website="", logo_url="", brand_color="#58a6ff", user_email=""):
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("""
-        INSERT INTO dealers (name, display_name, phone, email, address, website, logo_url, brand_color, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO dealers
+            (name, display_name, phone, email, user_email, address, website, logo_url, brand_color, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
             display_name=excluded.display_name, phone=excluded.phone, email=excluded.email,
             address=excluded.address, website=excluded.website, logo_url=excluded.logo_url,
-            brand_color=excluded.brand_color
-    """, (name, display_name, phone, email, address, website, logo_url, brand_color, datetime.now().isoformat()))
+            brand_color=excluded.brand_color,
+            user_email=CASE WHEN excluded.user_email != '' THEN excluded.user_email ELSE user_email END
+    """, (name, display_name, phone, email, user_email, address, website, logo_url, brand_color, datetime.now().isoformat()))
     conn.commit()
     conn.close()
-
-def db_list_dealers():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM dealers ORDER BY name").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
 
 
 def db_get_user(email: str):
@@ -801,47 +1144,144 @@ def db_get_user_credits(email: str) -> int:
 
 
 def generate_clean_frames(vin: str) -> bool:
-    """Generate clean (no watermark) versions of all frames for a vehicle."""
-    vehicle_dir = STORAGE_DIR / vin
-    exterior_dir = vehicle_dir / "exterior"
-    
-    if not exterior_dir.exists():
-        return False
-    
+    """Rebuild unwatermarked derivatives from the vehicle's retained source frames."""
+    import tempfile
+
     try:
-        # Get original frames (from raw if exists, else use existing)
-        raw_dir = RAW_DIR / vin
-        if raw_dir.exists():
-            source_dir = raw_dir
-        else:
-            source_dir = exterior_dir
-        
-        frames = sorted(source_dir.glob("frame_*.jpg"))
-        if not frames:
+        vin = validate_vehicle_id(vin)
+        storage_root = STORAGE_DIR.resolve()
+        vehicle_path = STORAGE_DIR / vin
+        if vehicle_path.is_symlink():
             return False
-        
-        # Process each frame - no watermark, higher quality
-        for frame_path in frames:
-            try:
-                img = Image.open(frame_path).convert("RGB")
-                img = auto_enhance(img)
-                img = img.resize((1920, 1080), Image.LANCZOS)
-                
-                # Save as clean (no watermark)
-                clean_path = exterior_dir / frame_path.name
-                img.save(clean_path, "JPEG", quality=98)
-            except Exception as e:
-                print(f"Clean frame error {frame_path}: {e}")
-        
-        # Also regenerate spin frames
-        spin_dir = vehicle_dir / "spin"
-        if spin_dir.exists():
-            interpolate_frames(exterior_dir, spin_dir, 36)
-        
-        return True
-    except Exception as e:
-        print(f"Generate clean frames error: {e}")
+        vehicle_dir = vehicle_path.resolve(strict=True)
+        if vehicle_dir.parent != storage_root or not vehicle_dir.is_dir():
+            return False
+    except (HTTPException, OSError, RuntimeError, ValueError):
         return False
+
+    exterior_dir = vehicle_dir / "exterior"
+    source_dirs = (
+        vehicle_dir / "source",  # clean video frames retained before studio processing
+        vehicle_dir / "raw",     # original, normalized dealer photo uploads
+        RAW_DIR / vin,            # compatibility with older deployments
+        exterior_dir,
+    )
+    source_dir = None
+    frames = []
+    for candidate in source_dirs:
+        if candidate.is_symlink() or not candidate.is_dir():
+            continue
+        try:
+            resolved_dir = candidate.resolve(strict=True)
+            if resolved_dir.parent != vehicle_dir:
+                # The legacy raw directory is under STORAGE_DIR/raw/{vin}.
+                if candidate != RAW_DIR / vin or resolved_dir.parent != RAW_DIR.resolve():
+                    continue
+            files = sorted(
+                path for path in resolved_dir.glob("frame_*.jpg")
+                if not path.is_symlink()
+                and re.fullmatch(r"frame_[A-Za-z0-9_-]{1,80}\.jpg", path.name)
+                and path.is_file()
+                and path.resolve(strict=True).parent == resolved_dir
+            )
+        except (OSError, RuntimeError):
+            continue
+        if files:
+            source_dir, frames = resolved_dir, files[:72]
+            break
+    if not source_dir or not frames:
+        return False
+
+    exterior_stage = Path(tempfile.mkdtemp(prefix=".clean-exterior-", dir=vehicle_dir))
+    spin_stage = None
+    try:
+        for frame in frames:
+            if frame.stat().st_size > 100 * 1024 * 1024:
+                raise ValueError(f"Source frame exceeds processing limit: {frame.name}")
+            process_exterior_photo(frame.read_bytes(), exterior_stage / frame.name)
+        _replace_directory(exterior_stage, exterior_dir)
+
+        spin_stage = Path(tempfile.mkdtemp(prefix=".clean-spin-", dir=vehicle_dir))
+        manifest = None
+        manifest_path = vehicle_dir / "manifest.json"
+        if manifest_path.is_file() and not manifest_path.is_symlink():
+            try:
+                if manifest_path.stat().st_size <= 1_000_000:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeError):
+                manifest = None
+        if not interpolate_frames(exterior_dir, spin_stage, target_frames=36, manifest=manifest):
+            return False
+
+        vehicle = db_get_vehicle(vin)
+        turntable_style = str(vehicle.get("turntable_style", "studio_shadow") if vehicle else "studio_shadow")
+        background_path = None
+        background_slug = str(vehicle.get("background_id", "") if vehicle else "")
+        if background_slug and background_slug != "none":
+            with sqlite3.connect(str(DB_PATH), timeout=5) as conn:
+                row = conn.execute("SELECT url FROM backgrounds WHERE slug=?", (background_slug,)).fetchone()
+            if row and row[0] and str(row[0]).startswith("/static/"):
+                candidate = Path(__file__).parent / "static" / str(row[0])[len("/static/"):]
+                resolved_static = (Path(__file__).parent / "static").resolve()
+                resolved_candidate = candidate.resolve()
+                if resolved_candidate.is_relative_to(resolved_static) and resolved_candidate.is_file():
+                    background_path = str(resolved_candidate)
+
+        process_all_frames_background(spin_stage, "clean", background_path, turntable_style)
+        spin_dir = vehicle_dir / "spin"
+        _replace_directory(spin_stage, spin_dir)
+        spin_stage = None
+        generate_thumbnail(spin_dir, vehicle_dir / "thumbnail.jpg")
+        db_update_counts(vin)
+        return True
+    except Exception as exc:
+        print(f"Generate clean frames error for {vin}: {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        if exterior_stage.exists():
+            shutil.rmtree(exterior_stage, ignore_errors=True)
+        if spin_stage is not None and spin_stage.exists():
+            shutil.rmtree(spin_stage, ignore_errors=True)
+
+def _write_clean_frame_status(vin: str, status: str, error: str = "") -> None:
+    vin = validate_vehicle_id(vin)
+    storage_root = STORAGE_DIR.resolve()
+    vehicle_dir = STORAGE_DIR / vin
+    if vehicle_dir.is_symlink():
+        raise OSError("Vehicle storage cannot be a symlink")
+    vehicle_dir.mkdir(parents=True, exist_ok=True)
+    resolved_vehicle_dir = vehicle_dir.resolve(strict=True)
+    if resolved_vehicle_dir.parent != storage_root or resolved_vehicle_dir.name != vin:
+        raise OSError("Vehicle storage path is invalid")
+    status_path = resolved_vehicle_dir / "clean-frame-status.json"
+    temp_path = status_path.with_name(f".clean-frame-status-{uuid.uuid4().hex}.tmp")
+    payload = {"vin": vin, "status": status, "updated_at": datetime.now().isoformat()}
+    if error:
+        payload["error"] = error[:400]
+    try:
+        temp_path.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temp_path, status_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _run_clean_frames_job(vin: str) -> None:
+    """Run paid clean derivatives as tracked bounded background work."""
+    try:
+        _write_clean_frame_status(vin, "running")
+        if not generate_clean_frames(vin):
+            _write_clean_frame_status(
+                vin, "error", "Clean source frames were unavailable or could not be processed"
+            )
+            return
+        _write_clean_frame_status(vin, "done")
+    except Exception as exc:
+        try:
+            _write_clean_frame_status(vin, "error", f"{type(exc).__name__}: {exc}")
+        except OSError:
+            pass
+        print(f"[Clean Frames] {vin}: {type(exc).__name__}: {exc}")
+
 
 # =============================================================================
 # PHASE 2: CREDIT CHECKING SYSTEM
@@ -851,8 +1291,8 @@ def check_user_can_render(email: str) -> dict:
     Check if user can render a vehicle.
     Returns: {"allowed": bool, "reason": str, "credits": int, "is_subscribed": bool, "plan": str}
     """
-    if not FEATURES_ENABLED.get("payments", False):
-        return {"allowed": True, "reason": "Payments disabled", "credits": -1, "is_subscribed": False, "plan": "free"}
+    if not _payments_available():
+        return {"allowed": True, "reason": "Payments disabled or pricing unapproved", "credits": -1, "is_subscribed": False, "plan": "free"}
     if not email:
         return {"allowed": True, "reason": "No user - free mode", "credits": 0, "is_subscribed": False, "plan": "free"}
     
@@ -862,7 +1302,6 @@ def check_user_can_render(email: str) -> dict:
     
     credits = user.get("credits", 0)
     is_subscribed = user.get("is_subscribed", False)
-    plan = user.get("plan", "free")
     plan_type = user.get("plan_type", "free")
     
     # Unlimited plan (dealership/enterprise)
@@ -927,13 +1366,26 @@ def db_update_dealer_plan(dealer_name: str, plan: str):
 # =============================================================================
 # PHASE 5: TENANT DATABASE FUNCTIONS
 # =============================================================================
-def db_create_dealer(name: str, email: str = "", display_name: str = "", background_preset: str = "showroom") -> int:
-    """Create a new dealer/tenant."""
+def db_create_dealer(
+    name: str,
+    email: str = "",
+    display_name: str = "",
+    background_preset: str = "showroom",
+    user_email: str = "",
+) -> int | None:
+    """Create a dealer and bind it to an authenticated account email."""
+    name = (name or "").strip()[:120]
+    email = (email or "").strip().lower()[:254]
+    owner_email = (user_email or email).strip().lower()[:254]
+    if not name:
+        return None
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("""
-        INSERT OR IGNORE INTO dealers (name, display_name, email, background_preset, plan, created_at)
-        VALUES (?, ?, ?, 'free', ?)
-    """, (name, display_name or name, email, datetime.now().isoformat()))
+        INSERT OR IGNORE INTO dealers
+            (name, display_name, email, user_email, background_preset, plan, created_at)
+        VALUES (?, ?, ?, ?, ?, 'free', ?)
+    """, (name, display_name or name, email, owner_email, background_preset or "showroom",
+          datetime.now().isoformat()))
     conn.commit()
     row = conn.execute("SELECT id FROM dealers WHERE name=?", (name,)).fetchone()
     conn.close()
@@ -948,12 +1400,42 @@ def db_get_dealer(name: str) -> dict | None:
     return dict(row) if row else None
 
 def db_get_dealer_by_email(email: str) -> dict | None:
-    """Get dealer by user email."""
+    """Get dealer by its owner account email (case-insensitive)."""
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM dealers WHERE user_email=?", (email,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM dealers WHERE LOWER(COALESCE(user_email,''))=? ORDER BY id LIMIT 1",
+        ((email or "").strip().lower(),),
+    ).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def _account_dealer(email: str, *, create: bool = False) -> dict | None:
+    """Resolve the current account's tenant without trusting user-supplied names."""
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    dealer = db_get_dealer_by_email(email)
+    if dealer or not create:
+        return dealer
+    import hashlib
+    name = "account-" + hashlib.sha256(email.encode("utf-8")).hexdigest()[:20]
+    db_create_dealer(name, email=email, display_name="", user_email=email)
+    return db_get_dealer(name)
+
+
+def _require_dealer_owner(request: Request, dealer_name: str) -> dict:
+    dealer = db_get_dealer(dealer_name)
+    if not dealer:
+        raise HTTPException(status_code=404, detail="Dealer not found")
+    email = _authenticated_user_email(request)
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    tenant_email = str(dealer.get("user_email", "") or "").strip().lower()
+    if not (owner_email and email == owner_email) and tenant_email != email:
+        raise HTTPException(status_code=404, detail="Dealer not found")
+    return dealer
+
 
 def db_update_dealer(dealer_name: str, **kwargs):
     """Update dealer fields."""
@@ -974,9 +1456,9 @@ def db_list_dealers() -> list[dict]:
 
 PLANS = {
     "free": {"credits": 5, "price": 0, "label": "Free"},
-    "single": {"credits": 1, "price": 2.99, "label": "Single ($2.99)"},
-    "starter": {"credits": 10, "price": 19.99, "label": "Starter (10 for $19.99)"},
-    "dealership": {"credits": 999999, "price": 75.00, "label": "Dealership Monthly ($75/mo)"},
+    "single": {"credits": 1, "price": 2.99, "label": "Single"},
+    "starter": {"credits": 10, "price": 19.99, "label": "Starter (10 vehicles)"},
+    "dealership": {"credits": 999999, "price": 75.00, "label": "Dealership Monthly"},
 }
 
 def check_credits(user_email: str) -> tuple[bool, int]:
@@ -1006,53 +1488,51 @@ def use_credit(user_email: str, vin: str) -> bool:
 # API — WATERMARK
 # =============================================================================
 @app.post("/api/watermark/{vin}")
-async def set_watermark(vin: str, mode: str = Form("clean")):
+def set_watermark(vin: str, request: Request, mode: str = Form("clean")):
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     if not FEATURES_ENABLED.get("watermark", False):
         return {"status": "ok", "mode": "clean", "note": "watermark feature disabled"}
-    vin = vin.upper()
     if mode not in ("preview", "clean"):
         raise HTTPException(status_code=400, detail="Mode must be 'preview' or 'clean'")
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("UPDATE vehicles SET watermark_mode=? WHERE vin=?", (mode, vin))
-    conn.commit()
-    conn.close()
-    
     if mode == "clean":
-        vehicle_dir = STORAGE_DIR / vin
-        spin_dir = vehicle_dir / "spin"
-        if spin_dir.exists():
-            for f in spin_dir.glob("spin_*.jpg"):
-                try:
-                    img = Image.open(f).convert("RGB")
-                    img.save(f, "JPEG", quality=92)
-                except:
-                    pass
-        ext_dir = vehicle_dir / "exterior"
-        if ext_dir.exists():
-            for f in ext_dir.glob("frame_*.jpg"):
-                try:
-                    img = Image.open(f).convert("RGB")
-                    img.save(f, "JPEG", quality=92)
-                except:
-                    pass
-    
+        _write_clean_frame_status(vin, "queued")
+        submission = _submit_background_job(
+            f"clean-frames:{vin}", _run_clean_frames_job, vin
+        )
+        if submission == "busy":
+            _write_clean_frame_status(vin, "error", "Background processing capacity is full")
+            raise HTTPException(status_code=429, detail="Background processing capacity is full",
+                                headers={"Retry-After": "30"})
+
+    with sqlite3.connect(str(DB_PATH), timeout=10) as conn:
+        conn.execute("UPDATE vehicles SET watermark_mode=? WHERE vin=? AND status='active'", (mode, vin))
+
+    if mode == "clean":
+        return {"status": "processing", "mode": mode, "vin": vin}
     return {"status": "ok", "mode": mode}
 
 
 @app.get("/api/watermark/{vin}")
-async def get_watermark(vin: str):
+def get_watermark(vin: str, request: Request):
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     if not FEATURES_ENABLED.get("watermark", False):
         return {"watermark_mode": "clean"}
-    vin = vin.upper()
-    vehicle = db_get_vehicle(vin)
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
     return {"watermark_mode": vehicle.get("watermark_mode", "preview")}
 
 
 @app.get("/api/plans")
-async def get_plans():
-    return {"plans": PLANS}
+def get_plans():
+    if not _pricing_is_approved():
+        return {"status": "pending_approval", "plans": []}
+    return {"status": "ok", "plans": PLANS}
 
 
 # =============================================================================
@@ -1063,16 +1543,18 @@ STRIPE_PUBLISHABLE = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
 @app.get("/api/stripe/config")
-async def stripe_config():
+def stripe_config():
     return {"publishable_key": STRIPE_PUBLISHABLE}
 
 
 @app.post("/api/create-checkout-session")
-async def create_checkout_session(
+def create_checkout_session(
+    request: Request,
     plan_id: str = Form(...),
     user_email: str = Form("")
 ):
-    if not FEATURES_ENABLED.get("payments", False):
+    user_email = _authenticated_user_email(request)
+    if not _payments_available():
         return {"status": "disabled", "error": "Payments feature is disabled"}
     if not STRIPE_KEY:
         return {"status": "error", "error": "Stripe not configured"}
@@ -1085,12 +1567,7 @@ async def create_checkout_session(
         import stripe
         stripe.api_key = STRIPE_KEY
         
-        price_data = {
-            "single": "price_single_xxxxx",
-            "starter": "price_starter_xxxxx",
-            "dealership": "price_dealership_xxxxx",
-        }
-        
+        public_base = os.environ.get("LOTVUE_PUBLIC_URL", str(request.base_url)).rstrip("/")
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
             line_items=[{
@@ -1102,8 +1579,8 @@ async def create_checkout_session(
                 "quantity": 1,
             }],
             mode="payment",
-            success_url=f"{os.environ.get('LOTVUE_PUBLIC_URL', 'http://127.0.0.1:8001').rstrip('/')}/?payment=success&plan={plan_id}",
-            cancel_url=f"{os.environ.get('LOTVUE_PUBLIC_URL', 'http://127.0.0.1:8001').rstrip('/')}/?payment=cancelled",
+            success_url=f"{public_base}/?payment=success&plan={plan_id}",
+            cancel_url=f"{public_base}/?payment=cancelled",
             customer_email=user_email if user_email else None,
             metadata={"plan_id": plan_id, "credits": str(plan["credits"]), "user_email": user_email}
         )
@@ -1112,93 +1589,226 @@ async def create_checkout_session(
         return {"status": "error", "error": str(e)}
 
 
+def _apply_stripe_event(event: dict) -> tuple[bool, list[str]]:
+    """Apply a verified Stripe event once, transactionally with its idempotency row."""
+    event_id = str(event.get("id") or "").strip()
+    event_type = str(event.get("type") or "").strip()
+    if not event_id or len(event_id) > 255 or not event_type:
+        raise ValueError("Stripe event is missing a valid id or type")
+
+    now = datetime.now().isoformat()
+    clean_frames_for = []
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        inserted = conn.execute(
+            "INSERT OR IGNORE INTO stripe_webhook_events "
+            "(event_id,event_type,status,received_at) VALUES (?,?, 'processing',?)",
+            (event_id, event_type, now),
+        )
+        if inserted.rowcount == 0:
+            existing = conn.execute(
+                "SELECT status FROM stripe_webhook_events WHERE event_id=?", (event_id,)
+            ).fetchone()
+            if existing and existing["status"] == "processed":
+                conn.commit()
+                return False, []
+            conn.execute(
+                "UPDATE stripe_webhook_events SET event_type=?,status='processing',received_at=?,error='' "
+                "WHERE event_id=?",
+                (event_type, now, event_id),
+            )
+
+        if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
+            session = (event.get("data") or {}).get("object") or {}
+            metadata = session.get("metadata") or {}
+            session_id = str(session.get("id") or "").strip()
+            payment_status = session.get("payment_status")
+            if session_id and payment_status in {None, "paid", "no_payment_required"}:
+                payment_type = str(metadata.get("type") or "")
+                purchaser_email = str(
+                    metadata.get("user_email") or session.get("customer_email") or ""
+                ).strip().lower()
+                if payment_type == "unlock_vehicle":
+                    vin = str(metadata.get("vin") or "").strip().upper()
+                    if re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", vin) and purchaser_email:
+                        vehicle = conn.execute(
+                            "SELECT user_email,status,is_paid FROM vehicles WHERE vin=?", (vin,)
+                        ).fetchone()
+                        owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+                        actual_owner = str(vehicle["user_email"] or "").strip().lower() if vehicle else ""
+                        if (vehicle and vehicle["status"] == "active"
+                                and purchaser_email in {actual_owner, owner_email}):
+                            if not bool(vehicle["is_paid"]):
+                                updated = conn.execute(
+                                    "UPDATE vehicles SET is_paid=1,watermark_mode='clean',payment_id=? "
+                                    "WHERE vin=? AND status='active' AND COALESCE(is_paid,0)=0",
+                                    (session_id, vin),
+                                )
+                                if updated.rowcount:
+                                    clean_frames_for.append(vin)
+                            else:
+                                # An earlier webhook attempt may have recorded payment
+                                # before the bounded image-work queue had capacity.
+                                clean_frames_for.append(vin)
+                elif payment_type == "subscription":
+                    plan_type = str(metadata.get("plan_type") or "dealership")
+                    if plan_type not in {"pro_monthly", "dealership", "enterprise"}:
+                        plan_type = "dealership"
+                    conn.execute(
+                        "UPDATE users SET is_subscribed=1,plan_type=? WHERE LOWER(email)=?",
+                        (plan_type, purchaser_email),
+                    )
+                elif purchaser_email:
+                    plan_id = str(metadata.get("plan_id") or "single")
+                    plan = PLANS.get(plan_id)
+                    if plan and plan_id != "free" and float(plan.get("price", 0) or 0) > 0:
+                        try:
+                            credits = int(plan.get("credits", 0))
+                            amount = max(0, int(session.get("amount_total", 0) or 0)) / 100.0
+                        except (TypeError, ValueError, OverflowError):
+                            credits, amount = 0, 0.0
+                        user = conn.execute(
+                            "SELECT id FROM users WHERE LOWER(email)=?", (purchaser_email,)
+                        ).fetchone()
+                        payment_exists = conn.execute(
+                            "SELECT 1 FROM payments WHERE stripe_payment_id=? LIMIT 1", (session_id,)
+                        ).fetchone()
+                        if user and credits > 0 and not payment_exists:
+                            conn.execute(
+                                "UPDATE users SET credits=COALESCE(credits,0)+? WHERE id=?",
+                                (credits, user["id"]),
+                            )
+                            conn.execute(
+                                "INSERT INTO credit_log (user_id,amount,action,vin,created_at) "
+                                "VALUES (?,?,?,?,?)",
+                                (user["id"], credits, f"stripe_purchase_{plan_id}", "", now),
+                            )
+                            conn.execute(
+                                "INSERT INTO payments "
+                                "(user_id,amount,plan,credits_purchased,stripe_payment_id,status,created_at) "
+                                "VALUES (?,?,?,?,?,'completed',?)",
+                                (user["id"], amount, plan_id, credits, session_id, now),
+                            )
+
+        elif event_type in {
+            "customer.subscription.created",
+            "customer.subscription.updated",
+            "customer.subscription.deleted",
+        }:
+            subscription = (event.get("data") or {}).get("object") or {}
+            metadata = subscription.get("metadata") or {}
+            email = str(metadata.get("user_email") or "").strip().lower()
+            if email:
+                if event_type == "customer.subscription.deleted":
+                    conn.execute(
+                        "UPDATE users SET is_subscribed=0,plan_type='free' WHERE LOWER(email)=?", (email,)
+                    )
+                elif str(subscription.get("status") or "") in {"active", "trialing"}:
+                    plan_type = str(metadata.get("plan_type") or "dealership")
+                    if plan_type not in {"pro_monthly", "dealership", "enterprise"}:
+                        plan_type = "dealership"
+                    conn.execute(
+                        "UPDATE users SET is_subscribed=1,plan_type=? WHERE LOWER(email)=?",
+                        (plan_type, email),
+                    )
+
+        conn.execute(
+            "UPDATE stripe_webhook_events SET status='processed',processed_at=?,error='' WHERE event_id=?",
+            (datetime.now().isoformat(), event_id),
+        )
+        conn.commit()
+        return True, clean_frames_for
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _mark_stripe_event_retry(event_id: str, reason: str) -> None:
+    """Keep a committed payment event retryable if its required job cannot queue."""
+    with closing(sqlite3.connect(str(DB_PATH), timeout=10)) as conn, conn:
+        conn.execute(
+            "UPDATE stripe_webhook_events SET status='retry',error=? WHERE event_id=?",
+            (str(reason)[:400], event_id),
+        )
+
+
 @app.post("/api/stripe/webhook")
 async def stripe_webhook(request: Request):
-    if not FEATURES_ENABLED.get("payments", False):
+    if not _payments_available():
         return JSONResponse({"status": "disabled", "error": "Payments feature is disabled"}, status_code=503)
     if not STRIPE_KEY:
         return JSONResponse({"error": "Stripe not configured"}, status_code=500)
-    
-    import stripe
-    stripe.api_key = STRIPE_KEY
-    
-    payload = await request.body()
-    sig = request.headers.get("stripe-signature", "")
-    
+    if not STRIPE_WEBHOOK_SECRET:
+        return JSONResponse({"error": "Verified webhook signing secret is required"}, status_code=503)
+
     try:
-        if STRIPE_WEBHOOK_SECRET:
-            event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
-        else:
-            event = json.loads(payload)
-        
-        if event.get("type") == "checkout.session.completed":
-            session = event["data"]["object"]
-            payment_type = session.get("metadata", {}).get("type", "")
-            plan_id = session.get("metadata", {}).get("plan_id", "single")
-            credits = int(session.get("metadata", {}).get("credits", "1"))
-            user_email = session.get("metadata", {}).get("user_email", session.get("customer_email", ""))
-            
-            if payment_type == "unlock_vehicle":
-                # Vehicle unlock payment
-                vin = session.get("metadata", {}).get("vin", "")
-                if vin:
-                    conn = sqlite3.connect(str(DB_PATH))
-                    conn.execute("UPDATE vehicles SET is_paid=1, watermark_mode='clean', payment_id=? WHERE vin=?", 
-                                  (session.get("id", ""), vin))
-                    conn.commit()
-                    conn.close()
-                    
-                    # Generate clean frames (no watermark)
-                    import threading
-                    threading.Thread(target=generate_clean_frames, args=(vin,)).start()
-                    print(f"[LotVue Pro] Vehicle unlocked: {vin}")
-            
-            elif payment_type == "subscription":
-                # Subscription payment - activate plan
-                plan_type = session.get("metadata", {}).get("plan_type", "dealership")
-                if user_email:
-                    user = db_get_user(user_email)
-                    if user:
-                        conn = sqlite3.connect(str(DB_PATH))
-                        conn.execute("UPDATE users SET is_subscribed=1, plan_type=? WHERE email=?", 
-                                      (plan_type, user_email))
-                        conn.commit()
-                        conn.close()
-            
-            elif user_email:
-                # Credit purchase (default)
-                db_add_credits(user_email, credits, f"stripe_purchase_{plan_id}", "")
-                user = db_get_user(user_email)
-                if user:
-                    db_record_payment(
-                        user["id"],
-                        session.get("amount_total", 0) / 100,
-                        plan_id,
-                        credits,
-                        session.get("id", ""),
-                        "completed"
-                    )
-        
-        return {"status": "received"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        import stripe
+        stripe.api_key = STRIPE_KEY
+        payload = await _read_limited_body(request, 1024 * 1024)
+        event = stripe.Webhook.construct_event(
+            payload, request.headers.get("stripe-signature", ""), STRIPE_WEBHOOK_SECRET
+        )
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    try:
+        processed, unlock_vins = await run_in_threadpool(_apply_stripe_event, event)
+    except Exception as exc:
+        print(f"[Stripe] webhook processing failed: {type(exc).__name__}: {exc}")
+        return JSONResponse({"error": "Webhook processing failed; retry is safe"}, status_code=500)
+
+    for vin in unlock_vins:
+        try:
+            await run_in_threadpool(_write_clean_frame_status, vin, "queued")
+            submission = _submit_background_job(
+                f"clean-frames:{vin}", _run_clean_frames_job, vin
+            )
+        except Exception as exc:
+            await run_in_threadpool(
+                _mark_stripe_event_retry, str(event.get("id") or ""), type(exc).__name__
+            )
+            print(f"[Stripe] clean-frame job could not be queued for {vin}: {type(exc).__name__}")
+            return JSONResponse(
+                {"error": "Payment recorded; clean-frame processing will be retried"},
+                status_code=503,
+                headers={"Retry-After": "30"},
+            )
+        if submission == "busy":
+            await run_in_threadpool(
+                _mark_stripe_event_retry, str(event.get("id") or ""), "background queue full"
+            )
+            print(f"[Stripe] clean-frame queue full after vehicle unlock for {vin}")
+            return JSONResponse(
+                {"error": "Payment recorded; clean-frame processing will be retried"},
+                status_code=503,
+                headers={"Retry-After": "30"},
+            )
+    return {"status": "received" if processed else "already_processed"}
 
 
 # =============================================================================
 # PHASE 3: STRIPE SUBSCRIPTION & RENDER UNLOCK
 # =============================================================================
 @app.post("/api/stripe/create-subscription")
-async def create_subscription(
-    user_email: str = Form(...),
+def create_subscription(
+    request: Request,
+    user_email: str = Form(""),
     plan_type: str = Form("dealership")
 ):
-    """Create monthly subscription (dealership/enterprise)."""
-    if not FEATURES_ENABLED.get("payments", False):
+    """Create monthly subscription for the signed-in account only."""
+    user_email = _authenticated_user_email(request)
+    if not _payments_available():
         return {"status": "disabled", "error": "Payments feature is disabled"}
     if not STRIPE_KEY:
         return {"error": "Stripe not configured"}
     
-    plan = PRICING_PLANS.get(plan_type)
+    # Only the published monthly dealership tier is eligible here. Other entries
+    # in the legacy subscription catalog have no approved public counterpart.
+    plan = PRICING_PLANS.get(plan_type) if plan_type == "dealership" else None
     if not plan:
         return {"error": "Invalid plan"}
     
@@ -1214,12 +1824,17 @@ async def create_subscription(
         else:
             customer = stripe.Customer.create(email=user_email)
         
-        # Create subscription price (you'd create this in Stripe dashboard)
-        price_id = "price_monthly_subscription"  # Replace with actual Stripe price ID
-        
         subscription = stripe.Subscription.create(
             customer=customer.id,
-            items=[{"price": price_id, "quantity": 1}],
+            items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {"name": f"LotVue Pro - {plan['label']}"},
+                    "unit_amount": int(round(float(plan["price"]) * 100)),
+                    "recurring": {"interval": "month"},
+                },
+                "quantity": 1,
+            }],
             metadata={"user_email": user_email, "plan_type": plan_type}
         )
         
@@ -1229,12 +1844,16 @@ async def create_subscription(
 
 
 @app.post("/api/render/unlock")
-async def unlock_render(
+def unlock_render(
+    request: Request,
     vin: str = Form(...),
     user_email: str = Form("")
 ):
-    """Create payment link to unlock a rendered vehicle (remove watermark)."""
-    if not FEATURES_ENABLED.get("payments", False):
+    """Create payment link to unlock a vehicle owned by the signed-in account."""
+    vin = validate_vehicle_id(vin)
+    vehicle = _require_vehicle_owner(request, vin)
+    user_email = _authenticated_user_email(request)
+    if not _payments_available():
         return {"status": "disabled", "error": "Payments feature is disabled"}
     if not STRIPE_KEY:
         return {"error": "Stripe not configured"}
@@ -1256,7 +1875,7 @@ async def unlock_render(
                 "price_data": {
                     "currency": "usd",
                     "product_data": {"name": f"LotVue Pro - Unlock {vin}"},
-                    "unit_amount": 299,  # $2.99
+                    "unit_amount": int(round(float(PLANS["single"]["price"]) * 100)),
                 },
                 "quantity": 1,
             }],
@@ -1275,11 +1894,13 @@ async def unlock_render(
 # PHASE 4: RENDER STATUS API
 # =============================================================================
 @app.get("/api/render/{vin}/status")
-async def get_render_status(vin: str):
-    """Check render progress for a vehicle."""
+def get_render_status(vin: str, request: Request):
+    """Check render progress only for an active vehicle owned by the requester."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
     vehicle = db_get_vehicle(vin)
-    if not vehicle:
-        return {"error": "Vehicle not found"}
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     
     vehicle_dir = STORAGE_DIR / vin
     spin_dir = vehicle_dir / "spin"
@@ -1303,11 +1924,13 @@ async def get_render_status(vin: str):
 # PHASE 6: API ENDPOINTS (COMPLETE)
 # =============================================================================
 @app.get("/api/render/{vin}/preview")
-async def get_render_preview(vin: str):
-    """Get watermarked preview URL for a vehicle."""
+def get_render_preview(vin: str, request: Request):
+    """Get a preview URL only for an active vehicle owned by the requester."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
     vehicle = db_get_vehicle(vin)
-    if not vehicle:
-        return {"error": "Vehicle not found"}
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     
     spin_dir = STORAGE_DIR / vin / "spin"
     if spin_dir.exists() and list(spin_dir.glob("spin_*.jpg")):
@@ -1329,11 +1952,14 @@ async def get_render_preview(vin: str):
 
 
 @app.get("/api/render/{vin}/clean")
-async def get_render_clean(vin: str, user_email: str = ""):
-    """Get clean (no watermark) URL - paid only."""
+def get_render_clean(vin: str, request: Request):
+    """Get a clean URL only for a paid vehicle owned by the requester."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    user_email = _authenticated_user_email(request)
     vehicle = db_get_vehicle(vin)
-    if not vehicle:
-        return {"error": "Vehicle not found"}
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     
     # Check if paid
     if not vehicle.get("is_paid", 0):
@@ -1345,6 +1971,19 @@ async def get_render_clean(vin: str, user_email: str = ""):
         else:
             return {"error": "Payment required", "payment_url": f"/view/{vin}?unlock=1"}
     
+    clean_status_path = STORAGE_DIR / vin / "clean-frame-status.json"
+    if clean_status_path.is_file() and not clean_status_path.is_symlink():
+        try:
+            if clean_status_path.stat().st_size <= 16 * 1024:
+                clean_status = json.loads(clean_status_path.read_text(encoding="utf-8"))
+                if clean_status.get("status") in {"queued", "running"}:
+                    return {"status": "processing", "vin": vin, "is_paid": bool(vehicle.get("is_paid", 0))}
+                if clean_status.get("status") == "error":
+                    return {"status": "error", "vin": vin,
+                            "error": str(clean_status.get("error") or "Clean frames could not be generated")[:400]}
+        except (OSError, ValueError, AttributeError):
+            pass
+
     spin_dir = STORAGE_DIR / vin / "spin"
     if spin_dir.exists() and list(spin_dir.glob("spin_*.jpg")):
         return {
@@ -1357,14 +1996,11 @@ async def get_render_clean(vin: str, user_email: str = ""):
 
 
 @app.get("/api/inventory")
-async def get_inventory(dealer: str = "", user_email: str = ""):
-    """List all renders for a tenant/user."""
-    if dealer:
-        vehicles = db_get_vehicles_by_dealer(dealer)
-    elif user_email:
-        vehicles = db_get_vehicles_by_email(user_email)
-    else:
-        vehicles = db_get_vehicles()
+def get_inventory(request: Request, dealer: str = "", user_email: str = ""):
+    """List inventory for the authenticated tenant; caller-supplied tenant filters are ignored."""
+    actor_email = _authenticated_user_email(request)
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    vehicles = db_get_vehicles() if owner_email and actor_email == owner_email else db_get_vehicles_by_email(actor_email)
     
     return {
         "vehicles": [
@@ -1386,22 +2022,20 @@ async def get_inventory(dealer: str = "", user_email: str = ""):
 
 
 @app.delete("/api/render/{vin}")
-async def delete_render(vin: str, user_email: str = ""):
-    """Delete a render."""
+def delete_render(vin: str, request: Request):
+    """Delete an active render only when the requester owns its vehicle."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
     vehicle = db_get_vehicle(vin)
-    if not vehicle:
-        return {"error": "Vehicle not found"}
-    
-    # Check ownership
-    if user_email and vehicle.get("user_email") != user_email:
-        return {"error": "Not authorized"}
-    
-    # Delete files
-    vehicle_dir = STORAGE_DIR / vin
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    vehicle_dir = (STORAGE_DIR / vin).resolve()
+    if vehicle_dir.parent != STORAGE_DIR.resolve():
+        raise HTTPException(status_code=400, detail="Invalid vehicle path")
     if vehicle_dir.exists():
         shutil.rmtree(vehicle_dir)
-    
-    # Delete from DB
+
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("UPDATE vehicles SET status='deleted' WHERE vin=?", (vin,))
     conn.commit()
@@ -1411,7 +2045,11 @@ async def delete_render(vin: str, user_email: str = ""):
 
 
 @app.get("/api/user/{email}")
-async def get_user(email: str):
+def get_user(email: str, request: Request):
+    actor_email = _authenticated_user_email(request)
+    if email.strip().lower() != actor_email:
+        raise HTTPException(status_code=404, detail="User not found")
+    email = actor_email
     user = db_get_user(email)
     if not user:
         return {"email": email, "credits": 5, "plan": "free"}
@@ -1424,84 +2062,100 @@ async def get_user(email: str):
 
 
 @app.post("/api/register")
-async def register_user(
+def register_user(
+    request: Request,
     email: str = Form(...),
     name: str = Form(""),
     password: str = Form("")
 ):
     if not FEATURES_ENABLED.get("auth", False):
-        return {"status": "disabled", "error": "Auth feature is disabled"}
-    import hashlib
-    pw_hash = hashlib.sha256(password.encode()).hexdigest()
+        raise HTTPException(status_code=503, detail="Account registration is temporarily disabled")
+    check_auth_rate(request, "register", 4)
+    email = email.strip().lower()
+    name = name.strip()
+    if len(email) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=400, detail="Enter a valid email address")
+    if len(name) > 120:
+        raise HTTPException(status_code=400, detail="Name must be 120 characters or fewer")
+    if len(password) < 12 or len(password) > 1024:
+        raise HTTPException(status_code=400, detail="Password must be 12–1,024 characters")
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    if owner_email and email == owner_email:
+        raise HTTPException(status_code=409, detail="This address is reserved for the platform owner")
+    if db_get_user(email):
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+    try:
+        pw_hash = hash_password(password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     db_create_user(email, name, pw_hash)
+    # INSERT OR IGNORE is retained for legacy account-creation call sites. Check
+    # the result here so a simultaneous registration cannot look like success.
+    created = db_get_user(email)
+    if not created or created.get("password_hash") != pw_hash:
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
     return {"status": "ok", "email": email}
 
 
 @app.post("/api/login")
-async def login_user(
+def login_user(
+    request: Request,
     response: Response,
     email: str = Form(...),
     password: str = Form("")
 ):
     if not FEATURES_ENABLED.get("auth", False):
-        return {"status": "disabled", "error": "Auth feature is disabled"}
-    import hashlib
-    pw_hash = hashlib.sha256(password.encode()).hexdigest()
+        raise HTTPException(status_code=503, detail="Authentication is temporarily disabled")
+    check_auth_rate(request, "login", 8)
+    email = email.strip().lower()
     user = db_get_user(email)
-    if not user or user.get("password_hash") != pw_hash:
-        return {"status": "error", "error": "Invalid credentials"}
-    # issue the same JWT session cookie the auth gate checks
+    stored_hash = user.get("password_hash") if user else None
+    if not verify_password(password, stored_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if needs_rehash(stored_hash):
+        upgraded = hash_password(password)
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("UPDATE users SET password_hash=? WHERE email=?", (upgraded, email))
+        conn.commit()
+        conn.close()
+        user["password_hash"] = upgraded
+    # issue the same HttpOnly JWT session cookie the auth gate checks
     try:
         from a2_extensions import _make_tokens, ACCESS_TTL_H
+        from security import secure_cookie_for_request
         tokens = _make_tokens(user["email"])
         response.set_cookie("lotvue_token", tokens["access_token"], httponly=True,
-                            samesite="lax", max_age=ACCESS_TTL_H * 3600)
+                            secure=secure_cookie_for_request(request), samesite="lax",
+                            path="/", max_age=ACCESS_TTL_H * 3600)
     except Exception as e:
-        print(f"[Auth] cookie issue failed (login still ok): {e}")
+        print(f"[Auth] cookie issue failed: {e}")
+        raise HTTPException(status_code=503, detail="Unable to create a secure session") from e
     return {"status": "ok", "email": user["email"], "credits": user.get("credits", 5), "plan": user.get("plan", "free")}
 
 
 @app.post("/api/set-plan")
-async def set_user_plan(
+def set_user_plan(
     email: str = Form(...),
     plan: str = Form("free")
 ):
-    if not FEATURES_ENABLED.get("auth", False):
-        return {"status": "disabled", "error": "Auth feature is disabled"}
-    if plan not in PLANS:
-        return {"status": "error", "error": "Invalid plan"}
-    user = db_get_user(email)
-    if not user:
-        db_create_user(email)
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("UPDATE users SET plan=? WHERE email=?", (plan, email))
-    conn.commit()
-    conn.close()
-    if plan == "dealership":
-        db_update_dealer_plan("default", "dealership")
-    return {"status": "ok", "plan": plan}
+    # Never let a browser-provided email/plan grant credits or a subscription.
+    # Plan state is changed only by a verified Stripe webhook or an operator.
+    if not _payments_available():
+        raise HTTPException(status_code=503, detail="Billing is not configured")
+    raise HTTPException(status_code=403, detail="Plan changes must complete through verified checkout")
 
 
 # =============================================================================
 # API — HEALTH CHECK
 # =============================================================================
 @app.get("/api/health")
-async def health_check():
-    import os
-    vg = db_get_vehicles()
+def health_check():
+    """Minimal liveness response; do not publish tenant counts or filesystem paths."""
     return {
         "status": "ok",
         "app": "LotVue Pro",
         "version": "2.0.0",
-        "gpu": GPU_INFO,
-        "rembg_available": REMBG_AVAILABLE,
         "heic_available": HEIC_SUPPORTED,
-        "storage_dir": str(STORAGE_DIR),
-        "storage_exists": STORAGE_DIR.exists(),
-        "vehicle_count": len(vg),
-        "ffmpeg_path": FFMPEG if os.path.exists(FFMPEG) else "not found",
-        "ffprobe_path": FFPROBE if os.path.exists(FFPROBE) else "not found",
-        "timestamp": datetime.now().isoformat()
     }
 
 
@@ -1509,11 +2163,9 @@ async def health_check():
 # API — USER CREDIT STATUS (Phase 2)
 # =============================================================================
 @app.get("/api/credits")
-async def get_user_credits(email: str = ""):
-    """Get user's credit status and plan info."""
-    if not email:
-        return {"error": "email required", "credits": 0}
-    
+def get_user_credits(request: Request, email: str = ""):
+    """Get the signed-in user's credit status; query-string identities are ignored."""
+    email = _authenticated_user_email(request)
     user = db_get_user(email)
     if not user:
         return {
@@ -1538,44 +2190,62 @@ async def get_user_credits(email: str = ""):
 # PHASE 5: TENANT API ENDPOINTS
 # =============================================================================
 @app.get("/api/tenant/presets")
-async def get_background_presets():
+def get_background_presets():
     """Get available background presets."""
     return {"presets": BACKGROUND_PRESETS}
 
 
 @app.post("/api/tenant/dealer")
-async def create_dealer(
+def create_dealer(
+    request: Request,
     name: str = Form(...),
     email: str = Form(""),
     display_name: str = Form(""),
     background_preset: str = Form("showroom")
 ):
-    """Create a new dealer/tenant."""
-    if db_get_dealer(name):
-        return {"error": "Dealer already exists"}
-    
-    dealer_id = db_create_dealer(name, email, display_name, background_preset)
-    return {"status": "ok", "dealer_id": dealer_id, "name": name}
+    """Create the signed-in account's dealer tenant; never accept an owner email."""
+    actor_email = _authenticated_user_email(request)
+    display_name = (display_name or name or "").strip()
+    contact_email = (email or actor_email).strip().lower()
+    if not display_name or len(display_name) > 120:
+        raise HTTPException(status_code=400, detail="Dealer name must be 1–120 characters")
+    if len(contact_email) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", contact_email):
+        raise HTTPException(status_code=400, detail="Enter a valid dealer email")
+    if background_preset not in BACKGROUND_PRESETS:
+        raise HTTPException(status_code=400, detail="Unknown background preset")
+    if _account_dealer(actor_email):
+        raise HTTPException(status_code=409, detail="This account already has a dealer tenant")
+    import hashlib
+    tenant_name = "account-" + hashlib.sha256(actor_email.encode("utf-8")).hexdigest()[:20]
+    dealer_id = db_create_dealer(
+        tenant_name, contact_email, display_name, background_preset, user_email=actor_email
+    )
+    return {"status": "ok", "dealer_id": dealer_id, "name": tenant_name}
 
 
 @app.get("/api/tenant/dealer/{dealer_name}")
-async def get_dealer(dealer_name: str):
-    """Get dealer details."""
-    dealer = db_get_dealer(dealer_name)
-    if not dealer:
-        return {"error": "Dealer not found"}
-    return dealer
+def get_tenant_dealer(dealer_name: str, request: Request):
+    """Get dealer details for the owning tenant only."""
+    return _require_dealer_owner(request, dealer_name)
 
 
 @app.get("/api/tenant/dealers")
-async def list_dealers():
-    """List all dealers."""
-    return {"dealers": db_list_dealers()}
+def list_dealers(request: Request):
+    """List only this account's dealer, unless the configured owner is signed in."""
+    email = _authenticated_user_email(request)
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    dealers = db_list_dealers() if owner_email and email == owner_email else []
+    if not dealers:
+        dealer = _account_dealer(email)
+        if dealer:
+            dealers = [dealer]
+    return {"dealers": dealers}
 
 
 @app.put("/api/tenant/dealer/{dealer_name}")
-async def update_dealer(
+def update_dealer(
     dealer_name: str,
+    request: Request,
     display_name: str = Form(""),
     phone: str = Form(""),
     email: str = Form(""),
@@ -1586,11 +2256,21 @@ async def update_dealer(
     background_preset: str = Form(""),
     plan: str = Form("")
 ):
-    """Update dealer settings."""
-    dealer = db_get_dealer(dealer_name)
-    if not dealer:
-        return {"error": "Dealer not found"}
-    
+    """Update an owned dealer's profile; billing state is never client-writable."""
+    _require_dealer_owner(request, dealer_name)
+    if plan:
+        raise HTTPException(status_code=403, detail="Plan changes require verified billing")
+    for field_name, value, maximum in (
+        ("display name", display_name, 120), ("phone", phone, 40), ("email", email, 254),
+        ("address", address, 300), ("website", website, 300), ("logo", logo_url, 500),
+    ):
+        if len(value or "") > maximum:
+            raise HTTPException(status_code=400, detail=f"{field_name} is too long")
+    if brand_color and not re.fullmatch(r"#[0-9A-Fa-f]{6}", brand_color):
+        raise HTTPException(status_code=400, detail="Brand color must be a six-digit hex color")
+    if background_preset and background_preset not in BACKGROUND_PRESETS:
+        raise HTTPException(status_code=400, detail="Unknown background preset")
+
     updates = {}
     if display_name: updates["display_name"] = display_name
     if phone: updates["phone"] = phone
@@ -1600,30 +2280,432 @@ async def update_dealer(
     if logo_url: updates["logo_url"] = logo_url
     if brand_color: updates["brand_color"] = brand_color
     if background_preset: updates["background_preset"] = background_preset
-    if plan: updates["plan"] = plan
-    
     if updates:
         db_update_dealer(dealer_name, **updates)
-    
     return {"status": "ok", "dealer": db_get_dealer(dealer_name)}
 
 
 @app.get("/api/tenant/me")
-async def get_my_dealer(email: str = ""):
-    """Get dealer for current user."""
-    if not email:
-        return {"error": "email required"}
-    
-    dealer = db_get_dealer_by_email(email)
+def get_my_dealer(request: Request):
+    """Get the signed-in user's own dealer (email query parameters are ignored)."""
+    email = _authenticated_user_email(request)
+    dealer = _account_dealer(email)
     if not dealer:
         return {"error": "No dealer found", "has_dealer": False}
-    
     return {"dealer": dealer, "has_dealer": True}
 
 
 # =============================================================================
 # HELPERS
 # =============================================================================
+def validate_vehicle_id(value: str) -> str:
+    """Normalize a VIN or internal ID used in storage paths and HTML."""
+    vehicle_id = (value or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{1,32}", vehicle_id):
+        raise HTTPException(status_code=400, detail="Invalid vehicle identifier")
+    return vehicle_id
+
+
+def _json_for_script(value) -> str:
+    """Serialize data so strings cannot terminate an inline script element."""
+    return (json.dumps(value, ensure_ascii=True)
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
+def _authenticated_user_email(request: Request) -> str:
+    """Return the subject of a valid access token (cookie or bearer), never form data."""
+    from auth_gate import _bearer_or_cookie
+    from a2_extensions import JWT_ALG, _jwt_secret
+    from jose import JWTError, jwt
+
+    token = _bearer_or_cookie(request)
+    try:
+        payload = jwt.decode(token, _jwt_secret(), algorithms=[JWT_ALG])
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="Sign in required") from exc
+    email = str(payload.get("sub", "")).strip().lower()
+    if payload.get("type") != "access" or not email or not db_get_user(email):
+        raise HTTPException(status_code=401, detail="Sign in required")
+    return email
+
+
+def _require_vehicle_access(
+    request: Request,
+    vehicle_id: str,
+    *,
+    allow_create: bool = False,
+) -> tuple[str, Optional[dict]]:
+    """Resolve the actor and enforce tenant ownership before vehicle reads/writes."""
+    vehicle_id = validate_vehicle_id(vehicle_id)
+    email = _authenticated_user_email(request)
+    storage_root = STORAGE_DIR.resolve()
+    vehicle_path = STORAGE_DIR / vehicle_id
+    try:
+        if vehicle_path.is_symlink():
+            raise HTTPException(status_code=404, detail="Vehicle not found")
+        if vehicle_path.exists():
+            resolved_vehicle_path = vehicle_path.resolve(strict=True)
+            if (resolved_vehicle_path.parent != storage_root
+                    or resolved_vehicle_path.name != vehicle_id
+                    or not resolved_vehicle_path.is_dir()):
+                raise HTTPException(status_code=404, detail="Vehicle not found")
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=404, detail="Vehicle not found") from exc
+    vehicle = db_get_vehicle(vehicle_id)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        if allow_create and not vehicle:
+            return email, None
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    vehicle_email = str(vehicle.get("user_email", "") or "").strip().lower()
+    if not (owner_email and email == owner_email) and vehicle_email != email:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    return email, vehicle
+
+
+def _require_vehicle_owner(request: Request, vehicle_id: str) -> dict:
+    """Find a vehicle and ensure the authenticated tenant owns it."""
+    _, vehicle = _require_vehicle_access(request, vehicle_id)
+    return vehicle or {}
+
+
+def _safe_vehicle_directory(vin: str) -> Path:
+    """Resolve an existing vehicle directory without following storage symlinks."""
+    vin = validate_vehicle_id(vin)
+    storage_root = Path(STORAGE_DIR).resolve(strict=True)
+    vehicle_path = Path(STORAGE_DIR) / vin
+    if vehicle_path.is_symlink():
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    try:
+        vehicle_dir = vehicle_path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=404, detail="Vehicle not found") from exc
+    if (vehicle_dir.parent != storage_root or vehicle_dir.name != vin
+            or not vehicle_dir.is_dir()):
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    return vehicle_dir
+
+
+def _ensure_safe_vehicle_subdir(vin: str, subdir: str, *, create: bool = False) -> Path:
+    """Resolve a known vehicle media directory; reject symlinks and escapes."""
+    if subdir not in {
+        "raw", "source", "_3dphotos", "exterior", "spin", "spin_hd", "interior", "panoramas",
+        "gallery", "hotspot_photos", "walkaround", "video", "videos", "commercial",
+        "video_ads", "exports", "studio", "studio_spin", "splat", "3d",
+    }:
+        raise HTTPException(status_code=400, detail="Invalid vehicle media directory")
+    vehicle_dir = _safe_vehicle_directory(vin)
+    directory = vehicle_dir / subdir
+    if directory.is_symlink():
+        raise HTTPException(status_code=404, detail="Vehicle media not found")
+    if create:
+        try:
+            directory.mkdir(exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="Vehicle media directory unavailable") from exc
+    try:
+        resolved = directory.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=404, detail="Vehicle media not found") from exc
+    if resolved.parent != vehicle_dir or resolved.name != subdir or not resolved.is_dir():
+        raise HTTPException(status_code=404, detail="Vehicle media not found")
+    return resolved
+
+
+def _vehicle_media_file_exists(vin: str, subdir: str, filename: str) -> bool:
+    try:
+        directory = _ensure_safe_vehicle_subdir(vin, subdir)
+        candidate = directory / filename
+        if candidate.is_symlink():
+            return False
+        resolved = candidate.resolve(strict=True)
+        return resolved.parent == directory and resolved.is_file()
+    except HTTPException:
+        return False
+
+
+def _ensure_brand_storage_dir() -> Path:
+    """Create the reserved brand-media directory without following a symlink."""
+    storage_root = Path(STORAGE_DIR).resolve(strict=True)
+    brand_dir = Path(STORAGE_DIR) / "_brand"
+    if brand_dir.is_symlink():
+        raise HTTPException(status_code=404, detail="Brand storage is unavailable")
+    brand_dir.mkdir(exist_ok=True)
+    resolved = brand_dir.resolve(strict=True)
+    if resolved.parent != storage_root or resolved.name != "_brand" or not resolved.is_dir():
+        raise HTTPException(status_code=404, detail="Brand storage is unavailable")
+    return resolved
+
+
+def _resolve_vehicle_image_ref(image_ref: str) -> tuple[str, Path]:
+    """Resolve an image reference only when every path component is a regular child."""
+    storage_root = Path(STORAGE_DIR).resolve(strict=True)
+    if image_ref.startswith("/storage/"):
+        relative_text = image_ref[len("/storage/"):]
+        parts = relative_text.split("/")
+        candidate = Path(STORAGE_DIR).joinpath(*parts)
+    else:
+        candidate = Path(image_ref).expanduser()
+        if any(part in {".", ".."} for part in candidate.parts):
+            raise HTTPException(status_code=400, detail="Image path contains traversal")
+        try:
+            relative = candidate.absolute().relative_to(storage_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Image must be in vehicle storage") from exc
+        parts = list(relative.parts)
+        candidate = storage_root.joinpath(*parts)
+    if (len(parts) < 2 or any(part in {"", ".", ".."} for part in parts)
+            or any(part.startswith(".") for part in parts)):
+        raise HTTPException(status_code=400, detail="Image must belong to a vehicle")
+    vin = validate_vehicle_id(parts[0])
+    current = storage_root
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise HTTPException(status_code=400, detail="Symlinked images cannot be composited")
+    try:
+        resolved = current.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Image must be in vehicle storage") from exc
+    if not resolved.is_relative_to(storage_root) or not resolved.is_file():
+        raise HTTPException(status_code=400, detail="Image must be in vehicle storage")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", resolved.stem):
+        raise HTTPException(status_code=400, detail="Invalid image filename")
+    return vin, resolved
+
+
+def _prepare_vehicle_upload(
+    vin: str,
+    user_email: str,
+    existing_vehicle: Optional[dict],
+    subdirs: tuple[str, ...],
+    *,
+    year: str = "",
+    make: str = "",
+    model: str = "",
+    job_id: str = "",
+) -> Path:
+    """Initialize tenant-owned upload folders and its first vehicle row."""
+    vin = validate_vehicle_id(vin)
+    vehicle_path = Path(STORAGE_DIR) / vin
+    if existing_vehicle is None and vehicle_path.exists():
+        raise HTTPException(status_code=409, detail="Vehicle storage already exists; contact support")
+    vehicle_path.mkdir(parents=True, exist_ok=True)
+    vehicle_dir = _safe_vehicle_directory(vin)
+    for subdir in subdirs:
+        _ensure_safe_vehicle_subdir(vin, subdir, create=True)
+    if existing_vehicle is None:
+        db_upsert_vehicle(
+            vin, year, make, model, 0, 0, user_email=user_email, job_id=job_id
+        )
+    return vehicle_dir
+
+
+def _count_matching_files(directory: Path, suffixes: tuple[str, ...]) -> int:
+    try:
+        with os.scandir(directory) as entries:
+            return sum(
+                1 for entry in entries
+                if entry.is_file(follow_symlinks=False)
+                and Path(entry.name).suffix.lower() in suffixes
+            )
+    except OSError:
+        return 0
+
+
+def _remove_directory_if_exists(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _unlink_file(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
+def _register_panorama_upload(vin: str, path: Path, scene_name: str, sort_order: int) -> None:
+    with closing(sqlite3.connect(str(DB_PATH))) as conn, conn:
+        conn.execute(
+            "INSERT INTO interior_panoramas "
+            "(vin, file_path, scene_name, is_equirectangular, sort_order, created_at) "
+            "VALUES (?, ?, ?, 1, ?, ?)",
+            (vin, str(path), scene_name, sort_order, datetime.now().isoformat()),
+        )
+        conn.execute("UPDATE vehicles SET show_interior=1 WHERE vin=?", (vin,))
+
+
+def _register_gallery_upload(
+    vin: str, path: Path, category: str, caption: str, sort_order: int
+) -> None:
+    with closing(sqlite3.connect(str(DB_PATH))) as conn, conn:
+        conn.execute(
+            "INSERT INTO gallery_photos "
+            "(vin, file_path, category, caption, sort_order, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (vin, str(path), category, caption, sort_order, datetime.now().isoformat()),
+        )
+        conn.execute("UPDATE vehicles SET show_gallery=1 WHERE vin=?", (vin,))
+
+
+def _insert_hotspot(
+    vin: str,
+    photo_filename: str,
+    tag: str,
+    x: float,
+    y: float,
+    condition_type: str,
+    severity: str,
+    note: str,
+    close_up: str,
+) -> int:
+    with closing(sqlite3.connect(str(DB_PATH))) as conn, conn:
+        cursor = conn.execute(
+            "INSERT INTO hotspots (vin, photo_filename, tag, hotspot_x, hotspot_y, "
+            "condition_type, severity, note, close_up) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (vin, photo_filename, tag, x, y, condition_type, severity, note, close_up),
+        )
+        return int(cursor.lastrowid or 0)
+
+
+def _insert_public_lead(
+    dealer_id: int,
+    vin: str,
+    name: str,
+    email: str,
+    phone: str,
+    message: str,
+    source: str,
+    wants_test_drive: int,
+    wants_video: int,
+) -> int:
+    with closing(sqlite3.connect(str(DB_PATH))) as conn, conn:
+        cursor = conn.execute(
+            "INSERT INTO leads "
+            "(dealer_id, vin, name, email, phone, message, source, wants_test_drive, wants_video) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (dealer_id, vin, name, email, phone, message, source, wants_test_drive, wants_video),
+        )
+        return int(cursor.lastrowid or 0)
+
+
+def _set_vehicle_workflow_status(
+    vin: str, workflow_status: str, *, only_if_current: str | None = None
+) -> bool:
+    with closing(sqlite3.connect(str(DB_PATH))) as conn, conn:
+        if only_if_current is None:
+            cursor = conn.execute(
+                "UPDATE vehicles SET workflow_status=? WHERE vin=?", (workflow_status, vin)
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE vehicles SET workflow_status=? WHERE vin=? AND workflow_status=?",
+                (workflow_status, vin, only_if_current),
+            )
+        return bool(cursor.rowcount)
+
+
+def _write_workflow_status(vin: str, workflow_status: str) -> None:
+    _set_vehicle_workflow_status(vin, workflow_status)
+
+
+_PIPELINE_JOB_KINDS = {"spin", "photo_studio", "background_studio"}
+_PIPELINE_JOB_STATES = {"queued", "running", "completed", "degraded", "error"}
+
+
+def _write_pipeline_job(
+    vin: str,
+    kind: str,
+    status: str,
+    *,
+    step: str = "",
+    progress: int = 0,
+    total: int = 0,
+    succeeded: int = 0,
+    degraded: int = 0,
+    failed: int = 0,
+    message: str = "",
+) -> None:
+    """Persist a privacy-safe, bounded summary for the latest vehicle pipeline job."""
+    vin = validate_vehicle_id(vin)
+    if kind not in _PIPELINE_JOB_KINDS or status not in _PIPELINE_JOB_STATES:
+        raise ValueError("Unknown vehicle pipeline job kind or status")
+    def bounded(value: int) -> int:
+        return max(0, min(int(value), 10_000))
+
+    step = re.sub(r"[^a-z0-9_-]", "", str(step).lower())[:40]
+    message = str(message or "")[:240]
+    with closing(sqlite3.connect(str(DB_PATH), timeout=10)) as conn, conn:
+        conn.execute(
+            "INSERT INTO vehicle_pipeline_jobs "
+            "(vin,kind,status,step,progress,total,succeeded,degraded,failed,message,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(vin,kind) DO UPDATE SET status=excluded.status,step=excluded.step,"
+            "progress=excluded.progress,total=excluded.total,succeeded=excluded.succeeded,"
+            "degraded=excluded.degraded,failed=excluded.failed,message=excluded.message,"
+            "updated_at=excluded.updated_at",
+            (vin, kind, status, step, max(0, min(100, bounded(progress))), bounded(total),
+             bounded(succeeded), bounded(degraded), bounded(failed), message,
+             datetime.now().isoformat()),
+        )
+
+
+def _read_pipeline_jobs(vin: str) -> list[dict]:
+    vin = validate_vehicle_id(vin)
+    with closing(sqlite3.connect(str(DB_PATH), timeout=5)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT kind,status,step,progress,total,succeeded,degraded,failed,message,updated_at "
+            "FROM vehicle_pipeline_jobs WHERE vin=? ORDER BY updated_at DESC",
+            (vin,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _start_vehicle_processing(vin: str) -> bool:
+    with closing(sqlite3.connect(str(DB_PATH), timeout=10)) as conn, conn:
+        cursor = conn.execute(
+            "UPDATE vehicles SET workflow_status='processing' "
+            "WHERE vin=? AND status='active' AND COALESCE(workflow_status,'')!='processing'",
+            (vin,),
+        )
+        return bool(cursor.rowcount)
+
+
+def _write_vehicle_price(vin: str, price: str) -> None:
+    with closing(sqlite3.connect(str(DB_PATH))) as conn, conn:
+        conn.execute("UPDATE vehicles SET price=? WHERE vin=?", (price, vin))
+
+
+def _read_lead_record(lead_id: int) -> dict | None:
+    with closing(sqlite3.connect(str(DB_PATH))) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def _require_lead_owner(request: Request, lead: dict) -> str:
+    """Authorize dealer lead access through the linked vehicle's tenant."""
+    email = _authenticated_user_email(request)
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    if owner_email and email == owner_email:
+        return email
+    vin = str(lead.get("vin", "") or "").strip().upper()
+    vehicle = db_get_vehicle(vin) if vin else None
+    if not vehicle or str(vehicle.get("user_email", "") or "").strip().lower() != email:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return email
+
+
+def _require_platform_owner(request: Request) -> str:
+    email = _authenticated_user_email(request)
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    if not owner_email:
+        raise HTTPException(status_code=503, detail="Platform owner account is not configured")
+    if email != owner_email:
+        raise HTTPException(status_code=403, detail="Platform owner access required")
+    return email
+
+
 def validate_vin(vin: str) -> str:
     """Validate and normalize VIN. Returns uppercase VIN or raises."""
     vin = vin.upper().strip()
@@ -1634,6 +2716,512 @@ def validate_vin(vin: str) -> str:
     if not re.match(r'^[A-HJ-NPR-Z0-9]{17}$', vin):
         raise HTTPException(status_code=400, detail="VIN must be alphanumeric (no I/O/Q)")
     return vin
+
+
+class _MultipartPartLimiter:
+    """Count multipart headers incrementally without buffering part payloads."""
+
+    MAX_HEADER_BYTES = 16 * 1024
+    MAX_FIELD_BYTES = 64 * 1024
+
+    def __init__(self, boundary: bytes, max_files: int, max_fields: int):
+        self.boundary = b"--" + boundary
+        self.marker = b"\r\n" + self.boundary
+        self.max_files = max_files
+        self.max_fields = max_fields
+        self.files = 0
+        self.fields = 0
+        self.first = True
+        self.state = "boundary"
+        self.buffer = bytearray()
+        self.current_part_is_file = False
+        self.current_field_bytes = 0
+        self.exceeded = False
+
+    def feed(self, chunk: bytes) -> bool:
+        """Return false as soon as a part-count/header limit is crossed."""
+        if self.exceeded:
+            return False
+        self.buffer.extend(chunk)
+        while True:
+            if self.state == "done":
+                return True
+            if self.state == "boundary":
+                marker = self.boundary
+                index = self.buffer.find(marker)
+                if index < 0:
+                    keep = len(marker) + 2
+                    if len(self.buffer) > keep:
+                        del self.buffer[:-keep]
+                    return True
+                if index:
+                    del self.buffer[:index]
+                if len(self.buffer) < len(marker) + 2:
+                    return True
+                suffix_at = len(marker)
+                suffix = bytes(self.buffer[suffix_at:suffix_at + 2])
+                if suffix == b"--":
+                    self.state = "done"
+                    self.buffer.clear()
+                    return True
+                if suffix != b"\r\n":
+                    del self.buffer[0]
+                    continue
+                del self.buffer[:suffix_at + 2]
+                self.state = "headers"
+                self.first = False
+                continue
+            if self.state == "headers":
+                end = self.buffer.find(b"\r\n\r\n")
+                if end < 0:
+                    if len(self.buffer) > self.MAX_HEADER_BYTES:
+                        self.exceeded = True
+                        return False
+                    return True
+                header_block = bytes(self.buffer[:end])
+                del self.buffer[:end + 4]
+                disposition = next((line for line in header_block.split(b"\r\n")
+                                    if line.lower().startswith(b"content-disposition:")), b"")
+                self.current_part_is_file = bool(
+                    re.search(rb"(?:^|;)\s*filename\*?\s*=", disposition, re.I)
+                )
+                if self.current_part_is_file:
+                    self.files += 1
+                    over_limit = self.files > self.max_files
+                else:
+                    self.fields += 1
+                    over_limit = self.fields > self.max_fields
+                self.current_field_bytes = 0
+                if over_limit:
+                    self.exceeded = True
+                    return False
+                self.state = "body"
+                continue
+            if self.state == "body":
+                index = self.buffer.find(self.marker)
+                if index < 0:
+                    keep = len(self.marker) + 2
+                    flushed = max(0, len(self.buffer) - keep)
+                    if not self.current_part_is_file:
+                        self.current_field_bytes += flushed
+                        if self.current_field_bytes > self.MAX_FIELD_BYTES:
+                            self.exceeded = True
+                            return False
+                    if flushed:
+                        del self.buffer[:flushed]
+                    return True
+                if not self.current_part_is_file:
+                    # The CRLF immediately before a boundary is framing; counting
+                    # its two bytes conservatively keeps the bound fail-closed.
+                    self.current_field_bytes += index + 2
+                    if self.current_field_bytes > self.MAX_FIELD_BYTES + 2:
+                        self.exceeded = True
+                        return False
+                del self.buffer[:index + 2]
+                self.state = "boundary"
+                continue
+
+
+class _UploadBodyLimitMiddleware:
+    """Bound request bytes and multipart part counts before Starlette parses them."""
+
+    def __init__(self, app):
+        self.app = app
+        self.upload_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_UPLOADS)
+        photo = MAX_PHOTO_MB * 1024 * 1024
+        video = MAX_VIDEO_MB * 1024 * 1024
+        self.rules = (
+            (re.compile(r"^/api/vehicle/[A-Za-z0-9_-]{1,32}/generate-3d$"), max(video, MAX_PHOTO_BATCH_MB * 1024 * 1024) + 16 * 1024 * 1024, 73, 4, True),
+            (re.compile(r"^/api/upload$"), max(video, MAX_PHOTO_BATCH_MB * 1024 * 1024) + 16 * 1024 * 1024, 73, 6, True),
+            (re.compile(r"^/api/(?:import/csv|dms/[A-Za-z0-9_-]{1,32}/import)$"), 12 * 1024 * 1024, 1, 0, True),
+            (re.compile(r"^/api/upload/(?:exterior|interior|gallery|panorama)$"), photo + 2 * 1024 * 1024, 1, 3, True),
+            (re.compile(r"^/api/(?:showroom|photo/remove-background)$"), photo + 2 * 1024 * 1024, 1, 1, True),
+            (re.compile(r"^/api/hotspot$"), photo + 2 * 1024 * 1024, 1, 8, True),
+            (re.compile(r"^/api/pano-hotspot$"), 2 * 1024 * 1024, 0, 6, False),
+            (re.compile(r"^/api/upload/video-url$"), 2 * 1024 * 1024, 0, 3, False),
+            (re.compile(r"^/api/brand/assets$"), 2 * photo + 4 * 1024 * 1024, 2, 0, True),
+            (re.compile(r"^/api/brand/clear$"), 2 * 1024 * 1024, 0, 1, False),
+        )
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("method", "").upper() not in {"POST", "PUT", "PATCH"}:
+            return await self.app(scope, receive, send)
+        path = scope.get("path", "")
+        # Keep normal API/form bodies small by default. Only explicit media
+        # upload routes get larger bounded budgets above.
+        rule = next((item for item in self.rules if item[0].fullmatch(path)), None)
+        limit = rule[1] if rule else 2 * 1024 * 1024
+        max_files = rule[2] if rule and len(rule) > 2 else 8
+        max_fields = rule[3] if rule and len(rule) > 3 else 32
+
+        headers = dict(scope.get("headers", []))
+        declared = headers.get(b"content-length")
+        if declared:
+            try:
+                if int(declared) > limit:
+                    return await self._send_too_large(send)
+            except ValueError:
+                return await self._send_too_large(send, status=400, detail="Invalid Content-Length")
+
+        upload_slot = bool(rule and len(rule) > 4 and rule[4])
+        multipart_guard = None
+        content_type = headers.get(b"content-type", b"")
+        if content_type.lower().startswith(b"multipart/form-data"):
+            try:
+                from python_multipart.multipart import parse_options_header
+                _, options = parse_options_header(content_type)
+                boundary = options.get(b"boundary")
+                if boundary and len(boundary) <= 200:
+                    multipart_guard = _MultipartPartLimiter(boundary, max_files, max_fields)
+            except (ImportError, ValueError, TypeError):
+                multipart_guard = None  # Let Starlette return its normal malformed-form response.
+
+        if upload_slot and not self.upload_slots.acquire(blocking=False):
+            return await self._send_busy(send)
+
+        received = 0
+        rejection_detail = ""
+        response_started = False
+        sent_replacement = False
+
+        async def limited_receive():
+            nonlocal received, rejection_detail
+            message = await receive()
+            if message.get("type") == "http.request":
+                body = message.get("body", b"")
+                received += len(body)
+                if received > limit:
+                    rejection_detail = "Request body exceeds the upload limit"
+                    return {"type": "http.disconnect"}
+                if multipart_guard is not None and not multipart_guard.feed(body):
+                    rejection_detail = "Multipart request exceeds its file, field, or part-header limit"
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def limited_send(message):
+            nonlocal response_started, sent_replacement
+            if rejection_detail:
+                if message.get("type") == "http.response.start" and not sent_replacement and not response_started:
+                    sent_replacement = True
+                    response_started = True
+                    await self._send_too_large(send, detail=rejection_detail)
+                return
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, limited_send)
+        except Exception:
+            if rejection_detail:
+                if not response_started and not sent_replacement:
+                    await self._send_too_large(send, detail=rejection_detail)
+                return
+            raise
+        finally:
+            if upload_slot:
+                self.upload_slots.release()
+
+    @staticmethod
+    async def _send_too_large(send, status: int = 413, detail: str = "Request body exceeds the upload limit"):
+        payload = json.dumps({"detail": detail}).encode("utf-8")
+        await send({
+            "type": "http.response.start",
+            "status": status,
+            "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode())],
+        })
+        await send({"type": "http.response.body", "body": payload})
+
+    @staticmethod
+    async def _send_busy(send):
+        payload = json.dumps({"detail": "Upload capacity is full; retry shortly"}).encode("utf-8")
+        await send({
+            "type": "http.response.start",
+            "status": 503,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode()),
+                (b"retry-after", b"30"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": payload})
+
+
+app.add_middleware(_UploadBodyLimitMiddleware)
+
+
+async def _read_limited_body(request: Request, limit_bytes: int) -> bytes:
+    """Read request content incrementally with a strict aggregate byte limit."""
+    chunks = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit_bytes:
+            raise HTTPException(status_code=413, detail="Request body exceeds the size limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _read_json_object_limited(request: Request, limit_bytes: int = 8192) -> dict:
+    raw = await _read_limited_body(request, limit_bytes)
+    try:
+        value = json.loads(raw or b"{}")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
+    return value
+
+
+async def _read_upload_limited(upload: UploadFile, limit_bytes: int) -> bytes:
+    """Read a small media upload in bounded chunks, rejecting before over-allocation."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = await upload.read(min(UPLOAD_CHUNK_BYTES, limit_bytes - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit_bytes:
+            raise HTTPException(status_code=413, detail="Uploaded file exceeds the size limit")
+        chunks.append(chunk)
+    if not total:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    return b"".join(chunks)
+
+
+async def _save_upload_limited(upload: UploadFile, destination: Path, limit_bytes: int) -> int:
+    """Stream a large upload atomically to disk; peak application memory is one chunk."""
+    import uuid
+    await run_in_threadpool(destination.parent.mkdir, parents=True, exist_ok=True)
+    temp_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.upload")
+    total = 0
+    try:
+        out = await run_in_threadpool(temp_path.open, "wb")
+        try:
+            while True:
+                chunk = await upload.read(min(UPLOAD_CHUNK_BYTES, limit_bytes - total + 1))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit_bytes:
+                    raise HTTPException(status_code=413, detail="Uploaded file exceeds the size limit")
+                await run_in_threadpool(out.write, chunk)
+        finally:
+            await run_in_threadpool(out.close)
+        if not total:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        await run_in_threadpool(os.replace, temp_path, destination)
+        return total
+    except Exception:
+        await run_in_threadpool(_unlink_file, temp_path)
+        raise
+
+
+def _verify_uploaded_image(raw_bytes: bytes, filename: str) -> None:
+    """Verify upload headers and dimensions without decoding into a retained image."""
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > MAX_UPLOAD_IMAGE_PIXELS:
+                raise HTTPException(status_code=413, detail=f"{filename} exceeds the image pixel limit")
+            image.verify()
+    except HTTPException:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise HTTPException(status_code=413, detail=f"{filename} exceeds the safe image size") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid image upload") from exc
+
+
+def _decode_uploaded_image(
+    raw_bytes: bytes,
+    filename: str,
+    max_size: tuple[int, int] | None = None,
+) -> Image.Image:
+    """Decode an upload safely, optionally downsampling before the RGB copy."""
+    from PIL import ImageOps
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as source:
+            width, height = source.size
+            if width <= 0 or height <= 0 or width * height > MAX_UPLOAD_IMAGE_PIXELS:
+                raise HTTPException(status_code=413,
+                                    detail=f"{filename} exceeds the image pixel limit")
+            if max_size is not None:
+                source.draft("RGB", max_size)
+                source.thumbnail(max_size, Image.Resampling.LANCZOS)
+            else:
+                source.load()
+            oriented = ImageOps.exif_transpose(source)
+            try:
+                return oriented.convert("RGB")
+            finally:
+                if oriented is not source:
+                    oriented.close()
+    except HTTPException:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise HTTPException(status_code=413,
+                            detail=f"{filename} exceeds the safe image size") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"Cannot process {filename}: invalid image") from exc
+
+
+def _decode_uploaded_rgba(raw_bytes: bytes, filename: str) -> Image.Image:
+    """Decode a transparent logo within the same pixel limits as photo uploads."""
+    from PIL import ImageOps
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as source:
+            width, height = source.size
+            if width <= 0 or height <= 0 or width * height > MAX_UPLOAD_IMAGE_PIXELS:
+                raise HTTPException(status_code=413, detail=f"{filename} exceeds the image pixel limit")
+            source.load()
+            oriented = ImageOps.exif_transpose(source)
+            try:
+                return oriented.convert("RGBA")
+            finally:
+                if oriented is not source:
+                    oriented.close()
+    except HTTPException:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise HTTPException(status_code=413, detail=f"{filename} exceeds the safe image size") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot process {filename}: invalid image") from exc
+
+
+def _process_batch_photo(raw_bytes: bytes, filename: str, destination: Path) -> tuple[int, int]:
+    """Decode and stage one photo without blocking the async request loop."""
+    image = _decode_uploaded_image(raw_bytes, filename)
+    try:
+        width, height = image.size
+        if width < 800 and height < 800:
+            raise HTTPException(status_code=400, detail=f"{filename} resolution too small (min 800px)")
+        image.save(destination, "JPEG", quality=92, optimize=True)
+        return width, height
+    finally:
+        image.close()
+
+
+def _process_3d_photo(raw_bytes: bytes, filename: str, destination: Path) -> bool:
+    """Decode one 3D capture photo and save only useful, bounded images."""
+    image = _decode_uploaded_image(raw_bytes, filename)
+    try:
+        if min(image.size) < 256:
+            return False
+        image.save(destination, "JPEG", quality=92, optimize=True)
+        return True
+    finally:
+        image.close()
+
+
+def _process_panorama_image(raw_bytes: bytes, filename: str, destination: Path) -> None:
+    """Bound, aspect-correct and atomically save an interior panorama."""
+    import uuid
+
+    image = _decode_uploaded_image(raw_bytes, filename, max_size=(4096, 2048))
+    temp_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        if min(image.size) < 256:
+            raise HTTPException(status_code=400, detail="Panorama is too small (minimum dimension 256px)")
+        image.thumbnail((4096, 2048), Image.Resampling.LANCZOS)
+        width, height = image.size
+        if abs((width / max(height, 1)) - 2.0) > 0.10:
+            if width >= 2 * height:
+                target_height = max((width + 1) // 2, 1)
+                canvas = Image.new("RGB", (width, target_height), (32, 34, 38))
+                canvas.paste(image, (0, (target_height - height) // 2))
+            else:
+                target_width = max(2 * height, 1)
+                canvas = Image.new("RGB", (target_width, height), (32, 34, 38))
+                canvas.paste(image, ((target_width - width) // 2, 0))
+            image.close()
+            image = canvas
+        image.save(temp_path, "JPEG", quality=90, optimize=True)
+        os.replace(temp_path, destination)
+    finally:
+        image.close()
+        temp_path.unlink(missing_ok=True)
+
+
+def _process_gallery_image(raw_bytes: bytes, filename: str, destination: Path) -> None:
+    """Decode and atomically save a bandwidth-bounded gallery derivative."""
+    import uuid
+
+    image = _decode_uploaded_image(raw_bytes, filename, max_size=(2000, 2000))
+    temp_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        image.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+        image.save(temp_path, "JPEG", quality=88, optimize=True)
+        os.replace(temp_path, destination)
+    finally:
+        image.close()
+        temp_path.unlink(missing_ok=True)
+
+
+def _process_brand_background(raw_bytes: bytes, filename: str, destination: Path) -> None:
+    """Normalize a platform showroom backdrop off-loop and replace it atomically."""
+    import uuid
+
+    image = _decode_uploaded_image(raw_bytes, filename, max_size=(6000, 4000))
+    temp_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        image.thumbnail((6000, 4000), Image.Resampling.LANCZOS)
+        image.save(temp_path, "JPEG", quality=90, optimize=True)
+        os.replace(temp_path, destination)
+    finally:
+        image.close()
+        temp_path.unlink(missing_ok=True)
+
+
+def _process_brand_logo(raw_bytes: bytes, filename: str, destination: Path) -> None:
+    """Normalize a transparent dealer logo and replace it atomically."""
+    import uuid
+
+    image = _decode_uploaded_rgba(raw_bytes, filename)
+    temp_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        image.thumbnail((2400, 1600), Image.Resampling.LANCZOS)
+        image.save(temp_path, "PNG", optimize=True)
+        os.replace(temp_path, destination)
+    finally:
+        image.close()
+        temp_path.unlink(missing_ok=True)
+
+
+def _replace_directory(source: Path, destination: Path) -> None:
+    """Replace a directory with rollback protection on the same filesystem."""
+    backup = destination.with_name(f".{destination.name}.backup-{uuid.uuid4().hex}")
+    moved_old = False
+    try:
+        if destination.exists():
+            os.replace(destination, backup)
+            moved_old = True
+        os.replace(source, destination)
+    except Exception:
+        if moved_old and backup.exists() and not destination.exists():
+            os.replace(backup, destination)
+        raise
+    else:
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Atomically write a bounded internal JSON manifest beside its destination."""
+    if path.is_symlink():
+        raise OSError("Manifest destination cannot be a symlink")
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(str(temp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(payload, output, separators=(",", ":"))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def get_video_duration(video_path: Path) -> float:
@@ -1650,7 +3238,12 @@ def get_video_duration(video_path: Path) -> float:
     return float(result.stdout.strip())
 
 
-def extract_frames(video_path: Path, output_dir: Path, num_frames: int = 36):
+def extract_frames(
+    video_path: Path,
+    output_dir: Path,
+    num_frames: int = 36,
+    clean_source_dir: Path | None = None,
+):
     """
     Extract EXACTLY num_frames evenly spaced from video.
     
@@ -1692,10 +3285,28 @@ def extract_frames(video_path: Path, output_dir: Path, num_frames: int = 36):
     # Safety trim if we got extras
     for f in frames[num_frames:]:
         f.unlink()
-    
-    # Process all frames with background removal
-    process_all_frames_background(output_dir)
-    
+    frames = frames[:num_frames]
+
+    # Retain clean source frames before background removal or watermarking. Paid
+    # unlocks can then rebuild the clean spin instead of trying to erase pixels
+    # already baked into a processed JPEG.
+    if clean_source_dir is not None:
+        import tempfile
+        if clean_source_dir.is_symlink():
+            raise ValueError("Clean source directory cannot be a symlink")
+        clean_source_dir.parent.mkdir(parents=True, exist_ok=True)
+        source_stage = Path(tempfile.mkdtemp(prefix=".source-stage-", dir=clean_source_dir.parent))
+        try:
+            for frame in frames:
+                shutil.copyfile(frame, source_stage / frame.name)
+            _replace_directory(source_stage, clean_source_dir)
+        finally:
+            if source_stage.exists():
+                shutil.rmtree(source_stage, ignore_errors=True)
+
+    # Keep extracted frames as clean, normalized source material. Background
+    # rendering now runs exactly once on the final staged spin after ordering and
+    # interpolation, avoiding double watermarking/cut-out and partial writes.
     return min(len(frames), num_frames)
 
 
@@ -1794,217 +3405,342 @@ def auto_align_frames(frames: list, canvas_w: int = 1920, canvas_h: int = 1080) 
 
 def process_all_frames_background(frames_dir: Path, watermark_mode: str = "preview",
                                    background_path: str = None, turntable_style: str = "studio_shadow",
-                                   bg_color: tuple = (26, 26, 26)):
-    """Prepare frames for the 360 spin. Two modes (env LOTVUE_RENDER_MODE):
-      - 'natural': KEEP the photographed background. Just auto-orient (EXIF),
-        normalize every frame to ONE uniform size so the spin doesn't jitter, and
-        apply a light sharpen. No cutout, no studio floor, no watermark — cleanest
-        look for a real walkaround video / on-lot photos.
-      - 'studio' (default): rembg cutout + auto-align + turntable shadow on a clean
-        backdrop (the GLO3D-style look; needs rembg).
+                                   bg_color: tuple = (26, 26, 26),
+                                   render_mode: str | None = None) -> dict:
+    """Render one staged 360 set and return measured outcome metadata.
+
+    ``studio`` performs rembg cut-out and local compositing. If rembg is absent,
+    it deliberately falls back to ``natural`` normalization and reports
+    ``degraded`` instead of silently leaving the input unchanged.
     """
     frames = sorted(list(frames_dir.glob("frame_*.jpg")) + list(frames_dir.glob("spin_*.jpg")))
     if not frames:
-        print(f"[Render] No frames found in {frames_dir}")
-        return
+        return {"status": "error", "mode": "none", "processed": 0,
+                "failed": 0, "warning": "No frames were available to render."}
 
-    render_mode = os.environ.get("LOTVUE_RENDER_MODE", "studio").lower()
+    requested_mode = (render_mode or os.environ.get("LOTVUE_RENDER_MODE", "studio")).lower()
+    if requested_mode not in {"natural", "studio"}:
+        raise ValueError("LOTVUE_RENDER_MODE must be natural or studio")
+    fallback_reason = ""
+    actual_mode = requested_mode
+    if requested_mode == "studio" and not REMBG_AVAILABLE:
+        actual_mode = "natural"
+        fallback_reason = "Background removal is not installed; the photographed backgrounds were retained."
     watermark_on = (watermark_mode == "preview") and FEATURES_ENABLED.get("watermark", False)
 
     # ── NATURAL mode: keep the real background; clean + normalize only ──────────
-    if render_mode == "natural":
+    if actual_mode == "natural":
         from PIL import ImageOps, ImageFilter
-        first = ImageOps.exif_transpose(Image.open(frames[0])).convert("RGB")
+        with Image.open(frames[0]) as source:
+            first = ImageOps.exif_transpose(source).convert("RGB")
         fw, fh = first.size
-        scale = min(1.0, 1600 / max(fw, fh))                 # cap longest side at 1600px
-        TW, TH = (int(fw * scale) // 2) * 2, (int(fh * scale) // 2) * 2
+        first.close()
+        scale = min(1.0, 1600 / max(fw, fh))
+        TW, TH = max(2, int(fw * scale) // 2 * 2), max(2, int(fh * scale) // 2 * 2)
+        completed = 0
         for frame_path in frames:
+            im = fitted = sharpened = final = None
             try:
-                im = ImageOps.exif_transpose(Image.open(frame_path)).convert("RGB")
-                im = ImageOps.fit(im, (TW, TH), Image.LANCZOS, centering=(0.5, 0.5))
-                im = im.filter(ImageFilter.UnsharpMask(radius=1.4, percent=85, threshold=2))
-                if watermark_on:
-                    im = apply_diagonal_watermark(im, "LOTVUE PRO PREVIEW", 60)
-                im.save(frame_path, "JPEG", quality=94)
-            except Exception as e:
-                print(f"[Render] natural frame failed {frame_path.name}: {e}")
-        print(f"[Render] natural mode: kept background, normalized {len(frames)} frames to {TW}x{TH}.")
-        return
+                with Image.open(frame_path) as source:
+                    im = ImageOps.exif_transpose(source).convert("RGB")
+                fitted = ImageOps.fit(im, (TW, TH), Image.Resampling.LANCZOS,
+                                      centering=(0.5, 0.5))
+                sharpened = fitted.filter(
+                    ImageFilter.UnsharpMask(radius=1.4, percent=85, threshold=2)
+                )
+                final = (apply_diagonal_watermark(sharpened, "LOTVUE PRO PREVIEW", 60)
+                         if watermark_on else sharpened.copy())
+                final.save(frame_path, "JPEG", quality=94)
+                completed += 1
+            except Exception as exc:
+                print(f"[Render] natural frame failed {frame_path.name}: {type(exc).__name__}")
+            finally:
+                for image in (final, sharpened, fitted, im):
+                    if image is not None:
+                        image.close()
+        print(f"[Render] natural mode: kept backgrounds, normalized {completed}/{len(frames)} frames to {TW}x{TH}.")
+        failed = len(frames) - completed
+        status = "error" if completed == 0 else (
+            "degraded" if fallback_reason or failed else "completed"
+        )
+        return {"status": status, "mode": "natural", "requested_mode": requested_mode,
+                "processed": completed, "failed": failed,
+                "warning": fallback_reason or ("Some frames could not be normalized." if failed else "")}
 
     # ── STUDIO mode: rembg cutout + composite (needs rembg) ─────────────────────
-    if not REMBG_AVAILABLE:
-        print("[BG Removal] rembg not available — skipping")
-        return
 
     CANVAS_W, CANVAS_H = 1920, 1080
+    from PIL import ImageOps
+    import statistics
+    import tempfile
 
-    # Load background image if provided
+    # Downsample a user-provided backdrop before retaining it. The source may be
+    # a camera-resolution image; only the 1920x1080 compositor needs to persist.
     bg_base = None
     if background_path and Path(background_path).exists():
         try:
-            bg_base = Image.open(background_path).convert("RGB").resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
+            with Image.open(background_path) as source:
+                source.draft("RGB", (CANVAS_W, CANVAS_H))
+                bg_small = source.convert("RGB")
+            bg_small.thumbnail((CANVAS_W, CANVAS_H), Image.LANCZOS)
+            bg_base = ImageOps.fit(bg_small, (CANVAS_W, CANVAS_H), Image.LANCZOS)
+            bg_small.close()
         except Exception as e:
             print(f"[BG Removal] Could not load background image: {e}")
 
-    # Step 1: Remove background from all frames, collect RGBA cars
+    # Cutouts are persisted as bounded-size temporary PNGs. Keep only the
+    # current frame in memory while finding a global median crop/scale, then
+    # reload and composite each frame in a second pass.
     print(f"[BG Removal] Processing {len(frames)} frames...")
-    car_frames = []
-    for frame_path in frames:
-        try:
-            with open(frame_path, "rb") as f:
-                raw = f.read()
-            result_bytes = remove_bg(raw)
-            car = Image.open(io.BytesIO(result_bytes)).convert("RGBA")
-            car_frames.append((frame_path, car))
-        except Exception as e:
-            print(f"[BG Removal] Failed on {frame_path.name}: {e}")
-            car_frames.append((frame_path, None))
+    cutouts = []
+    completed = 0
+    try:
+        with tempfile.TemporaryDirectory(prefix=".cutout-", dir=str(frames_dir)) as temp_name:
+            temp_dir = Path(temp_name)
+            for frame_path in frames:
+                try:
+                    raw = frame_path.read_bytes()
+                    result_bytes = remove_bg(raw)
+                    with Image.open(io.BytesIO(result_bytes)) as source:
+                        car = source.convert("RGBA")
+                    car.thumbnail((CANVAS_W, CANVAS_H), Image.LANCZOS)
+                    bbox = car.getbbox() or (0, 0, car.width, car.height)
+                    cutout_path = temp_dir / f"cutout_{len(cutouts):04d}.png"
+                    car.save(cutout_path, "PNG", compress_level=1)
+                    car.close()
+                    del raw, result_bytes
+                    cutouts.append((frame_path, cutout_path, bbox))
+                except Exception as e:
+                    print(f"[BG Removal] Failed on {frame_path.name}: {e}")
 
-    # Step 2: Auto-align all valid frames
-    valid_cars = [car for _, car in car_frames if car is not None]
-    if valid_cars:
-        aligned = auto_align_frames(valid_cars, CANVAS_W, CANVAS_H)
-    else:
-        return
+            if not cutouts:
+                return {"status": "error", "mode": "studio", "processed": 0,
+                        "failed": len(frames), "warning": "Background segmentation failed for every frame."}
 
-    # Step 3: Composite each frame onto background + turntable
-    aligned_idx = 0
-    for frame_path, car in car_frames:
-        if car is None:
-            continue
-        try:
-            resized_car, x, y = aligned[aligned_idx]
-            aligned_idx += 1
+            widths = [bbox[2] - bbox[0] for _, _, bbox in cutouts]
+            heights = [bbox[3] - bbox[1] for _, _, bbox in cutouts]
+            median_w = statistics.median(widths)
+            median_h = statistics.median(heights)
+            target_w = int(CANVAS_W * 0.85)
+            scale = min(target_w / max(median_w, 1),
+                        (CANVAS_H * 0.80) / max(median_h, 1))
 
-            # Build background
-            if bg_base:
-                bg = bg_base.copy()
-            else:
-                bg = Image.new("RGB", (CANVAS_W, CANVAS_H), bg_color)
+            for frame_path, cutout_path, bbox in cutouts:
+                try:
+                    with Image.open(cutout_path) as source:
+                        car = source.convert("RGBA")
+                    cropped = car.crop(bbox)
+                    car.close()
+                    new_size = (max(1, int(cropped.width * scale)),
+                                max(1, int(cropped.height * scale)))
+                    resized_car = cropped.resize(new_size, Image.LANCZOS)
+                    cropped.close()
+                    x = (CANVAS_W - resized_car.width) // 2
+                    y = int(CANVAS_H * 0.08)
 
-            # Composite turntable shadow UNDER car
-            bg = composite_turntable(bg, resized_car, x, y, turntable_style)
+                    bg = bg_base.copy() if bg_base is not None else Image.new(
+                        "RGB", (CANVAS_W, CANVAS_H), bg_color)
+                    bg_shadowed = composite_turntable(bg, resized_car, x, y, turntable_style)
+                    bg.close()
+                    bg_rgba = bg_shadowed.convert("RGBA")
+                    bg_shadowed.close()
+                    bg_rgba.paste(resized_car, (x, y), resized_car)
+                    final = bg_rgba.convert("RGB")
+                    bg_rgba.close()
+                    resized_car.close()
 
-            # Paste car on top
-            bg_rgba = bg.convert("RGBA")
-            bg_rgba.paste(resized_car, (x, y), resized_car)
-            final = bg_rgba.convert("RGB")
+                    if watermark_on:
+                        watermarked = apply_diagonal_watermark(final, "LOTVUE PRO PREVIEW", 60)
+                        final.close()
+                        final = watermarked
+                    final.save(frame_path, "JPEG", quality=92)
+                    final.close()
+                    completed += 1
+                except Exception as e:
+                    print(f"[BG Removal] Composite failed for {frame_path.name}: {e}")
+    finally:
+        if bg_base is not None:
+            bg_base.close()
 
-            # Apply watermark (only when the watermark feature is enabled)
-            if watermark_on:
-                final = apply_diagonal_watermark(final, "LOTVUE PRO PREVIEW", 60)
-
-            final.save(frame_path, "JPEG", quality=92)
-        except Exception as e:
-            print(f"[BG Removal] Composite failed for {frame_path.name}: {e}")
-
-    print(f"[BG Removal] Done. {aligned_idx} frames processed.")
+    failed = len(frames) - completed
+    status = "error" if completed == 0 else ("degraded" if failed else "completed")
+    print(f"[BG Removal] Done. {completed}/{len(frames)} frames processed.")
+    return {"status": status, "mode": "studio", "requested_mode": requested_mode,
+            "processed": completed, "failed": failed,
+            "warning": "Some frame cut-outs or composites failed." if failed else ""}
 
 
-def interpolate_optical_flow(img_a: np.ndarray, img_b: np.ndarray, t: float) -> np.ndarray:
-    """
-    Interpolate between two images using Farneback optical flow.
-    t: 0.0 -> img_a, 1.0 -> img_b
-    """
+def _optical_flow_context(img_a: np.ndarray, img_b: np.ndarray):
+    """Compute pair-level flow/grid once; reuse it for every intermediate t."""
     gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
     gray_b = cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY)
-
-    flow = cv2.calcOpticalFlowFarneback(gray_a, gray_b, None,
-                                          pyr_scale=0.5, levels=3, winsize=15,
-                                          iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
-
+    flow = cv2.calcOpticalFlowFarneback(
+        gray_a, gray_b, None, pyr_scale=0.5, levels=3, winsize=15,
+        iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
     h, w = flow.shape[:2]
-    # Vectorized remap-grid build (was pure-Python nested per-pixel loops over
-    # ~2M px/frame — the #1 wall for photo->spin). meshgrid is mathematically
-    # identical and ~1000x faster.
     grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32),
                                  np.arange(h, dtype=np.float32))
+    return flow, grid_x, grid_y
 
+
+def interpolate_optical_flow(img_a: np.ndarray, img_b: np.ndarray, t: float,
+                              flow_context=None) -> np.ndarray:
+    """Interpolate between two same-sized BGR images at t in [0, 1]."""
+    if img_a.shape != img_b.shape:
+        raise ValueError("optical-flow frames must have matching dimensions")
+    flow, grid_x, grid_y = flow_context or _optical_flow_context(img_a, img_b)
     flow_t = flow * t
     map_x = grid_x + flow_t[..., 0]
     map_y = grid_y + flow_t[..., 1]
-
     flow_inv_t = -flow * (1.0 - t)
     map_x_inv = grid_x + flow_inv_t[..., 0]
     map_y_inv = grid_y + flow_inv_t[..., 1]
-
-    warped_a = cv2.remap(img_a, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
-    warped_b = cv2.remap(img_b, map_x_inv, map_y_inv, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
-
-    blended = cv2.addWeighted(warped_a, 1.0 - t, warped_b, t, 0)
-    return blended
+    warped_a = cv2.remap(img_a, map_x, map_y, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_REFLECT_101)
+    warped_b = cv2.remap(img_b, map_x_inv, map_y_inv, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_REFLECT_101)
+    return cv2.addWeighted(warped_a, 1.0 - t, warped_b, t, 0)
 
 
 def interpolate_frames(input_dir: Path, output_dir: Path, target_frames: int = 36,
                        manifest: dict | None = None, use_optical_flow: bool = True):
-    """
-    Take N input frames, generate intermediate frames for smooth rotation.
-    If manifest is provided, uses gap degrees to distribute target_frames proportionally.
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
+    """Create a bounded-memory, fixed-size 360 spin from ordered JPEG frames."""
+    try:
+        target_frames = int(target_frames)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target_frames must be an integer") from exc
+    if not 1 <= target_frames <= 120:
+        raise ValueError("target_frames must be between 1 and 120")
 
+    output_dir.mkdir(parents=True, exist_ok=True)
     for old in output_dir.glob("spin_*.jpg"):
         old.unlink()
 
-    frames_list = sorted(input_dir.glob("frame_*.jpg"))
-    n = len(frames_list)
-    if n == 0:
+    candidates = sorted(input_dir.glob("frame_*.jpg"))
+    if not candidates:
         return 0
 
-    # If already enough frames, just copy
+    # Verify only headers first, then decode at most two resized frames at once.
+    # Dealer uploads can be 40 MP; a 1600 px long edge is already ample for a
+    # web spin and cuts interpolation scratch memory by an order of magnitude.
+    valid_paths = []
+    source_sizes = {}
+    for path in candidates:
+        try:
+            with Image.open(path) as source:
+                width, height = source.size
+                source.verify()
+            if width > 0 and height > 0:
+                valid_paths.append(path)
+                source_sizes[path] = (width, height)
+        except Exception as exc:
+            print(f"[Interpolate] Skipping unreadable frame {path.name}: {exc}")
+
+    n = len(valid_paths)
+    if not n:
+        return 0
+    first_width, first_height = source_sizes[valid_paths[0]]
+    scale = min(1.0, 1600 / max(first_width, first_height))
+    target_size = (max(2, int(round(first_width * scale))),
+                   max(2, int(round(first_height * scale))))
+
+    def read_frame(path):
+        width, height = source_sizes[path]
+        ratio = max(width / target_size[0], height / target_size[1])
+        reduction = 8 if ratio >= 8 else 4 if ratio >= 4 else 2 if ratio >= 2 else 1
+        flags = {1: cv2.IMREAD_COLOR, 2: cv2.IMREAD_REDUCED_COLOR_2,
+                 4: cv2.IMREAD_REDUCED_COLOR_4, 8: cv2.IMREAD_REDUCED_COLOR_8}[reduction]
+        image = cv2.imread(str(path), flags)
+        if image is None:
+            return None
+        if (image.shape[1], image.shape[0]) != target_size:
+            image = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+        return image
+
+    # If there are already enough frames, normalize and copy only the requested
+    # number without allocating an in-memory list of full-resolution images.
     if n >= target_frames:
-        for i, f in enumerate(frames_list[:target_frames]):
-            shutil.copy(f, output_dir / f"spin_{i+1:04d}.jpg")
-        return min(n, target_frames)
+        output_idx = 0
+        selected_paths = [valid_paths[round(i * (n - 1) / max(target_frames - 1, 1))]
+                          for i in range(target_frames)]
+        for path in selected_paths:
+            image = read_frame(path)
+            if image is None:
+                continue
+            output_idx += 1
+            out_path = output_dir / f"spin_{output_idx:04d}.jpg"
+            if not cv2.imwrite(str(out_path), image, [cv2.IMWRITE_JPEG_QUALITY, 92]):
+                raise OSError(f"Could not write interpolated frame {out_path}")
+        return output_idx
 
-    images = []
-    for f in frames_list:
-        img = cv2.imread(str(f))
-        if img is not None:
-            images.append(img)
+    # Respect nonuniform measured capture angles only when the manifest exactly
+    # matches the successfully decoded frame set; otherwise distribute evenly.
+    gap_frames = None
+    gaps = manifest.get("gaps") if isinstance(manifest, dict) else None
+    if isinstance(gaps, list) and len(gaps) == n:
+        try:
+            degrees = [float(g.get("degrees", 0)) for g in gaps]
+            total_degrees = sum(degrees)
+            if all(np.isfinite(value) and value > 0 for value in degrees) and total_degrees > 0:
+                gap_frames = [max(1, round(target_frames * value / total_degrees))
+                              for value in degrees]
+                while sum(gap_frames) < target_frames:
+                    gap_frames[gap_frames.index(min(gap_frames))] += 1
+                while sum(gap_frames) > target_frames:
+                    reducible = [i for i, value in enumerate(gap_frames) if value > 1]
+                    if not reducible:
+                        break
+                    index = max(reducible, key=gap_frames.__getitem__)
+                    gap_frames[index] -= 1
+        except (TypeError, ValueError, AttributeError):
+            gap_frames = None
+    if gap_frames is None:
+        base, extra = divmod(target_frames, n)
+        gap_frames = [base + (1 if i < extra else 0) for i in range(n)]
 
-    n = len(images)
-    if n == 0:
+    first_frame = read_frame(valid_paths[0])
+    if first_frame is None:
         return 0
-
-    # Determine frames per gap
-    if manifest and "gaps" in manifest:
-        gaps = manifest["gaps"]
-        gap_frames = []
-        total_degrees = sum(g["degrees"] for g in gaps)
-        for g in gaps:
-            frames_for_gap = max(1, round(target_frames * g["degrees"] / total_degrees))
-            gap_frames.append(frames_for_gap)
-        # Adjust to hit target exactly
-        while sum(gap_frames) < target_frames:
-            gap_frames[gap_frames.index(min(gap_frames))] += 1
-        while sum(gap_frames) > target_frames:
-            gap_frames[gap_frames.index(max(gap_frames))] -= 1
-    else:
-        total_gaps = n
-        base = target_frames // total_gaps
-        extra = target_frames % total_gaps
-        gap_frames = [base + (1 if i < extra else 0) for i in range(total_gaps)]
-
+    current = first_frame
     output_idx = 1
     for i in range(n):
-        img_a = images[i]
-        img_b = images[(i + 1) % n]
+        if i == n - 1:
+            following = first_frame
+        else:
+            following = read_frame(valid_paths[i + 1])
+            if following is None:
+                print(f"[Interpolate] Skipping unreadable frame {valid_paths[i + 1].name}")
+                continue
         count = gap_frames[i]
+        flow_context = None
+        if use_optical_flow and count > 1:
+            try:
+                flow_context = _optical_flow_context(current, following)
+            except Exception as exc:
+                print(f"[Interpolate] Optical flow unavailable for gap {i}: {exc}")
 
         for j in range(count):
-            t = j / count if count > 0 else 0
-            if use_optical_flow and 0 < t < 1:
+            t = j / count
+            if flow_context is not None and 0 < t < 1:
                 try:
-                    blended = interpolate_optical_flow(img_a, img_b, t)
-                except Exception:
-                    blended = cv2.addWeighted(img_a, 1.0 - t, img_b, t, 0)
+                    blended = interpolate_optical_flow(current, following, t, flow_context)
+                except Exception as exc:
+                    print(f"[Interpolate] Flow warp failed for gap {i}: {exc}")
+                    blended = cv2.addWeighted(current, 1.0 - t, following, t, 0)
             else:
-                blended = cv2.addWeighted(img_a, 1.0 - t, img_b, t, 0)
+                blended = cv2.addWeighted(current, 1.0 - t, following, t, 0)
             out_path = output_dir / f"spin_{output_idx:04d}.jpg"
-            cv2.imwrite(str(out_path), blended, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            if not cv2.imwrite(str(out_path), blended, [cv2.IMWRITE_JPEG_QUALITY, 92]):
+                raise OSError(f"Could not write interpolated frame {out_path}")
             output_idx += 1
+            del blended
 
+        if i < n - 1:
+            current = following
+        else:
+            del current, following
+
+    del first_frame
     return output_idx - 1
 
 
@@ -2070,19 +3806,189 @@ def convert_photo_to_jpg(raw_bytes: bytes, filename: str, save_path: Path,
 
 
 def generate_thumbnail(source_dir: Path, thumb_path: Path, size=(480, 320)):
-    """Generate a thumbnail from the first exterior frame."""
-    frames = sorted(source_dir.glob("frame_*.jpg"))
+    """Generate a bounded thumbnail from the first regular exterior/spin frame."""
+    frames = sorted(
+        (path for path in source_dir.glob("frame_*.jpg")
+         if path.is_file() and not path.is_symlink()),
+        key=lambda path: path.name,
+    )
     if not frames:
-        frames = sorted(source_dir.glob("*.jpg"))  # fallback: any jpg
+        frames = sorted(
+            (path for path in source_dir.glob("*.jpg")
+             if path.is_file() and not path.is_symlink()),
+            key=lambda path: path.name,
+        )
     if not frames:
         return False
+    thumbnail = None
     try:
-        img = Image.open(frames[0])
-        img.thumbnail(size, Image.LANCZOS)
-        img.save(thumb_path, "JPEG", quality=75)
+        with Image.open(frames[0]) as source:
+            thumbnail = source.convert("RGB")
+        thumbnail.thumbnail(size, Image.Resampling.LANCZOS)
+        thumbnail.save(thumb_path, "JPEG", quality=75)
         return True
     except Exception:
         return False
+    finally:
+        if thumbnail is not None:
+            thumbnail.close()
+
+
+def _bounded_frame_count(directory: Path, prefix: str, cap: int = 120) -> int:
+    """Count matching regular frame names while retaining at most cap+1 names."""
+    try:
+        with os.scandir(directory) as entries:
+            names = heapq.nsmallest(
+                cap + 1,
+                (entry.name for entry in entries
+                 if not entry.is_symlink()
+                 and entry.is_file(follow_symlinks=False)
+                 and entry.name.startswith(prefix)
+                 and entry.name.endswith(".jpg")
+                 and re.fullmatch(re.escape(prefix) + r"[A-Za-z0-9_-]{1,80}\.jpg", entry.name)),
+            )
+        return min(len(names), cap)
+    except OSError:
+        return 0
+
+
+def _vehicle_background_path(background_slug: str) -> str | None:
+    """Resolve a selected packaged backdrop without trusting its database URL."""
+    slug = (background_slug or "").strip()
+    if not slug or slug == "none":
+        return None
+    with closing(sqlite3.connect(str(DB_PATH), timeout=5)) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM backgrounds WHERE slug=? AND is_active=1 AND is_system=1",
+            (slug,),
+        ).fetchone()
+    if not row:
+        return None
+    asset = background_asset_path(slug, STATIC_BACKGROUND_DIR)
+    return str(asset) if asset is not None else None
+
+
+def _run_vehicle_spin_job(vin: str, manifest: dict | None = None) -> None:
+    """Build a full staged spin, render it once, and atomically publish the set."""
+    vin = validate_vehicle_id(vin)
+    stage_dir = None
+    staged_thumbnail = None
+    try:
+        import tempfile
+
+        vehicle_dir = _safe_vehicle_directory(vin)
+        exterior_dir = _ensure_safe_vehicle_subdir(vin, "exterior")
+        spin_dir = _ensure_safe_vehicle_subdir(vin, "spin", create=True)
+        source_count = _bounded_frame_count(exterior_dir, "frame_", 72)
+        _write_pipeline_job(
+            vin, "spin", "running", step="interpolate", progress=5,
+            total=NUM_EXTERIOR_FRAMES,
+        )
+        stage_dir = Path(tempfile.mkdtemp(prefix=".spin-stage-", dir=vehicle_dir))
+        interpolated = interpolate_frames(
+            exterior_dir, stage_dir, target_frames=NUM_EXTERIOR_FRAMES,
+            manifest=manifest, use_optical_flow=True,
+        )
+        if interpolated <= 0:
+            raise ValueError("No valid exterior frames could be interpolated")
+        _write_pipeline_job(
+            vin, "spin", "running", step="render", progress=65,
+            total=NUM_EXTERIOR_FRAMES,
+        )
+
+        vehicle = db_get_vehicle(vin) or {}
+        watermark_mode = vehicle.get("watermark_mode", "preview") or "preview"
+        turntable_style = vehicle.get("turntable_style", "studio_shadow") or "studio_shadow"
+        background_slug = vehicle.get("background_id", "") or ""
+        selected_render_mode = os.environ.get("LOTVUE_RENDER_MODE", "studio").lower()
+        if background_slug == "none":
+            selected_render_mode = "natural"
+        render = process_all_frames_background(
+            stage_dir,
+            watermark_mode,
+            _vehicle_background_path(background_slug),
+            turntable_style,
+            render_mode=selected_render_mode,
+        )
+        if not isinstance(render, dict) or render.get("status") == "error":
+            raise RuntimeError("360 frame rendering failed")
+        spin_count = _bounded_frame_count(stage_dir, "spin_", 120)
+        if spin_count <= 0:
+            raise RuntimeError("360 render produced no viewer frames")
+
+        spin_manifest = {
+            "count": spin_count,
+            "source_frames": source_count,
+            "engine": "opencv-frame-interpolation",
+            "render_mode": render.get("mode", "unknown"),
+            "render_status": render.get("status", "unknown"),
+            "background_removed": bool(render.get("mode") == "studio"),
+        }
+        (stage_dir / "manifest.json").write_text(
+            json.dumps(spin_manifest, separators=(",", ":")), encoding="utf-8"
+        )
+
+        staged_thumbnail = vehicle_dir / f".thumbnail-{uuid.uuid4().hex}.jpg"
+        thumbnail_ok = generate_thumbnail(stage_dir, staged_thumbnail)
+        if not thumbnail_ok:
+            staged_thumbnail.unlink(missing_ok=True)
+            staged_thumbnail = None
+
+        _replace_directory(stage_dir, spin_dir)
+        stage_dir = None
+        if staged_thumbnail is not None:
+            os.replace(staged_thumbnail, vehicle_dir / "thumbnail.jpg")
+            staged_thumbnail = None
+        db_update_counts(vin)
+
+        warnings = []
+        if render.get("warning"):
+            warnings.append(str(render["warning"]))
+        if not thumbnail_ok:
+            warnings.append("The 360 spin is ready, but its thumbnail could not be updated.")
+        final_status = "degraded" if render.get("status") == "degraded" or not thumbnail_ok else "completed"
+        message = " ".join(warnings) if warnings else "360 spin ready for review."
+        _write_pipeline_job(
+            vin, "spin", final_status, step="ready", progress=100,
+            total=NUM_EXTERIOR_FRAMES, succeeded=spin_count,
+            degraded=1 if final_status == "degraded" else 0,
+            message=message,
+        )
+    except Exception as exc:
+        print(f"[Finalize] spin build failed for {vin}: {type(exc).__name__}: {exc}")
+        try:
+            _write_pipeline_job(
+                vin, "spin", "error", step="failed", progress=0,
+                message="The 360 build failed. Existing viewer output, if any, was preserved; review the capture and retry.",
+                failed=1,
+            )
+        except sqlite3.Error:
+            pass
+    finally:
+        if stage_dir is not None and stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=True)
+        if staged_thumbnail is not None:
+            staged_thumbnail.unlink(missing_ok=True)
+
+
+def _queue_vehicle_spin_job(vin: str, manifest: dict | None = None) -> str:
+    """Submit the canonical spin renderer and persist queue/busy outcomes."""
+    vin = validate_vehicle_id(vin)
+    key = f"finalize:{vin}"
+    if _background_job_running(key):
+        return "already_running"
+    _write_pipeline_job(
+        vin, "spin", "queued", step="queued", progress=0,
+        total=NUM_EXTERIOR_FRAMES, message="360 media build is queued.",
+    )
+    submission = _submit_background_job(key, _run_vehicle_spin_job, vin, manifest)
+    if submission == "busy":
+        _write_pipeline_job(
+            vin, "spin", "error", step="queued", progress=0,
+            total=NUM_EXTERIOR_FRAMES,
+            message="Background processing capacity is full; retry in a moment.",
+        )
+    return submission
 
 
 # =============================================================================
@@ -2130,48 +4036,78 @@ BASE_CSS = """
 # ROUTES — DASHBOARD (Phase 1A Upgrade)
 # =============================================================================
 @app.get("/")
-async def dashboard(request: Request):
-    vehicles = db_get_vehicles()
+def dashboard(request: Request):
+    actor_email = _authenticated_user_email(request)
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    vehicles = db_get_vehicles() if owner_email and actor_email == owner_email else db_get_vehicles_by_email(actor_email)
 
-    # Storage used
-    total_bytes = 0
-    try:
-        for p in STORAGE_DIR.rglob("*"):
-            if p.is_file() and "_showrooms" not in str(p):
-                total_bytes += p.stat().st_size
-    except Exception:
-        pass
+    # Scope storage accounting to this tenant and cache the recursive stat scan.
+    import time as _time
+    cache_key = "__owner__" if owner_email and actor_email == owner_email else actor_email
+    now = _time.monotonic()
+    with _DASHBOARD_STORAGE_LOCK:
+        cached = _DASHBOARD_STORAGE_CACHE.get(cache_key)
+    if cached and now - cached[0] < 30:
+        total_bytes = cached[1]
+    else:
+        total_bytes = 0
+        for vehicle in vehicles:
+            vehicle_dir = STORAGE_DIR / str(vehicle.get("vin", ""))
+            try:
+                for root, dirs, files in os.walk(vehicle_dir, followlinks=False):
+                    dirs[:] = [name for name in dirs if not name.startswith(".")]
+                    for filename in files:
+                        try:
+                            total_bytes += (Path(root) / filename).stat().st_size
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        with _DASHBOARD_STORAGE_LOCK:
+            _DASHBOARD_STORAGE_CACHE[cache_key] = (now, total_bytes)
     storage_gb = round(total_bytes / (1024 ** 3), 2)
 
-    # Status logic per vehicle — workflow_status overrides if present
+    # Derive displayed states from bounded metadata plus the viewer frame set.
     def get_status(v):
         ws = v.get("workflow_status", "")
-        if ws and ws != "intake":
+        if ws in {"processing", "review", "published"}:
             return ws
-        ext = v.get("exterior_frames", 0)
-        if ext >= 8:
-            return "published" if ws == "published" else "review"
-        elif ext > 0:
+        if int(v.get("exterior_frames", 0) or 0) >= 8:
+            return "review"
+        if int(v.get("exterior_frames", 0) or 0) > 0:
             return "photos"
         return "intake"
 
     total_vehicles = len(vehicles)
-    total_360 = sum(1 for v in vehicles if get_status(v) == "ready")
+    total_360 = sum(
+        1 for vehicle in vehicles
+        if len(list((STORAGE_DIR / str(vehicle.get("vin", "")) / "spin").glob("spin_*.jpg"))) >= NUM_EXTERIOR_FRAMES
+    )
 
     # Build vehicle cards
     cards_html = ""
     for v in vehicles:
-        vin = v["vin"]
+        try:
+            vin = validate_vehicle_id(str(v.get("vin", "")))
+        except HTTPException:
+            continue
+        safe_year = html_lib.escape(str(v.get("year", "") or ""), quote=True)
+        raw_make = str(v.get("make", "") or "")
+        raw_model = str(v.get("model", "") or "")
+        safe_make = html_lib.escape(raw_make, quote=True)
+        safe_model = html_lib.escape(raw_model, quote=True)
+        make_query = html_lib.escape(raw_make.lower(), quote=True)
+        model_query = html_lib.escape(raw_model.lower(), quote=True)
         thumb_path = STORAGE_DIR / vin / "thumbnail.jpg"
-        thumb_src = f"/storage/{vin}/thumbnail.jpg" if thumb_path.exists() else ""
+        thumb_src = f"/storage/{vin}/thumbnail.jpg" if thumb_path.is_file() else ""
         thumb_html = (
-            f'<img src="{thumb_src}" class="card-thumb">'
+            f'<img src="{thumb_src}" class="card-thumb" alt="Vehicle preview">'
             if thumb_src
             else '<div class="card-thumb no-thumb">No Preview</div>'
         )
-        price = v.get("price", "")
-        mileage = v.get("mileage", "")
-        color = v.get("color", "")
+        price = html_lib.escape(str(v.get("price", "") or ""), quote=True)
+        mileage = html_lib.escape(str(v.get("mileage", "") or ""), quote=True)
+        color = html_lib.escape(str(v.get("color", "") or ""), quote=True)
         status = get_status(v)
         status_labels = {
             "intake": ("Intake", "#6c757d"),
@@ -2182,14 +4118,14 @@ async def dashboard(request: Request):
         }
         slabel, scolor = status_labels[status]
         vin_short = vin[-6:] if len(vin) >= 6 else vin
-        year_make_model = f"{v.get('year','')} {v.get('make','')} {v.get('model','')}".strip() or vin
+        year_make_model = f"{safe_year} {safe_make} {safe_model}".strip() or vin
         meta_parts = []
         if price: meta_parts.append(f'<span style="color:#3fb950;font-weight:700;">{price}</span>')
         if mileage: meta_parts.append(f'<span>{mileage} mi</span>')
         if color: meta_parts.append(f'<span>{color}</span>')
         meta_html = ' &middot; '.join(meta_parts) if meta_parts else ''
         cards_html += f"""
-        <div class="vcard" data-vin="{vin}" data-make="{v.get('make','').lower()}" data-model="{v.get('model','').lower()}" data-year="{v.get('year','')}" data-status="{status}">
+        <div class="vcard" data-vin="{vin}" data-make="{make_query}" data-model="{model_query}" data-year="{safe_year}" data-status="{status}">
             <div style="position:relative;">
                 {thumb_html}
                 <span class="status-badge" style="background:{scolor}20;color:{scolor};border:1px solid {scolor}40;">{slabel}</span>
@@ -2282,8 +4218,9 @@ async def dashboard(request: Request):
         <nav class="nav">
             <a href="/">Dashboard</a>
             <a href="/capture">Upload</a>
+            <a href="/studio">Dealer Studio</a>
             <a href="/settings">Settings</a>
-            <a href="/health" target="_blank">System</a>
+            <a href="/health">System</a>
             <a href="/capture" class="btn-add">+ Add Vehicle</a>
         </nav>
     </div>
@@ -2580,15 +4517,15 @@ async def dashboard(request: Request):
 
 
 @app.get("/dashboard")
-async def dashboard_alias(request: Request):
-    return await dashboard(request)
+def dashboard_alias(request: Request):
+    return dashboard(request)
 
 
 # =============================================================================
 # ROUTES — CAPTURE GUIDE
 # =============================================================================
 @app.get("/capture-guide")
-async def capture_guide():
+def capture_guide():
     html = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2759,7 +4696,7 @@ async def capture_guide():
 # ROUTES — CAPTURE (LotVue360 — dark minimal batch upload)
 # =============================================================================
 @app.get("/capture")
-async def capture_page():
+def capture_page():
     heic_note = "" if HEIC_SUPPORTED else '<div class="heic-warn"><strong>HEIC not supported.</strong> iPhone: Settings &rarr; Camera &rarr; Formats &rarr; Most Compatible.</div>'
 
     html = f"""<!DOCTYPE html>
@@ -2999,12 +4936,30 @@ async def capture_page():
         const r1 = await fetch('/api/process/' + jobId + '/order', {{ method: 'POST' }});
         if (!r1.ok) throw new Error('Ordering failed');
 
-        setProgress(70, 'Generating frames...');
-        const r2 = await fetch('/api/process/' + jobId + '/interpolate', {{ method: 'POST' }});
-        if (!r2.ok) throw new Error('Interpolation failed');
+        setProgress(65, 'Queueing the shared 360 renderer...');
+        const r2 = await fetch('/api/process/' + jobId + '/interpolate', {{ method: 'POST', credentials: 'same-origin' }});
+        const r2Data = await r2.json().catch(() => ({{}}));
+        if (!r2.ok) throw new Error((r2Data && r2Data.detail) || 'Could not start the 360 renderer');
 
-        setProgress(100, 'Building viewer...');
-        setTimeout(() => window.location.href = '/viewer/' + jobId, 400);
+        setProgress(70, 'Rendering the 360 viewer...');
+        let finished = false;
+        for (let attempt = 0; attempt < 360; attempt++) {{
+          await new Promise(resolve => setTimeout(resolve, 1500));
+          const statusResponse = await fetch('/api/finalize-status/' + encodeURIComponent(vin), {{ credentials: 'same-origin' }});
+          const statusData = await statusResponse.json().catch(() => ({{}}));
+          if (!statusResponse.ok) throw new Error(statusData.detail || 'Could not read 360 job status');
+          const pct = Math.min(98, statusData.progress || (statusData.spin_frames ? Math.round(statusData.spin_frames / 36 * 90) : 70));
+          setProgress(pct, statusData.message || 'Rendering 360 frames...');
+          if (statusData.status === 'error') throw new Error(statusData.message || '360 rendering failed');
+          if (statusData.status === 'completed' || statusData.status === 'degraded') {{
+            if (!statusData.ready) throw new Error('Render finished without a viewer frame');
+            finished = true;
+            break;
+          }}
+        }}
+        if (!finished) throw new Error('The 360 render is still processing. Retry from Dealer Studio.');
+        setProgress(100, 'Viewer ready for review');
+        setTimeout(() => window.location.href = '/viewer/' + encodeURIComponent(jobId), 400);
       }} catch(e) {{
         alert('Error: ' + e.message);
         btn.disabled = false;
@@ -3092,7 +5047,6 @@ def estimate_angles_orb(raw_dir: Path) -> tuple[list[dict], float]:
     normalized = [(a / total_span) * 360.0 % 360.0 for a in abs_angles]
 
     # Confidence per frame based on match count
-    max_matches = max(match_counts) if match_counts else 1
     confidences = [min(1.0, c / 50.0) for c in match_counts]
     avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
 
@@ -3129,114 +5083,129 @@ def build_manifest(job_id: str, vin: str, ordered_frames: list[dict]) -> dict:
 
 
 @app.post("/api/process/{job_id}/interpolate")
-async def process_interpolate(job_id: str):
+def process_interpolate(job_id: str, request: Request):
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
     vehicle = db_get_vehicle_by_job_id(job_id)
     if not vehicle:
         raise HTTPException(status_code=404, detail="Job not found")
+    _require_vehicle_owner(request, vehicle["vin"])
 
     vin = vehicle["vin"]
-    exterior_dir = STORAGE_DIR / vin / "exterior"
-    spin_dir = STORAGE_DIR / vin / "spin"
-    manifest_path = STORAGE_DIR / vin / "manifest.json"
+    exterior_dir = _ensure_safe_vehicle_subdir(vin, "exterior")
+    vehicle_dir = _safe_vehicle_directory(vin)
+    manifest_path = vehicle_dir / "manifest.json"
 
     if not exterior_dir.exists():
         raise HTTPException(status_code=400, detail="No ordered exterior frames found")
 
     manifest = None
-    if manifest_path.exists():
-        with open(manifest_path, "r") as f:
-            manifest = json.load(f)
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        try:
+            if manifest_path.stat().st_size <= 1_000_000:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            manifest = None
 
-    spin_dir.mkdir(exist_ok=True)
-    for old in spin_dir.glob("*.jpg"):
-        old.unlink()
-
-    actual = interpolate_frames(exterior_dir, spin_dir, target_frames=36, manifest=manifest, use_optical_flow=True)
-
-    # Generate thumbnail
-    first_spin = sorted(spin_dir.glob("spin_*.jpg"))
-    if first_spin:
-        generate_thumbnail(spin_dir, STORAGE_DIR / vin / "thumbnail.jpg")
-
-    db_update_counts(vin)
-
+    frame_count = _bounded_frame_count(exterior_dir, "frame_", 72)
+    if frame_count < 4:
+        raise HTTPException(status_code=400, detail="At least 4 ordered exterior frames are required")
+    submission = _queue_vehicle_spin_job(vin, manifest)
+    if submission == "busy":
+        raise HTTPException(
+            status_code=429, detail="Background processing capacity is full",
+            headers={"Retry-After": "30"},
+        )
     return {
-        "status": "interpolated",
+        "status": submission,
         "job_id": job_id,
         "vin": vin,
-        "spin_frames": actual,
+        "original_frames": frame_count,
+        "message": "The 360 build runs in the background. Poll /api/finalize-status/{vin}.",
     }
 
 
 @app.post("/api/process/{job_id}/order")
-async def process_order(job_id: str):
+def process_order(job_id: str, request: Request):
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
     vehicle = db_get_vehicle_by_job_id(job_id)
     if not vehicle:
         raise HTTPException(status_code=404, detail="Job not found")
+    _require_vehicle_owner(request, vehicle["vin"])
+
+    import tempfile
 
     vin = vehicle["vin"]
-    raw_dir = STORAGE_DIR / vin / "raw"
-    exterior_dir = STORAGE_DIR / vin / "exterior"
-    manifest_path = STORAGE_DIR / vin / "manifest.json"
+    vehicle_dir = _safe_vehicle_directory(vin)
+    exterior_dir = _ensure_safe_vehicle_subdir(vin, "exterior", create=True)
+    manifest_path = vehicle_dir / "manifest.json"
+    raw_dir = vehicle_dir / "raw"
+    if raw_dir.is_symlink():
+        raise HTTPException(status_code=404, detail="Raw photos not found")
+    raw_dir_exists = raw_dir.is_dir()
+    raw_frames = sorted(raw_dir.glob("frame_*.jpg")) if raw_dir_exists else []
+    pre_extracted = sorted(
+        (path for path in exterior_dir.glob("frame_*.jpg")
+         if path.is_file() and not path.is_symlink()),
+        key=lambda path: path.name,
+    )[:72]
 
-    # VIDEO path: /api/upload extracts frames straight into exterior/ (already
-    # ordered + background-processed) and leaves raw/ empty. The photo-mode logic
-    # below WIPES exterior and recopies from raw — which would destroy the video's
-    # frames (the "No frames found" bug). So if raw/ is empty but exterior already
-    # has frames, just order the existing exterior frames by filename, keep them
-    # in place, and let interpolate build the spin from them.
-    raw_frames = sorted(raw_dir.glob("frame_*.jpg")) if raw_dir.exists() else []
-    pre_extracted = sorted(exterior_dir.glob("*.jpg")) if exterior_dir.exists() else []
+    # Video extraction already writes clean source frames to exterior/. Do not
+    # rewrite those frames; only create/update the ordering manifest here.
     if not raw_frames and pre_extracted:
         ordered_frames = [
-            {"file": f.name, "estimated_angle": round(i * 360.0 / len(pre_extracted), 2),
+            {"file": frame.name, "estimated_angle": round(i * 360.0 / len(pre_extracted), 2),
              "confidence": 0.1}
-            for i, f in enumerate(pre_extracted)
+            for i, frame in enumerate(pre_extracted)
         ]
         manifest = build_manifest(job_id, vin, ordered_frames)
-        with open(manifest_path, "w") as f:
-            json.dump(manifest, f, indent=2)
+        _atomic_write_json(manifest_path, manifest)
         return {"status": "ordered", "job_id": job_id, "vin": vin,
                 "confidence": 0.1, "source": "video", "frames": len(pre_extracted)}
 
-    if not raw_dir.exists() or not raw_frames:
+    if not raw_frames:
         raise HTTPException(status_code=400, detail="No raw photos found")
+    if len(raw_frames) < 4 or len(raw_frames) > 72:
+        raise HTTPException(status_code=400, detail="A photo spin requires 4–72 raw photos")
 
     ordered_frames, confidence = estimate_angles_orb(raw_dir)
-
-    # Fallback to filename order if low confidence
     if confidence < 0.25 or len(ordered_frames) < 4:
-        frames = sorted(raw_dir.glob("frame_*.jpg"))
-        n = len(frames)
+        n = len(raw_frames)
         step = 360.0 / max(n, 1)
         ordered_frames = [
-            {"file": f.name, "estimated_angle": round(i * step, 2), "confidence": 0.1}
-            for i, f in enumerate(frames)
+            {"file": frame.name, "estimated_angle": round(i * step, 2), "confidence": 0.1}
+            for i, frame in enumerate(raw_frames)
         ]
-
+    ordered_frames = ordered_frames[:72]
     manifest = build_manifest(job_id, vin, ordered_frames)
-    manifest_path = STORAGE_DIR / vin / "manifest.json"
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
 
-    # Also copy ordered frames to exterior/ for downstream processing
-    exterior_dir = STORAGE_DIR / vin / "exterior"
-    exterior_dir.mkdir(exist_ok=True)
-    for old in exterior_dir.glob("*.jpg"):
-        old.unlink()
-    for i, entry in enumerate(ordered_frames):
-        src = raw_dir / entry["file"]
-        dst = exterior_dir / f"frame_{i+1:04d}.jpg"
-        shutil.copy(src, dst)
+    exterior_stage = Path(tempfile.mkdtemp(prefix=".exterior-stage-", dir=vehicle_dir))
+    try:
+        for index, entry in enumerate(ordered_frames):
+            filename = str(entry.get("file", ""))
+            if not re.fullmatch(r"frame_[A-Za-z0-9_-]{1,80}\.jpg", filename):
+                raise ValueError("Frame manifest contains an invalid filename")
+            source = raw_dir / filename
+            if source.is_symlink() or not source.is_file() or source.resolve().parent != raw_dir:
+                raise ValueError("An ordered source frame is unavailable")
+            shutil.copyfile(source, exterior_stage / f"frame_{index + 1:04d}.jpg")
+        _replace_directory(exterior_stage, exterior_dir)
+        _atomic_write_json(manifest_path, manifest)
+    finally:
+        if exterior_stage.exists():
+            shutil.rmtree(exterior_stage, ignore_errors=True)
 
-    return {"status": "ordered", "job_id": job_id, "vin": vin, "confidence": confidence, "manifest_path": str(manifest_path)}
+    return {"status": "ordered", "job_id": job_id, "vin": vin,
+            "confidence": confidence, "frames": len(ordered_frames)}
 
 
 # =============================================================================
 # API — CREATE VEHICLE (for photo-only mode, no video)
 # =============================================================================
 @app.post("/api/create-vehicle")
-async def create_vehicle(
+def create_vehicle(
+    request: Request,
     vin: str = Form(...),
     year: str = Form(""),
     make: str = Form(""),
@@ -3246,17 +5215,18 @@ async def create_vehicle(
     mileage: str = Form(""),
 ):
     vin = validate_vin(vin)
+    user_email, _existing_vehicle = _require_vehicle_access(request, vin, allow_create=True)
+    if any(len(value or "") > 120 for value in (year, make, model, color)) or len(price) > 32 or len(mileage) > 32:
+        raise HTTPException(status_code=400, detail="Vehicle metadata is too long")
 
     vehicle_dir = STORAGE_DIR / vin
+    if _existing_vehicle is None and vehicle_dir.exists():
+        raise HTTPException(status_code=409, detail="Vehicle storage already exists; contact support")
     exterior_dir = vehicle_dir / "exterior"
     interior_dir = vehicle_dir / "interior"
     vehicle_dir.mkdir(parents=True, exist_ok=True)
     exterior_dir.mkdir(exist_ok=True)
     interior_dir.mkdir(exist_ok=True)
-
-    # Clear any old exterior frames if re-uploading
-    for old in exterior_dir.glob("*.jpg"):
-        old.unlink()
 
     # Auto-decode VIN from NHTSA if year/make/model not provided
     decoded = {}
@@ -3295,6 +5265,7 @@ async def create_vehicle(
         drivetrain=decoded.get("drivetrain", ""),
         fuel_type=decoded.get("fuel_type", ""),
         body_style=decoded.get("body_style", ""),
+        user_email=user_email,
     )
 
     # Set initial workflow status + color/price/mileage
@@ -3312,6 +5283,7 @@ async def create_vehicle(
 # =============================================================================
 @app.post("/api/upload/exterior")
 async def upload_exterior_photo(
+    request: Request,
     vin: str = Form(""),
     photo: UploadFile = File(...),
     index: str = Form("0"),
@@ -3322,37 +5294,33 @@ async def upload_exterior_photo(
         vin = str(uuid.uuid4())[:17].upper().replace("-", "0")
     
     vin = validate_vin(vin)
-    vehicle_dir = STORAGE_DIR / vin
-    
-    # Auto-create vehicle directory if not exists
-    if not vehicle_dir.exists():
-        vehicle_dir.mkdir(parents=True, exist_ok=True)
-        (vehicle_dir / "exterior").mkdir(exist_ok=True)
-        (vehicle_dir / "interior").mkdir(exist_ok=True)
-        db_upsert_vehicle(vin, "", "", "", 0, 0)
-    
+    user_email, existing_vehicle = await run_in_threadpool(_require_vehicle_access, request, vin, allow_create=True)
+    vehicle_dir = await run_in_threadpool(
+        _prepare_vehicle_upload, vin, user_email, existing_vehicle, ("exterior", "interior")
+    )
     exterior_dir = vehicle_dir / "exterior"
-    exterior_dir.mkdir(exist_ok=True)
     
-    raw = await photo.read()
-    
-    if len(raw) > MAX_PHOTO_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"Photo too large (max {MAX_PHOTO_MB}MB)")
-    
+    raw = await _read_upload_limited(photo, MAX_PHOTO_MB * 1024 * 1024)
+    try:
+        requested_index = int(index)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid frame index") from exc
+    if requested_index < 0 or requested_index >= 72:
+        raise HTTPException(status_code=400, detail="Frame index must be between 0 and 71")
     # Use index for ordering — frame_0001.jpg, frame_0002.jpg, etc.
-    idx = int(index) + 1  # 0-indexed from frontend → 1-indexed filename
+    idx = requested_index + 1
     photo_path = exterior_dir / f"frame_{idx:04d}.jpg"
     
-    # Process with background removal
-    showroom = get_dealer_showroom()
-    process_exterior_photo(raw, photo_path, showroom)
+    # Keep CPU-heavy decode/enhancement off the async event loop.
+    showroom = await run_in_threadpool(get_dealer_showroom, user_email)
+    await run_in_threadpool(process_exterior_photo, raw, photo_path, showroom)
     
     # Update thumbnail from first frame
     if idx == 1:
-        generate_thumbnail(exterior_dir, vehicle_dir / "thumbnail.jpg")
+        await run_in_threadpool(generate_thumbnail, exterior_dir, vehicle_dir / "thumbnail.jpg")
     
     # Update counts
-    db_update_counts(vin)
+    await run_in_threadpool(db_update_counts, vin)
     
     return {"status": "ok", "vin": vin, "filename": photo_path.name, "index": idx}
 
@@ -3360,14 +5328,52 @@ async def upload_exterior_photo(
 # =============================================================================
 # VIEWER — STATIC FRAME SERVING
 # =============================================================================
-@app.get("/static/{job_id}/frames/{filename}")
-async def serve_frame(job_id: str, filename: str):
+def _public_job_spin_dir(job_id: str) -> tuple[str, Path]:
+    """Resolve only an active vehicle's real spin directory under storage."""
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", job_id or ""):
+        raise HTTPException(status_code=404, detail="Viewer not found")
     vehicle = db_get_vehicle_by_job_id(job_id)
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Job not found")
-    vin = vehicle["vin"]
-    frame_path = STORAGE_DIR / vin / "spin" / filename
-    if not frame_path.exists():
+    if not vehicle or vehicle.get("status") != "active":
+        raise HTTPException(status_code=404, detail="Viewer not found")
+    try:
+        vin = validate_vehicle_id(vehicle.get("vin", ""))
+        storage_root = Path(STORAGE_DIR).resolve(strict=True)
+        vehicle_path = Path(STORAGE_DIR) / vin
+        if vehicle_path.is_symlink():
+            raise HTTPException(status_code=404, detail="Viewer not found")
+        vehicle_dir = vehicle_path.resolve(strict=True)
+        if (vehicle_dir.parent != storage_root or vehicle_dir.name != vin
+                or not vehicle_dir.is_dir()):
+            raise HTTPException(status_code=404, detail="Viewer not found")
+        spin_path = vehicle_dir / "spin"
+        if spin_path.is_symlink():
+            raise HTTPException(status_code=404, detail="Frames not found")
+        spin_dir = spin_path.resolve(strict=True)
+        if (spin_dir.parent != vehicle_dir or spin_dir.name != "spin"
+                or not spin_dir.is_dir()):
+            raise HTTPException(status_code=404, detail="Frames not found")
+        return vin, spin_dir
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="Frames not found") from exc
+
+
+@app.get("/static/{job_id}/frames/{filename}")
+def serve_frame(job_id: str, filename: str):
+    if not re.fullmatch(r"spin_[A-Za-z0-9_-]{1,80}\.jpg", filename or ""):
+        raise HTTPException(status_code=404, detail="Frame not found")
+    try:
+        _, spin_dir = _public_job_spin_dir(job_id)
+        frame_path = spin_dir / filename
+        if frame_path.is_symlink():
+            raise HTTPException(status_code=404, detail="Frame not found")
+        frame_path = frame_path.resolve(strict=True)
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="Frame not found") from exc
+    if frame_path.parent != spin_dir or not frame_path.is_file():
         raise HTTPException(status_code=404, detail="Frame not found")
     return FileResponse(frame_path)
 
@@ -3376,20 +5382,25 @@ async def serve_frame(job_id: str, filename: str):
 # VIEWER — INTERACTIVE 360 PAGE
 # =============================================================================
 @app.get("/viewer/{job_id}")
-async def viewer_page(job_id: str, request: Request):
-    vehicle = db_get_vehicle_by_job_id(job_id)
-    if not vehicle:
-        return HTMLResponse("<h1>Viewer not found</h1>", status_code=404)
+def viewer_page(job_id: str, request: Request):
+    try:
+        _, spin_dir = _public_job_spin_dir(job_id)
+    except HTTPException as exc:
+        return HTMLResponse("<h1>Viewer not found</h1>", status_code=exc.status_code)
 
-    vin = vehicle["vin"]
-    spin_dir = STORAGE_DIR / vin / "spin"
-    if not spin_dir.exists():
+    try:
+        with os.scandir(spin_dir) as entries:
+            frames = heapq.nsmallest(
+                120,
+                (entry.name for entry in entries
+                 if not entry.is_symlink()
+                 and entry.is_file(follow_symlinks=False)
+                 and re.fullmatch(r"spin_[A-Za-z0-9_-]{1,80}\.jpg", entry.name)),
+            )
+    except OSError:
         return HTMLResponse("<h1>Frames not ready</h1>", status_code=404)
-
-    frames = sorted([f.name for f in spin_dir.glob("spin_*.jpg")])
     if not frames:
         return HTMLResponse("<h1>No frames found</h1>", status_code=404)
-
     frame_urls = [f"/static/{job_id}/frames/{f}" for f in frames]
     total = len(frame_urls)
     frame_urls_json = json.dumps(frame_urls)
@@ -3604,6 +5615,7 @@ preload();
 # =============================================================================
 @app.post("/api/upload")
 async def upload_media(
+    request: Request,
     vin: str = Form(""),
     year: str = Form(""),
     make: str = Form(""),
@@ -3614,6 +5626,7 @@ async def upload_media(
     photos: Optional[List[UploadFile]] = File(None),
 ):
     import uuid
+    import tempfile
     from validate_video import validate_dir, validate_video_file, gate_summary
     job_id = str(uuid.uuid4())
 
@@ -3622,15 +5635,21 @@ async def upload_media(
         vin = f"LV360{job_id.replace('-','')[:12].upper()}"
 
     vin = validate_vin(vin)
+    user_email, existing_vehicle = await run_in_threadpool(_require_vehicle_access, request, vin, allow_create=True)
 
-    vehicle_dir = STORAGE_DIR / vin
+    vehicle_dir = await run_in_threadpool(
+        _prepare_vehicle_upload,
+        vin,
+        user_email,
+        existing_vehicle,
+        ("raw", "exterior", "interior"),
+        year=year,
+        make=make,
+        model=model,
+        job_id=job_id,
+    )
     raw_dir = vehicle_dir / "raw"
     exterior_dir = vehicle_dir / "exterior"
-    interior_dir = vehicle_dir / "interior"
-    vehicle_dir.mkdir(parents=True, exist_ok=True)
-    raw_dir.mkdir(exist_ok=True)
-    exterior_dir.mkdir(exist_ok=True)
-    interior_dir.mkdir(exist_ok=True)
 
     # ── Photo batch branch ───────────────────────────────────────────────────
     if photos and len(photos) > 0:
@@ -3640,87 +5659,91 @@ async def upload_media(
             raise HTTPException(status_code=400, detail="Max 72 photos allowed")
 
         valid_exts = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp"}
+        stage_dir = Path(await run_in_threadpool(
+            tempfile.mkdtemp, prefix=".raw-upload-", dir=vehicle_dir
+        ))
         photo_count = 0
+        batch_bytes = 0
+        batch_limit = MAX_PHOTO_BATCH_MB * 1024 * 1024
+        try:
+            for i, photo in enumerate(photos):
+                filename = Path(photo.filename or "upload").name
+                ext = Path(filename).suffix.lower()
+                if ext not in valid_exts:
+                    raise HTTPException(status_code=400, detail=f"Invalid file type: {filename}")
 
-        for i, photo in enumerate(photos):
-            ext = Path(photo.filename).suffix.lower()
-            if ext not in valid_exts:
-                raise HTTPException(status_code=400, detail=f"Invalid file type: {photo.filename}")
+                raw_bytes = await _read_upload_limited(photo, MAX_PHOTO_MB * 1024 * 1024)
+                batch_bytes += len(raw_bytes)
+                if batch_bytes > batch_limit:
+                    raise HTTPException(status_code=413,
+                                        detail=f"Photo batch too large (max {MAX_PHOTO_BATCH_MB}MB total)")
 
-            raw_bytes = await photo.read()
-            if len(raw_bytes) > MAX_PHOTO_MB * 1024 * 1024:
-                raise HTTPException(status_code=413, detail=f"Photo too large (max {MAX_PHOTO_MB}MB)")
+                save_path = stage_dir / f"frame_{i+1:04d}.jpg"
+                await run_in_threadpool(_process_batch_photo, raw_bytes, filename, save_path)
+                photo_count += 1
 
-            try:
-                img = Image.open(io.BytesIO(raw_bytes))
-                img = img.convert("RGB")
-                w, h = img.size
-                if w < 800 and h < 800:
-                    raise HTTPException(status_code=400, detail=f"{photo.filename} resolution too small (min 800px)")
-            except HTTPException:
-                raise
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Cannot process {photo.filename}: {e}")
+            # Validate before replacing a previous upload. Failed retries never
+            # destroy the dealer's last good batch.
+            gate = await run_in_threadpool(validate_dir, stage_dir)
+            if gate["verdict"] == "FAIL" and force != "1":
+                raise HTTPException(status_code=422, detail={
+                    "error": "capture_rejected", "gate": gate_summary(gate)})
+            if gate["verdict"] == "FAIL":
+                print(f"[gate] FORCED past FAIL for {vin}: {gate['reasons']}")
 
-            # Save original to raw/
-            save_path = raw_dir / f"frame_{i+1:04d}.jpg"
-            img.save(save_path, "JPEG", quality=95)
-            photo_count += 1
-
-        # ── P0 QUALITY GATE (Spyne validate-video parity) ────────────────────
-        gate = validate_dir(raw_dir)
-        if gate["verdict"] == "FAIL" and force != "1":
-            for f in raw_dir.glob("frame_*.jpg"):
-                f.unlink()
-            raise HTTPException(status_code=422, detail={
-                "error": "capture_rejected", "gate": gate_summary(gate)})
-        if gate["verdict"] == "FAIL":
-            print(f"[gate] FORCED past FAIL for {vin}: {gate['reasons']}")
-
-        db_upsert_vehicle(vin, year, make, model, photo_count, 0, job_id=job_id)
-
-        return {"job_id": job_id, "photo_count": photo_count, "status": "uploaded",
-                "vin": vin, "gate": gate_summary(gate)}
+            await run_in_threadpool(_replace_directory, stage_dir, raw_dir)
+            await run_in_threadpool(db_upsert_vehicle, vin, year, make, model, photo_count, 0, user_email=user_email, job_id=job_id)
+            return {"job_id": job_id, "photo_count": photo_count, "status": "uploaded",
+                    "vin": vin, "gate": gate_summary(gate)}
+        finally:
+            await run_in_threadpool(_remove_directory_if_exists, stage_dir)
 
     # ── Video branch ─────────────────────────────────────────────────────────
     if not video:
         raise HTTPException(status_code=400, detail="No video or photos provided")
 
-    video_path = vehicle_dir / "video_temp.mp4"
-    content = await video.read()
+    allowed_video_exts = {".mp4", ".mov", ".m4v", ".webm", ".avi"}
+    video_name = Path(video.filename or "").name
+    if Path(video_name).suffix.lower() not in allowed_video_exts:
+        raise HTTPException(status_code=400, detail="Upload an MP4, MOV, M4V, WebM, or AVI video")
 
-    if len(content) > MAX_VIDEO_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"Video too large (max {MAX_VIDEO_MB}MB)")
-
-    with open(video_path, "wb") as f:
-        f.write(content)
+    video_path = vehicle_dir / f".video-{job_id}.mp4"
+    await _save_upload_limited(video, video_path, MAX_VIDEO_MB * 1024 * 1024)
 
     # ── P0 QUALITY GATE — runs BEFORE the expensive extract+matting pipeline ─
     try:
-        gate = validate_video_file(video_path)
+        gate = await run_in_threadpool(validate_video_file, video_path)
     except Exception as e:
         gate = {"verdict": "FAIL", "reasons": [f"unreadable video: {e}"],
                 "frames": 0, "checks": {}}
     if gate["verdict"] == "FAIL" and force != "1":
-        if video_path.exists():
-            video_path.unlink()
+        await run_in_threadpool(_unlink_file, video_path)
         raise HTTPException(status_code=422, detail={
             "error": "capture_rejected", "gate": gate_summary(gate)})
     if gate["verdict"] == "FAIL":
         print(f"[gate] FORCED past FAIL for {vin}: {gate['reasons']}")
 
+    exterior_stage = Path(await run_in_threadpool(
+        tempfile.mkdtemp, prefix=".video-frames-", dir=vehicle_dir
+    ))
     try:
-        num_extracted = extract_frames(video_path, exterior_dir, NUM_EXTERIOR_FRAMES)
+        num_extracted = await run_in_threadpool(
+            extract_frames, video_path, exterior_stage, NUM_EXTERIOR_FRAMES,
+            vehicle_dir / "source",
+        )
+        if num_extracted < 4:
+            raise ValueError("Video extraction produced fewer than four usable frames")
+        await run_in_threadpool(_replace_directory, exterior_stage, exterior_dir)
     except Exception as e:
-        if video_path.exists():
-            video_path.unlink()
-        raise HTTPException(status_code=500, detail=f"Frame extraction failed: {str(e)}")
+        await run_in_threadpool(_unlink_file, video_path)
+        raise HTTPException(status_code=500, detail="Frame extraction failed; existing media was preserved") from e
+    finally:
+        await run_in_threadpool(_remove_directory_if_exists, exterior_stage)
 
-    if video_path.exists():
-        video_path.unlink()
+    await run_in_threadpool(_unlink_file, video_path)
 
-    generate_thumbnail(exterior_dir, vehicle_dir / "thumbnail.jpg")
-    db_upsert_vehicle(vin, year, make, model, num_extracted, 0, job_id=job_id)
+    await run_in_threadpool(generate_thumbnail, exterior_dir, vehicle_dir / "thumbnail.jpg")
+    await run_in_threadpool(db_upsert_vehicle, vin, year, make, model, num_extracted, 0, user_email=user_email, job_id=job_id)
 
     return {"job_id": job_id, "vin": vin, "frames_extracted": num_extracted,
             "status": "uploaded", "gate": gate_summary(gate)}
@@ -3731,6 +5754,7 @@ async def upload_media(
 # =============================================================================
 @app.post("/api/upload/interior")
 async def upload_interior(
+    request: Request,
     vin: str = Form(""),
     photo: UploadFile = File(...)
 ):
@@ -3740,35 +5764,21 @@ async def upload_interior(
         vin = str(uuid.uuid4())[:17].upper().replace("-", "0")
     
     vin = validate_vin(vin)
-    vehicle_dir = STORAGE_DIR / vin
-    
-    # Auto-create vehicle directory if not exists
-    if not vehicle_dir.exists():
-        vehicle_dir.mkdir(parents=True, exist_ok=True)
-        (vehicle_dir / "exterior").mkdir(exist_ok=True)
-        (vehicle_dir / "interior").mkdir(exist_ok=True)
-        db_upsert_vehicle(vin, "", "", "", 0, 0)
-    
+    user_email, existing_vehicle = await run_in_threadpool(_require_vehicle_access, request, vin, allow_create=True)
+    vehicle_dir = await run_in_threadpool(
+        _prepare_vehicle_upload, vin, user_email, existing_vehicle, ("exterior", "interior")
+    )
     interior_dir = vehicle_dir / "interior"
-    interior_dir.mkdir(exist_ok=True)
-    
-    raw = await photo.read()
-    
-    if len(raw) > MAX_PHOTO_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"Photo too large (max {MAX_PHOTO_MB}MB)")
-    
-    existing = len(list(interior_dir.glob("*.jpg")))
+    raw = await _read_upload_limited(photo, MAX_PHOTO_MB * 1024 * 1024)
+    existing = await run_in_threadpool(_count_matching_files, interior_dir, (".jpg",))
     photo_path = interior_dir / f"interior_{existing+1:03d}.jpg"
-    
-    # Just save the photo as-is (no processing)
-    if not raw or len(raw) < 100:
-        raise HTTPException(status_code=400, detail="Empty or invalid image file")
-    img = Image.open(io.BytesIO(raw))
-    img = img.convert("RGB")
-    img.save(photo_path, "JPEG", quality=92)
+    try:
+        await run_in_threadpool(process_interior_photo, raw, photo_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid interior image") from exc
     
     # Update counts
-    db_update_counts(vin)
+    await run_in_threadpool(db_update_counts, vin)
     
     return {"status": "ok", "filename": photo_path.name}
 
@@ -3779,61 +5789,48 @@ async def upload_interior(
 
 @app.post("/api/upload/panorama")
 async def upload_panorama(
+    request: Request,
     vin: str = Form(""),
     scene_name: str = Form("Front Seat"),
     photo: UploadFile = File(...)
 ):
     """Upload an equirectangular interior panorama for Pannellum viewer."""
-    # Accept any vehicle ID (matches /3d-studio + /interior-studio); sanitize to a safe folder.
-    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
-    if not vin:
-        raise HTTPException(status_code=400, detail="Provide a vehicle VIN or ID")
-    vehicle_dir = STORAGE_DIR / vin
-    pano_dir = vehicle_dir / "panoramas"
-    pano_dir.mkdir(parents=True, exist_ok=True)
+    # Accept a VIN or internal vehicle ID, but reject rather than silently rewrite it.
+    vin = validate_vehicle_id(vin)
+    await run_in_threadpool(_require_vehicle_owner, request, vin)
+    pano_dir = await run_in_threadpool(
+        _ensure_safe_vehicle_subdir, vin, "panoramas", create=True
+    )
 
-    raw = await photo.read()
-    if len(raw) > 100 * 1024 * 1024:  # 100MB max for panoramas
-        raise HTTPException(status_code=413, detail="Panorama too large (max 100MB)")
+    if len(scene_name.strip()) > 100:
+        raise HTTPException(status_code=400, detail="Scene name must be 100 characters or fewer")
+    raw = await _read_upload_limited(photo, MAX_PHOTO_MB * 1024 * 1024)
 
-    existing = len(list(pano_dir.glob("*.jpg")) + list(pano_dir.glob("*.jpeg")) + list(pano_dir.glob("*.png")))
+    existing = await run_in_threadpool(
+        _count_matching_files, pano_dir, (".jpg", ".jpeg", ".png")
+    )
     pano_path = pano_dir / f"pano_{existing+1:03d}.jpg"
 
     try:
-        img = Image.open(io.BytesIO(raw)).convert("RGB")
-        # Equirectangular needs a 2:1 width:height ratio. If the upload isn't ~2:1,
-        # pad the short side with neutral gray so Pannellum maps it without stretch
-        # (a too-wide phone pano gets top/bottom bands; a too-tall one gets side bands).
-        w, h = img.size
-        if abs((w / max(h, 1)) - 2.0) > 0.10:
-            if w >= 2 * h:                       # too wide -> add top/bottom bands
-                nh = max(w // 2, 1); canvas = Image.new("RGB", (w, nh), (32, 34, 38))
-                canvas.paste(img, (0, (nh - h) // 2))
-            else:                                # too tall/narrow -> add left/right bands
-                nw = max(2 * h, 1); canvas = Image.new("RGB", (nw, h), (32, 34, 38))
-                canvas.paste(img, ((nw - w) // 2, 0))
-            img = canvas; w, h = img.size
-        if w > 4096:                             # cap; image is now exactly 2:1
-            img = img.resize((4096, 2048), Image.LANCZOS)
-        img.save(pano_path, "JPEG", quality=92)
+        await run_in_threadpool(
+            _process_panorama_image,
+            raw,
+            Path(photo.filename or "panorama").name,
+            pano_path,
+        )
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
+        raise HTTPException(status_code=400, detail="Invalid panorama image") from e
 
-    # Register in DB
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("""
-        INSERT INTO interior_panoramas (vin, file_path, scene_name, is_equirectangular, sort_order, created_at)
-        VALUES (?, ?, ?, 1, ?, ?)
-    """, (vin, str(pano_path), scene_name, existing + 1, datetime.now().isoformat()))
-    conn.execute("UPDATE vehicles SET show_interior=1 WHERE vin=?", (vin,))
-    conn.commit()
-    conn.close()
+    await run_in_threadpool(_register_panorama_upload, vin, pano_path, scene_name, existing + 1)
 
     return {"status": "ok", "filename": pano_path.name, "vin": vin, "scene_name": scene_name}
 
 
 @app.post("/api/upload/gallery")
 async def upload_gallery_photo(
+    request: Request,
     vin: str = Form(""),
     category: str = Form("exterior"),
     caption: str = Form(""),
@@ -3844,186 +5841,152 @@ async def upload_gallery_photo(
         import uuid
         vin = str(uuid.uuid4())[:17].upper().replace("-", "0")
     vin = validate_vin(vin)
-    vehicle_dir = STORAGE_DIR / vin
+    if category not in {"exterior", "interior", "engine", "trunk", "damage", "other"}:
+        raise HTTPException(status_code=400, detail="Unsupported gallery photo category")
+    if len(caption) > 255:
+        raise HTTPException(status_code=400, detail="Caption must be 255 characters or fewer")
+    user_email, existing_vehicle = await run_in_threadpool(_require_vehicle_access, request, vin, allow_create=True)
+    vehicle_dir = await run_in_threadpool(
+        _prepare_vehicle_upload, vin, user_email, existing_vehicle, ("gallery",)
+    )
     gallery_dir = vehicle_dir / "gallery"
-    gallery_dir.mkdir(parents=True, exist_ok=True)
 
-    raw = await photo.read()
-    if len(raw) > MAX_PHOTO_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"Photo too large (max {MAX_PHOTO_MB}MB)")
-
-    existing = len(list(gallery_dir.glob("*.jpg")))
+    raw = await _read_upload_limited(photo, MAX_PHOTO_MB * 1024 * 1024)
+    existing = await run_in_threadpool(_count_matching_files, gallery_dir, (".jpg",))
     photo_path = gallery_dir / f"gallery_{existing+1:03d}.jpg"
 
     try:
-        img = Image.open(io.BytesIO(raw)).convert("RGB")
-        # Auto-orient from EXIF
-        try:
-            from PIL import ImageOps
-            img = ImageOps.exif_transpose(img)
-        except Exception:
-            pass
-        # Resize to max 2000px wide
-        if img.width > 2000:
-            ratio = 2000 / img.width
-            img = img.resize((2000, int(img.height * ratio)), Image.LANCZOS)
-        img.save(photo_path, "JPEG", quality=90)
+        await run_in_threadpool(
+            _process_gallery_image,
+            raw,
+            Path(photo.filename or "gallery photo").name,
+            photo_path,
+        )
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
+        raise HTTPException(status_code=400, detail="Invalid gallery image") from e
 
-    # Register in DB
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("""
-        INSERT INTO gallery_photos (vin, file_path, category, caption, sort_order, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (vin, str(photo_path), category, caption, existing + 1, datetime.now().isoformat()))
-    conn.execute("UPDATE vehicles SET show_gallery=1 WHERE vin=?", (vin,))
-    conn.commit()
-    conn.close()
+    await run_in_threadpool(
+        _register_gallery_upload, vin, photo_path, category, caption, existing + 1
+    )
 
     return {"status": "ok", "filename": photo_path.name, "vin": vin, "category": category}
 
 
 @app.post("/api/upload/video-url")
-async def set_vehicle_video_url(
+def set_vehicle_video_url(
+    request: Request,
     vin: str = Form(""),
     video_url: str = Form(""),
-    video_type: str = Form("youtube"),
+    video_type: str = Form(""),
 ):
-    """Set a YouTube URL or direct MP4 URL as the vehicle video."""
+    """Set an allowlisted YouTube/Vimeo embed or direct HTTPS video URL."""
     if not vin:
         raise HTTPException(status_code=400, detail="VIN required")
     vin = validate_vin(vin)
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute(
-        "UPDATE vehicles SET video_url=?, video_type=?, show_video=1 WHERE vin=?",
-        (video_url, video_type, vin)
-    )
-    conn.commit()
-    conn.close()
-    return {"status": "ok", "vin": vin, "video_url": video_url, "video_type": video_type}
+    _require_vehicle_owner(request, vin)
+    safe_url, safe_type = normalize_video_source(video_url, video_type, vin)
+    with sqlite3.connect(str(DB_PATH), timeout=10) as conn:
+        updated = conn.execute(
+            "UPDATE vehicles SET video_url=?, video_type=?, show_video=? "
+            "WHERE vin=? AND status='active'",
+            (safe_url, safe_type, int(bool(safe_url)), vin),
+        )
+        if not updated.rowcount:
+            raise HTTPException(status_code=404, detail="Vehicle not found")
+    return {"status": "ok", "vin": vin, "video_url": safe_url, "video_type": safe_type}
 
 
 # =============================================================================
 # API — FINALIZE (run interpolation + background removal)
 # =============================================================================
 @app.post("/api/finalize/{vin}")
-async def finalize_vehicle(vin: str, engine: str = ""):
-    """Run frame interpolation after all photos uploaded.
-    engine=pro routes through the premium gaussian_3d engine instead (stabilized
-    turntable + optical-flow densify + WAN generative arcs) — the mobile guided
-    capture uses this; poll /api/vehicle/{vin}/3d-status for it."""
-    vin = vin.upper()
-    vehicle_dir = STORAGE_DIR / vin
-
-    if not vehicle_dir.exists():
+def finalize_vehicle(request: Request, vin: str, engine: str = ""):
+    """Run the canonical, staged 360 renderer; ``engine=pro`` requests optional splats."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
         raise HTTPException(status_code=404, detail="Vehicle not found")
-
-    exterior_dir = vehicle_dir / "exterior"
-    spin_dir = vehicle_dir / "spin"
-
-    if not exterior_dir.exists():
-        raise HTTPException(status_code=400, detail="No exterior photos found")
-
-    # Count exterior frames
-    frame_count = len(list(exterior_dir.glob("frame_*.jpg")))
-
-    if frame_count == 0:
-        raise HTTPException(status_code=400, detail="No exterior frames found")
+    vehicle_dir = _safe_vehicle_directory(vin)
+    exterior_dir = _ensure_safe_vehicle_subdir(vin, "exterior")
+    frame_count = _bounded_frame_count(exterior_dir, "frame_", 72)
+    if frame_count < 4:
+        raise HTTPException(status_code=400, detail="At least 4 exterior photos are required")
 
     if engine == "pro":
-        splat_dir = vehicle_dir / "splat"
-        splat_dir.mkdir(parents=True, exist_ok=True)
-        (splat_dir / "status.json").write_text(json.dumps({
-            "vin": vin, "status": "running", "step": "queued", "progress": 1}),
-            encoding="utf-8")
-        subprocess.Popen(
-            [sys.executable, str(Path(__file__).parent / "gaussian_3d.py"),
-             "--vin", vin, "--images", str(exterior_dir), "--style", "natural"],
-            cwd=str(Path(__file__).parent),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0))
+        if _background_job_running(f"gaussian3d:{vin}"):
+            return {"status": "already_running", "vin": vin}
+        _ensure_safe_vehicle_subdir(vin, "splat", create=True)
+        _write_gaussian_status(vin, {
+            "vin": vin, "status": "running", "step": "queued", "progress": 1,
+        })
+        submission = _submit_background_job(
+            f"gaussian3d:{vin}", _run_gaussian_3d_job,
+            vin, ["--images", str(exterior_dir)], 7000, "natural", "light",
+        )
+        if submission != "started":
+            _write_gaussian_status(vin, {
+                "status": "error", "step": "queued", "progress": 0, "vin": vin,
+                "error": "Background processing capacity is full",
+            })
+            raise HTTPException(status_code=429, detail="Background processing capacity is full",
+                                headers={"Retry-After": "30"})
         return {"status": "started", "engine": "pro", "original_frames": frame_count,
-                "message": "Premium build running. Poll /api/vehicle/{vin}/3d-status."}
+                "message": "Optional Gaussian-splat build running. Poll /api/vehicle/{vin}/3d-status."}
 
-    spin_dir.mkdir(exist_ok=True)
-    for old in spin_dir.glob("*.jpg"):
-        old.unlink()
-
-    def _finalize_work():
-        """Everything heavy runs off the event loop: interpolation, thumbnail,
-        DB counts, then the rembg/turntable chain. The POST returns instantly
-        (Cloudflare cuts blocked responses at ~100s)."""
-        marker = spin_dir / ".processing"
+    manifest = None
+    manifest_path = vehicle_dir / "manifest.json"
+    if manifest_path.is_file() and not manifest_path.is_symlink():
         try:
-            marker.write_text(datetime.now().isoformat())
-        except OSError:
-            pass
-        try:
-            all_frames = sorted(exterior_dir.glob("frame_*.jpg"))
-            # Smart interpolation: if < 18 frames, interpolate up to 36; otherwise copy as-is.
-            # Pass the ORB angle manifest when the order step produced one, so gap
-            # spacing follows the estimated degrees instead of assuming even stops.
-            if frame_count < 18:
-                manifest = None
-                mpath = vehicle_dir / "manifest.json"
-                if mpath.exists():
-                    try:
-                        manifest = json.loads(mpath.read_text(encoding="utf-8"))
-                    except Exception:
-                        manifest = None
-                interpolate_frames(exterior_dir, spin_dir, target_frames=36, manifest=manifest)
-            else:
-                for i, f in enumerate(all_frames):
-                    shutil.copy(f, spin_dir / f"spin_{i+1:04d}.jpg")
-            # manifest keeps splat_viewer's spin fallback working for this path too
-            spin_count = len(list(spin_dir.glob("spin_*.jpg")))
-            (spin_dir / "manifest.json").write_text(
-                json.dumps({"count": spin_count, "engine": "optical-flow"}), encoding="utf-8")
-
-            if sorted(spin_dir.glob("spin_*.jpg")):
-                generate_thumbnail(spin_dir, vehicle_dir / "thumbnail.jpg")
-            db_update_counts(vin)
-
-            vehicle = db_get_vehicle(vin)
-            wm_mode = vehicle.get("watermark_mode", "preview") if vehicle else "preview"
-            turntable_style = vehicle.get("turntable_style", "studio_shadow") if vehicle else "studio_shadow"
-            background_slug = vehicle.get("background_id", "") if vehicle else ""
-
-            bg_path = None
-            if background_slug and background_slug != "none":
-                conn = sqlite3.connect(str(DB_PATH))
-                bg_row = conn.execute("SELECT url FROM backgrounds WHERE slug=?", (background_slug,)).fetchone()
-                conn.close()
-                if bg_row and bg_row[0]:
-                    bg_url = bg_row[0]
-                    if bg_url.startswith("/static/"):
-                        bg_path = str(Path(__file__).parent / "static" / bg_url[len("/static/"):])
-
-            process_all_frames_background(spin_dir, wm_mode, bg_path, turntable_style)
-        except Exception as e:
-            print(f"[Finalize] background work failed for {vin}: {e}")
-        finally:
-            try:
-                marker.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-    threading.Thread(target=_finalize_work, daemon=True).start()
-
-    return {"status": "started", "original_frames": frame_count, "processing_bg": True,
-            "message": "Processing in background. Poll /api/finalize-status/{vin}."}
+            if manifest_path.stat().st_size <= 1_000_000:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            manifest = None
+    submission = _queue_vehicle_spin_job(vin, manifest)
+    if submission == "busy":
+        raise HTTPException(status_code=429, detail="Background processing capacity is full",
+                            headers={"Retry-After": "30"})
+    return {
+        "status": submission, "vin": vin,
+        "original_frames": frame_count, "processing_bg": submission == "started",
+        "status_url": f"/api/finalize-status/{vin}",
+        "message": "360 media build queued. Poll the status URL before opening the viewer.",
+    }
 
 
 @app.get("/api/finalize-status/{vin}")
-async def finalize_status(vin: str):
-    """Check if background removal is done for a vehicle."""
-    vin = vin.upper()
-    spin_dir = STORAGE_DIR / vin / "spin"
-    frames = list(spin_dir.glob("spin_*.jpg")) if spin_dir.exists() else []
-    processing = (spin_dir / ".processing").exists()
-    return {"vin": vin, "spin_frames": len(frames), "processing": processing,
-            "ready": len(frames) > 0 and not processing}
+def finalize_status(vin: str, request: Request):
+    """Return the latest owner-scoped spin-job state and whether frames exist."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    _safe_vehicle_directory(vin)
+    try:
+        spin_dir = _ensure_safe_vehicle_subdir(vin, "spin")
+        frame_count = _bounded_frame_count(spin_dir, "spin_", 120)
+        marker_processing = (spin_dir / ".processing").is_file()
+    except HTTPException:
+        frame_count = 0
+        marker_processing = False
+    jobs = _read_pipeline_jobs(vin)
+    job = next((item for item in jobs if item["kind"] == "spin"), None)
+    job_status = job["status"] if job else ("running" if marker_processing else ("completed" if frame_count else "not_started"))
+    processing = job_status in {"queued", "running"} or marker_processing
+    return {
+        "vin": vin,
+        "status": job_status,
+        "step": job.get("step", "") if job else "",
+        "progress": job.get("progress", 100 if frame_count else 0) if job else (100 if frame_count else 0),
+        "spin_frames": frame_count,
+        "processing": processing,
+        "ready": frame_count > 0,
+        "message": job.get("message", "") if job else "",
+        "updated_at": job.get("updated_at", "") if job else "",
+    }
 
 
 # =============================================================================
@@ -4031,34 +5994,27 @@ async def finalize_status(vin: str):
 # =============================================================================
 @app.post("/api/showroom")
 async def upload_showroom(
+    request: Request,
     dealer_name: str = Form("default"),
-    photo: UploadFile = File(...)
+    photo: UploadFile = File(...),
 ):
-    """Dealer uploads showroom background - used for all vehicles."""
-    SHOWROOM_DIR.mkdir(exist_ok=True)
-    
-    raw = await photo.read()
-    
-    if len(raw) > MAX_PHOTO_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"Photo too large (max {MAX_PHOTO_MB}MB)")
-    
-    save_path = SHOWROOM_DIR / f"{dealer_name}.jpg"
-    
-    try:
-        img = Image.open(io.BytesIO(raw))
-        img = img.convert("RGB")
-        img.save(save_path, "JPEG", quality=90)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cannot process image: {str(e)}")
-    
+    """Upload a tenant-private showroom background."""
+    email = await run_in_threadpool(_authenticated_user_email, request)
+    save_path = _showroom_file(email, dealer_name)
+    await run_in_threadpool(save_path.parent.mkdir, parents=True, exist_ok=True)
+    raw = await _read_upload_limited(photo, MAX_PHOTO_MB * 1024 * 1024)
+    await run_in_threadpool(
+        _process_gallery_image, raw, Path(photo.filename or "showroom").name, save_path
+    )
     return {"status": "ok", "showroom": save_path.name}
 
 
 @app.get("/api/showroom")
-async def get_showroom(dealer_name: str = "default"):
-    """Get showroom background for a dealer."""
-    showroom_path = SHOWROOM_DIR / f"{dealer_name}.jpg"
-    if showroom_path.exists():
+def get_showroom(request: Request, dealer_name: str = "default"):
+    """Report whether the authenticated tenant has uploaded a showroom background."""
+    email = _authenticated_user_email(request)
+    showroom_path = _showroom_file(email, dealer_name)
+    if showroom_path.is_file():
         return {"exists": True, "showroom": showroom_path.name}
     return {"exists": False}
 
@@ -4068,52 +6024,80 @@ async def get_showroom(dealer_name: str = "default"):
 # =============================================================================
 @app.post("/api/hotspot")
 async def add_hotspot(
+    request: Request,
     vin: str = Form(...),
     photo_filename: str = Form(...),
     tag: str = Form(...),
     x: str = Form("0.5"),
     y: str = Form("0.5"),
     note: str = Form(""),
-    condition_type: str = Form(""),   # "" = feature; scratch|dent|chip|rust|crack|other = damage
-    severity: str = Form(""),         # minor|moderate|major (damage only)
-    photo: Optional[UploadFile] = File(None),  # optional close-up of the spot
+    condition_type: str = Form(""),
+    severity: str = Form(""),
+    photo: Optional[UploadFile] = File(None),
 ):
-    """Add a hotspot to a spin frame. Damage hotspots carry condition_type +
-    severity and surface in the printable report at /vdp/{vin}/damage-report."""
-    vin = vin.upper()
-    if condition_type and severity not in ("minor", "moderate", "major"):
-        raise HTTPException(status_code=400,
-                            detail="damage hotspot needs severity: minor|moderate|major")
+    """Add a bounded hotspot to a frame for a vehicle owned by this tenant."""
+    vin = validate_vehicle_id(vin)
+    await run_in_threadpool(_require_vehicle_owner, request, vin)
+    photo_filename = (photo_filename or "").strip()
+    if (Path(photo_filename).name != photo_filename
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", photo_filename)
+            or Path(photo_filename).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}):
+        raise HTTPException(status_code=400, detail="Invalid photo filename")
+    image_exists = False
+    for subdir in ("exterior", "spin"):
+        if await run_in_threadpool(_vehicle_media_file_exists, vin, subdir, photo_filename):
+            image_exists = True
+            break
+    if not image_exists:
+        raise HTTPException(status_code=404, detail="Frame not found")
+    tag = "".join(ch for ch in (tag or "") if ord(ch) >= 32 and ord(ch) != 127).strip()[:80]
+    note = "".join(ch for ch in (note or "") if ch in "\t\n\r" or (ord(ch) >= 32 and ord(ch) != 127)).strip()[:500]
+    if not tag:
+        raise HTTPException(status_code=400, detail="Tag is required")
+    condition_type = (condition_type or "").strip().lower()
+    severity = (severity or "").strip().lower()
+    if condition_type not in {"", "scratch", "dent", "chip", "tear", "stain", "crack", "rust", "other"}:
+        raise HTTPException(status_code=400, detail="Invalid condition type")
+    if severity and severity not in {"minor", "moderate", "major"}:
+        raise HTTPException(status_code=400, detail="Invalid severity")
+    if condition_type and not severity:
+        raise HTTPException(status_code=400, detail="Damage hotspot needs a severity")
+    if not condition_type:
+        severity = ""
+    try:
+        hotspot_x, hotspot_y = float(x), float(y)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Hotspot coordinates must be numbers") from exc
+    if not (0.0 <= hotspot_x <= 1.0 and 0.0 <= hotspot_y <= 1.0):
+        raise HTTPException(status_code=400, detail="Hotspot coordinates must be between 0 and 1")
+
     close_up = ""
     if photo is not None:
-        raw = await photo.read()
-        if len(raw) > MAX_PHOTO_MB * 1024 * 1024:
-            raise HTTPException(status_code=413, detail=f"Photo too large (max {MAX_PHOTO_MB}MB)")
-        hs_dir = STORAGE_DIR / vin / "hotspot_photos"
-        hs_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Cannot process photo: {e}")
-        import uuid as _uuid
-        close_up = f"hs_{_uuid.uuid4().hex[:10]}.jpg"
-        img.save(hs_dir / close_up, "JPEG", quality=90)
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.execute(
-        "INSERT INTO hotspots (vin, photo_filename, tag, hotspot_x, hotspot_y, "
-        "condition_type, severity, note, close_up) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (vin, photo_filename, tag, float(x), float(y), condition_type, severity, note, close_up)
+        raw = await _read_upload_limited(photo, MAX_PHOTO_MB * 1024 * 1024)
+        hs_dir = await run_in_threadpool(
+            _ensure_safe_vehicle_subdir, vin, "hotspot_photos", create=True
+        )
+        close_up = f"hs_{uuid.uuid4().hex[:10]}.jpg"
+        await run_in_threadpool(
+            _process_gallery_image,
+            raw,
+            Path(photo.filename or "close-up").name,
+            hs_dir / close_up,
+        )
+    hotspot_id = await run_in_threadpool(
+        _insert_hotspot, vin, photo_filename, tag, hotspot_x, hotspot_y,
+        condition_type, severity, note, close_up,
     )
-    conn.commit()
-    hotspot_id = cursor.lastrowid
-    conn.close()
     return {"status": "ok", "id": hotspot_id, "close_up": close_up}
 
 
 @app.get("/api/hotspots/{vin}")
-async def get_hotspots(vin: str):
-    """Get all hotspots for a vehicle (public read — viewer + damage report)."""
-    vin = vin.upper()
+def get_hotspots(vin: str):
+    """Read viewer hotspots only for active inventory."""
+    vin = validate_vehicle_id(vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     cursor = conn.execute(
@@ -4133,8 +6117,14 @@ async def get_hotspots(vin: str):
 
 
 @app.delete("/api/hotspot/{hotspot_id}")
-async def delete_hotspot(hotspot_id: int):
-    """Delete a hotspot."""
+def delete_hotspot(hotspot_id: int, request: Request):
+    """Delete a hotspot only when its vehicle belongs to the current tenant."""
+    conn = sqlite3.connect(str(DB_PATH))
+    row = conn.execute("SELECT vin FROM hotspots WHERE id=?", (hotspot_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Hotspot not found")
+    _require_vehicle_owner(request, row[0])
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("DELETE FROM hotspots WHERE id = ?", (hotspot_id,))
     conn.commit()
@@ -4144,22 +6134,35 @@ async def delete_hotspot(hotspot_id: int):
 
 # ── Interior-panorama hotspots (Pannellum yaw/pitch feature pins) ─────────────
 @app.post("/api/pano-hotspot")
-async def add_pano_hotspot(vin: str = Form(...), pano_file: str = Form(""),
+def add_pano_hotspot(request: Request, vin: str = Form(...), pano_file: str = Form(""),
                            yaw: str = Form("0"), pitch: str = Form("0"),
                            label: str = Form(...), description: str = Form("")):
-    """Add a tappable feature pin to an interior 360 (stored as yaw/pitch). Gated (dealer)."""
-    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
-    # strip angle brackets so a label can never inject HTML on the public buyer page
-    # (defense-in-depth; the Pannellum viewers also run with escapeHTML:true)
-    label = (label or "").replace("<", "").replace(">", "").strip()[:80]
-    description = (description or "").replace("<", "").replace(">", "").strip()[:500]
-    if not vin or not label:
-        raise HTTPException(status_code=400, detail="vin and label are required")
+    """Add a bounded interior feature pin to a vehicle owned by this tenant."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    label = "".join(ch for ch in (label or "") if ord(ch) >= 32 and ord(ch) != 127).strip()[:80]
+    description = "".join(ch for ch in (description or "") if ord(ch) in (9, 10, 13) or (ord(ch) >= 32 and ord(ch) != 127)).strip()[:500]
+    if not label:
+        raise HTTPException(status_code=400, detail="label is required")
     try:
-        y = max(-180.0, min(180.0, float(yaw))); p = max(-90.0, min(90.0, float(pitch)))
-    except ValueError:
-        y, p = 0.0, 0.0
-    pano_file = re.sub(r"[^A-Za-z0-9_.-]", "", pano_file or "")[:64]
+        y, p = float(yaw), float(pitch)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Yaw and pitch must be numbers") from exc
+    if not (-180.0 <= y <= 180.0 and -90.0 <= p <= 90.0):
+        raise HTTPException(status_code=400, detail="Yaw or pitch is outside its valid range")
+    pano_file = (pano_file or "").strip()
+    if pano_file:
+        if (Path(pano_file).name != pano_file
+                or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", pano_file)
+                or Path(pano_file).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}):
+            raise HTTPException(status_code=400, detail="Invalid panorama filename")
+        pano_dir = (STORAGE_DIR / vin / "panoramas").resolve()
+        try:
+            pano_path = (pano_dir / pano_file).resolve(strict=True)
+        except OSError as exc:
+            raise HTTPException(status_code=404, detail="Panorama not found") from exc
+        if pano_path.parent != pano_dir or not pano_path.is_file():
+            raise HTTPException(status_code=404, detail="Panorama not found")
     conn = sqlite3.connect(str(DB_PATH))
     cur = conn.execute(
         "INSERT INTO pano_hotspots (vin, pano_file, yaw, pitch, label, description, created_at) "
@@ -4170,9 +6173,12 @@ async def add_pano_hotspot(vin: str = Form(...), pano_file: str = Form(""),
 
 
 @app.get("/api/pano-hotspots/{vin}")
-async def get_pano_hotspots(vin: str):
-    """List interior-pano hotspots (public read — the buyer viewer renders them)."""
-    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
+def get_pano_hotspots(vin: str):
+    """List interior-pano hotspots only for active public inventory."""
+    vin = validate_vehicle_id(vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT id, pano_file, yaw, pitch, label, description FROM pano_hotspots WHERE vin=? ORDER BY id",
@@ -4183,8 +6189,14 @@ async def get_pano_hotspots(vin: str):
 
 
 @app.delete("/api/pano-hotspot/{hotspot_id}")
-async def delete_pano_hotspot(hotspot_id: int):
-    """Delete an interior-pano hotspot. Gated (dealer)."""
+def delete_pano_hotspot(hotspot_id: int, request: Request):
+    """Delete a panorama hotspot only for its owning tenant."""
+    conn = sqlite3.connect(str(DB_PATH))
+    row = conn.execute("SELECT vin FROM pano_hotspots WHERE id=?", (hotspot_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Hotspot not found")
+    _require_vehicle_owner(request, row[0])
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("DELETE FROM pano_hotspots WHERE id = ?", (hotspot_id,))
     conn.commit()
@@ -4196,51 +6208,55 @@ async def delete_pano_hotspot(hotspot_id: int):
 # ROUTES — TAGGING PAGE
 # =============================================================================
 @app.get("/tag/{vin}")
-async def tag_page(vin: str):
-    """Tag hotspots on vehicle photos."""
-    vin = vin.upper()
+def tag_page(vin: str, request: Request):
+    """Tag hotspots on vehicle photos owned by the current tenant."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
     vehicle_dir = STORAGE_DIR / vin
     
     if not vehicle_dir.exists():
         return HTMLResponse("<h1>Vehicle not found</h1>", status_code=404)
     
     exterior_dir = vehicle_dir / "exterior"
-    frames = sorted([f.name for f in exterior_dir.glob("frame_*.jpg")]) if exterior_dir.exists() else []
+    frames = sorted(
+        f.name for f in exterior_dir.glob("frame_*.jpg")
+        if f.is_file() and re.fullmatch(r"frame_[A-Za-z0-9_-]{1,80}\.jpg", f.name)
+    ) if exterior_dir.exists() else []
     
     if not frames:
         return HTMLResponse("<h1>No exterior photos found</h1>", status_code=404)
     
-    html = f"""<!DOCTYPE html>
+    html = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tag Features - LotVue Pro</title>
     <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: 'Segoe UI', sans-serif; background: #e8edf2; color: #1a2332; min-height: 100vh; }}
-        .header {{ background: #dde3ea; padding: 1rem 2rem; border-bottom: 1px solid #c5cdd6; display: flex; justify-content: space-between; align-items: center; }}
-        .logo {{ font-size: 1.2rem; font-weight: 700; color: #58a6ff; }}
-        .container {{ max-width: 1200px; margin: 0 auto; padding: 1.5rem; }}
-        .card {{ background: #dde3ea; border: 1px solid #c5cdd6; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }}
-        .card h2 {{ color: #1a2332; margin-bottom: 1rem; }}
-        .frames-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 0.8rem; }}
-        .frame-thumb {{ aspect-ratio: 16/9; border-radius: 6px; overflow: hidden; cursor: pointer; border: 2px solid transparent; transition: all 0.2s; }}
-        .frame-thumb:hover {{ border-color: #58a6ff; }}
-        .frame-thumb.selected {{ border-color: #58a6ff; box-shadow: 0 0 12px rgba(88,166,255,0.4); }}
-        .frame-thumb img {{ width: 100%; height: 100%; object-fit: cover; }}
-        .frame-num {{ position: absolute; bottom: 4px; left: 4px; background: rgba(0,0,0,0.7); padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; }}
-        .selected-viewer {{ position: relative; margin-top: 1rem; }}
-        .selected-viewer img {{ width: 100%; max-height: 400px; object-fit: contain; border-radius: 8px; background: #000; cursor: crosshair; }}
-        .tag-form {{ display: flex; gap: 1rem; align-items: center; margin-top: 1rem; flex-wrap: wrap; }}
-        .tag-form select {{ padding: 0.6rem; background: #010409; border: 1px solid #c5cdd6; border-radius: 6px; color: #1a2332; font-size: 1rem; }}
-        .btn {{ background: #238636; border: none; padding: 0.6rem 1.2rem; color: white; border-radius: 6px; cursor: pointer; font-weight: 600; }}
-        .btn:hover {{ background: #2ea043; }}
-        .btn-outline {{ background: transparent; border: 1px solid #b0bac5; color: #8b949e; }}
-        .hotspots-list {{ margin-top: 1.5rem; }}
-        .hotspot-item {{ display: flex; justify-content: space-between; align-items: center; background: #c5cdd6; padding: 0.8rem 1rem; border-radius: 6px; margin-bottom: 0.5rem; }}
-        .hotspot-item .tag-badge {{ background: #58a6ff; color: #e8edf2; padding: 2px 8px; border-radius: 4px; font-size: 0.85rem; font-weight: 600; }}
-        .nav-btns {{ display: flex; gap: 1rem; justify-content: center; margin-top: 2rem; }}
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', sans-serif; background: #e8edf2; color: #1a2332; min-height: 100vh; }
+        .header { background: #dde3ea; padding: 1rem 2rem; border-bottom: 1px solid #c5cdd6; display: flex; justify-content: space-between; align-items: center; }
+        .logo { font-size: 1.2rem; font-weight: 700; color: #58a6ff; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
+        .card { background: #dde3ea; border: 1px solid #c5cdd6; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+        .card h2 { color: #1a2332; margin-bottom: 1rem; }
+        .frames-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 0.8rem; }
+        .frame-thumb { aspect-ratio: 16/9; border-radius: 6px; overflow: hidden; cursor: pointer; border: 2px solid transparent; transition: all 0.2s; }
+        .frame-thumb:hover { border-color: #58a6ff; }
+        .frame-thumb.selected { border-color: #58a6ff; box-shadow: 0 0 12px rgba(88,166,255,0.4); }
+        .frame-thumb img { width: 100%; height: 100%; object-fit: cover; }
+        .frame-num { position: absolute; bottom: 4px; left: 4px; background: rgba(0,0,0,0.7); padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; }
+        .selected-viewer { position: relative; margin-top: 1rem; }
+        .selected-viewer img { width: 100%; max-height: 400px; object-fit: contain; border-radius: 8px; background: #000; cursor: crosshair; }
+        .tag-form { display: flex; gap: 1rem; align-items: center; margin-top: 1rem; flex-wrap: wrap; }
+        .tag-form select { padding: 0.6rem; background: #010409; border: 1px solid #c5cdd6; border-radius: 6px; color: #1a2332; font-size: 1rem; }
+        .btn { background: #238636; border: none; padding: 0.6rem 1.2rem; color: white; border-radius: 6px; cursor: pointer; font-weight: 600; }
+        .btn:hover { background: #2ea043; }
+        .btn-outline { background: transparent; border: 1px solid #b0bac5; color: #8b949e; }
+        .hotspots-list { margin-top: 1.5rem; }
+        .hotspot-item { display: flex; justify-content: space-between; align-items: center; background: #c5cdd6; padding: 0.8rem 1rem; border-radius: 6px; margin-bottom: 0.5rem; }
+        .hotspot-item .tag-badge { background: #58a6ff; color: #e8edf2; padding: 2px 8px; border-radius: 4px; font-size: 0.85rem; font-weight: 600; }
+        .nav-btns { display: flex; gap: 1rem; justify-content: center; margin-top: 2rem; }
     </style>
 </head>
 <body>
@@ -4311,16 +6327,30 @@ async def tag_page(vin: str):
             const r = await fetch('/api/hotspots/{vin}');
             const hotspots = await r.json();
             const list = document.getElementById('hotspotsList');
-            if (hotspots.length === 0) {{
-                list.innerHTML = '<p style="color:#8b949e;">No hotspots tagged yet.</p>';
+            list.replaceChildren();
+            if (!Array.isArray(hotspots) || hotspots.length === 0) {{
+                const empty = document.createElement('p');
+                empty.textContent = 'No hotspots tagged yet.';
+                list.appendChild(empty);
                 return;
             }}
-            list.innerHTML = hotspots.map(h => `
-                <div class="hotspot-item">
-                    <span>📷 ${{h.photo}} → <span class="tag-badge">${{h.tag.replace('_', ' ')}}</span></span>
-                    <button class="btn-outline" onclick="deleteHotspot(${{h.id}})" style="padding:4px 8px;">Delete</button>
-                </div>
-            `).join('');
+            hotspots.forEach(h => {{
+                const item = document.createElement('div');
+                item.className = 'hotspot-item';
+                const label = document.createElement('span');
+                label.textContent = '📷 ' + String(h.photo || '') + ' → ';
+                const badge = document.createElement('span');
+                badge.className = 'tag-badge';
+                badge.textContent = String(h.tag || '').replace(/_/g, ' ');
+                label.appendChild(badge);
+                const button = document.createElement('button');
+                button.className = 'btn-outline';
+                button.style.padding = '4px 8px';
+                button.textContent = 'Delete';
+                button.addEventListener('click', () => deleteHotspot(Number(h.id)));
+                item.append(label, button);
+                list.appendChild(item);
+            }});
         }}
         
         function selectFrame(idx) {{
@@ -4378,39 +6408,56 @@ async def tag_page(vin: str):
 # ROUTES — 360 VIEWER
 # =============================================================================
 @app.get("/view/{vin}")
-async def view_vehicle(vin: str, request: Request):
+def view_vehicle(vin: str, request: Request):
     try:
-        vin = vin.upper()
-        vehicle_dir = STORAGE_DIR / vin
-
-        if not vehicle_dir.exists():
+        vin = validate_vehicle_id(vin)
+        info = db_get_vehicle(vin)
+        if not info or info.get("status", "active") != "active":
+            return HTMLResponse("<h1>Vehicle not found</h1>", status_code=404)
+        try:
+            vehicle_dir = _safe_vehicle_directory(vin)
+        except HTTPException:
             return HTMLResponse("<h1>Vehicle not found</h1>", status_code=404)
 
+        def safe_media_names(subdir: str, suffixes: set[str], prefix: str = "") -> list[str]:
+            directory = vehicle_dir / subdir
+            if directory.is_symlink():
+                return []
+            try:
+                resolved_dir = directory.resolve(strict=True)
+                if (resolved_dir.parent != vehicle_dir or resolved_dir.name != subdir
+                        or not resolved_dir.is_dir()):
+                    return []
+                with os.scandir(resolved_dir) as entries:
+                    return heapq.nsmallest(
+                        300,
+                        (entry.name for entry in entries
+                         if not entry.is_symlink()
+                         and entry.is_file(follow_symlinks=False)
+                         and Path(entry.name).suffix.lower() in suffixes
+                         and (not prefix or entry.name.startswith(prefix))
+                         and not entry.name.startswith(".")
+                         and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", entry.name)),
+                    )
+            except OSError:
+                return []
+
         # ── Exterior frames ──────────────────────────────────────────────────
-        spin_dir = vehicle_dir / "spin"
-        if spin_dir.exists() and any(spin_dir.glob("spin_*.jpg")):
-            ext_frames = sorted([f.name for f in spin_dir.glob("spin_*.jpg")])
+        ext_frames = safe_media_names("spin", {".jpg"}, "spin_")
+        if ext_frames:
             frame_path_prefix = f"/storage/{vin}/spin"
         else:
-            ext_dir = vehicle_dir / "exterior"
-            ext_frames = sorted([f.name for f in ext_dir.glob("*.jpg")]) if ext_dir.exists() else []
+            ext_frames = safe_media_names("exterior", {".jpg", ".jpeg", ".png", ".webp"})
             frame_path_prefix = f"/storage/{vin}/exterior"
 
         # ── Interior photos ──────────────────────────────────────────────────
-        int_dir = vehicle_dir / "interior"
-        int_photos = sorted([f.name for f in int_dir.glob("*.jpg")]) if int_dir.exists() else []
+        int_photos = safe_media_names("interior", {".jpg", ".jpeg", ".png", ".webp"})
 
         # ── Interior panoramas (equirectangular) ─────────────────────────────
-        pano_dir = vehicle_dir / "panoramas"
-        pano_files = sorted([f.name for f in pano_dir.glob("*.jpg")] +
-                            [f.name for f in pano_dir.glob("*.jpeg")] +
-                            [f.name for f in pano_dir.glob("*.png")]) if pano_dir.exists() else []
+        pano_files = safe_media_names("panoramas", {".jpg", ".jpeg", ".png", ".webp"})
 
         # ── Gallery photos ───────────────────────────────────────────────────
-        gallery_dir = vehicle_dir / "gallery"
-        gallery_files = sorted([f.name for f in gallery_dir.glob("*.jpg")] +
-                               [f.name for f in gallery_dir.glob("*.jpeg")] +
-                               [f.name for f in gallery_dir.glob("*.png")]) if gallery_dir.exists() else []
+        gallery_files = safe_media_names("gallery", {".jpg", ".jpeg", ".png", ".webp"})
         # Fallback: use exterior frames as gallery if no dedicated gallery
         if not gallery_files:
             gallery_files = ext_frames
@@ -4418,64 +6465,118 @@ async def view_vehicle(vin: str, request: Request):
         else:
             gallery_prefix = f"/storage/{vin}/gallery"
 
-        # ── DB info ──────────────────────────────────────────────────────────
-        try:
-            info = db_get_vehicle(vin) or {"vin": vin, "year": "", "make": "", "model": ""}
-        except Exception:
-            info = {"vin": vin, "year": "", "make": "", "model": ""}
-
+        # ── Public listing details ───────────────────────────────────────────
         title = f"{info.get('year','')} {info.get('make','')} {info.get('model','')}".strip() or vin
-        price = info.get("price", "")
-        mileage = info.get("mileage", "")
-        color = info.get("color", "")
-        video_url = info.get("video_url", "") or ""
-        video_type = info.get("video_type", "") or ""
-        dealer_logo = info.get("dealer_logo_url", "") or ""
+        price = str(info.get("price", "") or "")
+        mileage = str(info.get("mileage", "") or "")
+        color = str(info.get("color", "") or "")
+        vehicle = info
+        try:
+            video_url, video_type = normalize_video_source(
+                info.get("video_url", "") or "", info.get("video_type", "") or "", vin)
+        except HTTPException:
+            # Never reflect a legacy/untrusted URL into public page markup.
+            video_url, video_type = "", ""
+        dealer_logo = str(info.get("dealer_logo_url", "") or "").strip()
+        try:
+            logo_parts = urlsplit(dealer_logo)
+            logo_port = logo_parts.port
+            if logo_parts.scheme:
+                safe_logo = (logo_parts.scheme.lower() == "https" and bool(logo_parts.hostname)
+                             and not logo_parts.username and not logo_parts.password
+                             and logo_port in {None, 443})
+            elif not logo_parts.netloc:
+                logo_path = unquote(logo_parts.path, errors="strict")
+                logo_segments = logo_path.split("/")
+                safe_logo = (not logo_parts.query and not logo_parts.fragment
+                             and "%" not in logo_parts.path and chr(92) not in logo_path
+                             and all(part not in {".", ".."} for part in logo_segments)
+                             and all(not part or re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in logo_segments)
+                             and logo_path.startswith(("/static/", "/storage/_brand/", f"/storage/{vin}/")))
+            else:
+                safe_logo = False
+            if not safe_logo:
+                dealer_logo = ""
+        except (ValueError, UnicodeDecodeError):
+            dealer_logo = ""
 
         # ── Build JS arrays ──────────────────────────────────────────────────
-        import json as _json
-        import time as _time
-        _cb = int(_time.time())
-        ext_urls_js = _json.dumps([f"{frame_path_prefix}/{f}?v={_cb}" for f in ext_frames])
-        int_urls_js = _json.dumps([f"/storage/{vin}/interior/{f}" for f in int_photos])
-        pano_urls_js = _json.dumps([{"src": f"/storage/{vin}/panoramas/{f}", "name": f"Scene {i+1}", "file": f} for i, f in enumerate(pano_files)])
-        gallery_urls_js = _json.dumps([f"{gallery_prefix}/{f}" for f in gallery_files])
+        ext_urls_js = _json_for_script([f"{frame_path_prefix}/{f}" for f in ext_frames])
+        int_urls_js = _json_for_script([f"/storage/{vin}/interior/{f}" for f in int_photos])
+        pano_scene_names = {}
+        try:
+            conn = sqlite3.connect(str(DB_PATH))
+            pano_rows = conn.execute(
+                "SELECT file_path, scene_name FROM interior_panoramas WHERE vin=? ORDER BY sort_order, id",
+                (vin,)
+            ).fetchall()
+            conn.close()
+            pano_scene_names = {Path(row[0]).name: row[1] for row in pano_rows}
+        except Exception:
+            pass
+        pano_urls_js = _json_for_script([
+            {"src": f"/storage/{vin}/panoramas/{f}",
+             "name": str(pano_scene_names.get(f) or f"Scene {i+1}"), "file": f}
+            for i, f in enumerate(pano_files)
+        ])
+        gallery_urls_js = _json_for_script([f"{gallery_prefix}/{f}" for f in gallery_files])
+        video_url_js = _json_for_script(video_url)
+        video_type_js = _json_for_script(video_type)
+        vin_js = _json_for_script(vin)
+        active_bg_slug_js = _json_for_script(str(info.get("background_id", "") or ""))
 
         # ── Tab visibility ───────────────────────────────────────────────────
         has_interior = len(int_photos) > 0 or len(pano_files) > 0
         has_gallery = len(gallery_files) > 0
         has_video = bool(video_url)
-        base_url = str(request.base_url).rstrip("/")
+        base_url = (os.getenv("LOTVUE_PUBLIC_URL", "").strip().rstrip("/")
+                    or str(request.base_url).rstrip("/"))
         share_url = f"{base_url}/view/{vin}"
-        embed_code = f'&lt;iframe src="{base_url}/embed/{vin}" width="100%" height="600" frameborder="0" allowfullscreen&gt;&lt;/iframe&gt;'
+        embed_code = (f'&lt;iframe src="{html_lib.escape(base_url, quote=True)}/embed/{vin}" '
+                      'width="100%" height="600" frameborder="0" allowfullscreen&gt;&lt;/iframe&gt;')
         # Social sharing metadata (og: / twitter:)
         og_image = f"{base_url}{frame_path_prefix}/{ext_frames[0]}" if ext_frames else ""
         og_desc = " · ".join(x for x in [
             f"${price}" if price else "",
             f"{mileage} miles" if mileage else "",
-            str(color) if color else "",
+            color if color else "",
         ] if x) or f"360° interactive viewer for {title}"
-        # Alias: vehicle = info (for template references to vehicle.get(...))
-        vehicle = info
-    except Exception as e:
+        title_html = html_lib.escape(str(title), quote=True)
+        price_html = html_lib.escape(price, quote=True)
+        mileage_html = html_lib.escape(mileage, quote=True)
+        color_html = html_lib.escape(color, quote=True)
+        vin_html = html_lib.escape(vin, quote=True)
+        og_desc_html = html_lib.escape(og_desc, quote=True)
+        og_image_html = html_lib.escape(og_image, quote=True)
+        share_url_html = html_lib.escape(share_url, quote=True)
+        trim_html = html_lib.escape(str(vehicle.get("trim_level", "") or ""), quote=True)
+        engine_html = html_lib.escape(str(vehicle.get("engine", "") or ""), quote=True)
+        transmission_html = html_lib.escape(str(vehicle.get("transmission", "") or ""), quote=True)
+        drivetrain_html = html_lib.escape(str(vehicle.get("drivetrain", "") or ""), quote=True)
+        fuel_type_html = html_lib.escape(str(vehicle.get("fuel_type", "") or ""), quote=True)
+        body_style_html = html_lib.escape(str(vehicle.get("body_style", "") or ""), quote=True)
+    except HTTPException:
+        raise
+    except Exception:
         import traceback
-        return HTMLResponse(f"<h1>Error loading view</h1><pre>{traceback.format_exc()}</pre>", status_code=500)
+        traceback.print_exc()
+        return HTMLResponse("<h1>Unable to load this vehicle viewer</h1>", status_code=500)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{title} — LotVue Pro</title>
+<title>{title_html} — LotVue Pro</title>
 <meta property="og:type" content="website">
-<meta property="og:title" content="{title} — LotVue360">
-<meta property="og:description" content="{og_desc}">
-<meta property="og:image" content="{og_image}">
-<meta property="og:url" content="{share_url}">
+<meta property="og:title" content="{title_html} — LotVue360">
+<meta property="og:description" content="{og_desc_html}">
+<meta property="og:image" content="{og_image_html}">
+<meta property="og:url" content="{share_url_html}">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="{title} — LotVue360">
-<meta name="twitter:description" content="{og_desc}">
-<meta name="twitter:image" content="{og_image}">
+<meta name="twitter:title" content="{title_html} — LotVue360">
+<meta name="twitter:description" content="{og_desc_html}">
+<meta name="twitter:image" content="{og_image_html}">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.css"/>
 <script src="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -4525,7 +6626,7 @@ body{{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif
 /* ── Exterior spin ────────────────────────────────────────────────────── */
 #spin-container{{width:100%;height:480px;position:relative;background:#060e1a;cursor:grab;touch-action:none;user-select:none;overflow:hidden;}}
 #spin-container:active{{cursor:grabbing;}}
-#spin-container img{{width:100%;height:100%;object-fit:contain;position:absolute;inset:0;pointer-events:none;display:none;}}
+#spin-container img.spin-image{{width:100%;height:100%;object-fit:contain;position:absolute;inset:0;pointer-events:none;display:block;opacity:0;transition:opacity 120ms linear;}}
 .frame-counter{{position:absolute;top:0.75rem;right:0.75rem;background:rgba(10,22,40,0.85);color:#f5f0e8;padding:0.25rem 0.6rem;border-radius:12px;font-size:0.75rem;font-family:monospace;z-index:10;border:1px solid #1a2e50;}}
 .spin-hint{{position:absolute;bottom:0.75rem;left:50%;transform:translateX(-50%);background:rgba(10,22,40,0.85);color:#a0aab4;padding:0.3rem 0.9rem;border-radius:12px;font-size:0.75rem;z-index:10;pointer-events:none;transition:opacity 0.5s;border:1px solid #1a2e50;}}
 .spin-controls{{position:absolute;bottom:0.75rem;right:0.75rem;display:flex;gap:0.4rem;z-index:10;}}
@@ -4631,10 +6732,10 @@ body{{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif
 
   <!-- HEADER -->
   <div class="viewer-header">
-    {'<img class="dealer-logo" src="' + dealer_logo + '" alt="Dealer">' if dealer_logo else '<div class="dealer-logo-placeholder">LotVue Pro</div>'}
+    {'<img class="dealer-logo" src="' + html_lib.escape(dealer_logo, quote=True) + '" alt="Dealer">' if dealer_logo else '<div class="dealer-logo-placeholder">LotVue Pro</div>'}
     <div class="vehicle-title">
-      <h1>{title}</h1>
-      <div class="vin-badge">VIN: {vin}</div>
+      <h1>{title_html}</h1>
+      <div class="vin-badge">VIN: {vin_html}</div>
     </div>
     <div class="header-actions">
       <button class="btn-icon" onclick="toggleFullscreen()" id="fsBtn">&#x26F6; Fullscreen</button>
@@ -4717,7 +6818,7 @@ body{{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif
       <div class="share-panel" id="sharePanel">
         <h4>Share This Vehicle</h4>
         <div class="share-url">
-          <input type="text" id="shareUrlInput" value="{share_url}" readonly>
+          <input type="text" id="shareUrlInput" value="{share_url_html}" readonly>
           <button onclick="copyShareUrl()">Copy</button>
         </div>
         <div class="embed-code" id="embedCodeBlock">{embed_code}</div>
@@ -4734,16 +6835,16 @@ body{{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif
     <!-- SPECS SIDEBAR -->
     <div class="specs-sidebar">
       <h3>Vehicle Details</h3>
-      {'<div class="spec-row"><div class="spec-label">Price</div><div class="price-display">' + price + '</div></div>' if price else ''}
-      {'<div class="spec-row"><div class="spec-label">Mileage</div><div class="spec-value">' + mileage + ' mi</div></div>' if mileage else ''}
-      {'<div class="spec-row"><div class="spec-label">Color</div><div class="spec-value">' + color + '</div></div>' if color else ''}
-      {'<div class="spec-row"><div class="spec-label">Trim</div><div class="spec-value">' + (vehicle.get("trim_level","") or "") + '</div></div>' if vehicle.get("trim_level") else ''}
-      {'<div class="spec-row"><div class="spec-label">Engine</div><div class="spec-value">' + (vehicle.get("engine","") or "") + '</div></div>' if vehicle.get("engine") else ''}
-      {'<div class="spec-row"><div class="spec-label">Trans.</div><div class="spec-value">' + (vehicle.get("transmission","") or "") + '</div></div>' if vehicle.get("transmission") else ''}
-      {'<div class="spec-row"><div class="spec-label">Drive</div><div class="spec-value">' + (vehicle.get("drivetrain","") or "") + '</div></div>' if vehicle.get("drivetrain") else ''}
-      {'<div class="spec-row"><div class="spec-label">Fuel</div><div class="spec-value">' + (vehicle.get("fuel_type","") or "") + '</div></div>' if vehicle.get("fuel_type") else ''}
-      {'<div class="spec-row"><div class="spec-label">Body</div><div class="spec-value">' + (vehicle.get("body_style","") or "") + '</div></div>' if vehicle.get("body_style") else ''}
-      <div class="spec-row"><div class="spec-label">VIN</div><div class="spec-value" style="font-size:0.75rem;font-family:monospace;">{vin}</div></div>
+      {'<div class="spec-row"><div class="spec-label">Price</div><div class="price-display">' + price_html + '</div></div>' if price else ''}
+      {'<div class="spec-row"><div class="spec-label">Mileage</div><div class="spec-value">' + mileage_html + ' mi</div></div>' if mileage else ''}
+      {'<div class="spec-row"><div class="spec-label">Color</div><div class="spec-value">' + color_html + '</div></div>' if color else ''}
+      {'<div class="spec-row"><div class="spec-label">Trim</div><div class="spec-value">' + trim_html + '</div></div>' if vehicle.get("trim_level") else ''}
+      {'<div class="spec-row"><div class="spec-label">Engine</div><div class="spec-value">' + engine_html + '</div></div>' if vehicle.get("engine") else ''}
+      {'<div class="spec-row"><div class="spec-label">Trans.</div><div class="spec-value">' + transmission_html + '</div></div>' if vehicle.get("transmission") else ''}
+      {'<div class="spec-row"><div class="spec-label">Drive</div><div class="spec-value">' + drivetrain_html + '</div></div>' if vehicle.get("drivetrain") else ''}
+      {'<div class="spec-row"><div class="spec-label">Fuel</div><div class="spec-value">' + fuel_type_html + '</div></div>' if vehicle.get("fuel_type") else ''}
+      {'<div class="spec-row"><div class="spec-label">Body</div><div class="spec-value">' + body_style_html + '</div></div>' if vehicle.get("body_style") else ''}
+      <div class="spec-row"><div class="spec-label">VIN</div><div class="spec-value" style="font-size:0.75rem;font-family:monospace;">{vin_html}</div></div>
       <div class="spec-row"><div class="spec-label">Frames</div><div class="spec-value">{len(ext_frames)}</div></div>
       <!-- BACKGROUND SELECTOR -->
       <div class="bg-selector-wrap" id="bgSelectorWrap">
@@ -4799,7 +6900,7 @@ body{{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif
 <div class="toast" id="toast"></div>
 
 <!-- GLO3D buyer tools: AI chat + lead magnets (trade-in/price/history/test-drive/video) -->
-<div id="lv-glo3d-root" data-vin="{vin}" data-title="{title}"></div>
+<div id="lv-glo3d-root" data-vin="{vin_html}" data-title="{title_html}"></div>
 <script src="/static/glo3d_tools.js?v=20260612b" defer></script>
 
 <script>
@@ -4808,9 +6909,9 @@ const EXT_URLS = {ext_urls_js};
 const INT_URLS = {int_urls_js};
 const PANO_URLS = {pano_urls_js};
 const GALLERY_URLS = {gallery_urls_js};
-const VIDEO_URL = {_json.dumps(video_url)};
-const VIDEO_TYPE = {_json.dumps(video_type)};
-const VIN = "{vin}";
+const VIDEO_URL = {video_url_js};
+const VIDEO_TYPE = {video_type_js};
+const VIN = {vin_js};
 
 // ── Toast helper ────────────────────────────────────────────────────────────
 function showToast(msg, ms=2500) {{
@@ -4837,9 +6938,33 @@ function switchTab(tab) {{
 }}
 
 // ── Exterior 360 Spin Engine ────────────────────────────────────────────────
-let spinFrames = [], spinCur = 0, spinDragging = false, spinStartX = 0, spinStartFrame = 0;
+let spinImage = null, spinCur = 0, spinDragging = false, spinStartX = 0, spinStartFrame = 0;
 let autoInterval = null, autoRunning = false;
-let spinLoaded = 0;
+const spinImageCache = new Map();
+const SPIN_CACHE_RADIUS = 2;
+
+function preloadSpinFrame(idx) {{
+  if (!EXT_URLS.length) return;
+  idx = ((idx % EXT_URLS.length) + EXT_URLS.length) % EXT_URLS.length;
+  if (idx === spinCur || spinImageCache.has(idx)) return;
+  const img = new Image();
+  img.decoding = 'async';
+  img.loading = 'eager';
+  img.src = EXT_URLS[idx];
+  spinImageCache.set(idx, img);
+}}
+
+function preloadSpinNeighborhood(center) {{
+  if (!EXT_URLS.length) return;
+  for (let offset = -SPIN_CACHE_RADIUS; offset <= SPIN_CACHE_RADIUS; offset++) {{
+    if (offset) preloadSpinFrame(center + offset);
+  }}
+  for (const [idx] of spinImageCache) {{
+    const distance = Math.min((idx - center + EXT_URLS.length) % EXT_URLS.length,
+                              (center - idx + EXT_URLS.length) % EXT_URLS.length);
+    if (distance > SPIN_CACHE_RADIUS) spinImageCache.delete(idx);
+  }}
+}}
 
 function initSpin() {{
   const container = document.getElementById('spin-container');
@@ -4847,23 +6972,18 @@ function initSpin() {{
     container.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#8b949e;font-size:1rem;">No exterior frames available</div>';
     return;
   }}
-  // Create img elements
-  EXT_URLS.forEach((url, i) => {{
-    const img = document.createElement('img');
-    img.src = url;
-    img.dataset.idx = i;
-    img.style.display = 'none';
-    img.onload = () => {{
-      spinLoaded++;
-      if (spinLoaded === EXT_URLS.length) {{
-        showSpinFrame(0);
-        startAuto();
-      }}
-    }};
-    img.onerror = () => spinLoaded++;
-    container.insertBefore(img, container.querySelector('.frame-counter'));
-    spinFrames.push(img);
-  }});
+  // Only one full-resolution image is retained in the DOM. Nearby frames are
+  // decoded on demand in a small rolling cache instead of loading every frame.
+  spinImage = document.createElement('img');
+  spinImage.className = 'spin-image';
+  spinImage.alt = 'Interactive 360 degree vehicle view';
+  spinImage.decoding = 'async';
+  spinImage.fetchPriority = 'high';
+  spinImage.draggable = false;
+  spinImage.onload = () => {{ spinImage.style.opacity = '1'; }};
+  spinImage.onerror = () => showToast('A spin frame could not be loaded.');
+  container.insertBefore(spinImage, container.querySelector('.frame-counter'));
+  showSpinFrame(0);
   updateFrameCounter();
   buildFrameStrip();
   // Drag events
@@ -4874,14 +6994,19 @@ function initSpin() {{
   container.addEventListener('touchstart', spinTouchStart, {{passive: true}});
   container.addEventListener('touchmove', spinTouchMove, {{passive: false}});
   container.addEventListener('touchend', spinTouchEnd);
-  // Zoom: mouse wheel, double-click cycle, pinch (handled in touch handlers)
   container.addEventListener('wheel', spinWheel, {{passive: false}});
   container.addEventListener('dblclick', () => {{
     zoomLevel = zoomLevel >= 4 ? 1 : zoomLevel * 2;
     if (zoomLevel === 1) {{ panX = 0; panY = 0; }}
     applyZoom();
   }});
-  // Keyboard
+  // Per the capture spec, autoplay starts on desktop hover (not on initial page
+  // load), and stops immediately when the pointer leaves or the page is hidden.
+  container.addEventListener('pointerenter', () => {{
+    if (matchMedia('(hover: hover) and (prefers-reduced-motion: no-preference)').matches) startAuto();
+  }});
+  container.addEventListener('pointerleave', stopAuto);
+  document.addEventListener('visibilitychange', () => {{ if (document.hidden) stopAuto(); }});
   document.addEventListener('keydown', e => {{
     if (activeTab !== 'exterior') return;
     if (e.key === 'ArrowLeft') spinStep(-1);
@@ -4890,12 +7015,17 @@ function initSpin() {{
 }}
 
 function showSpinFrame(idx) {{
-  spinFrames.forEach(f => f.style.display = 'none');
-  if (spinFrames[idx]) spinFrames[idx].style.display = 'block';
-  spinCur = idx;
+  if (!EXT_URLS.length || !spinImage) return;
+  spinCur = ((idx % EXT_URLS.length) + EXT_URLS.length) % EXT_URLS.length;
+  const nextUrl = EXT_URLS[spinCur];
+  if (spinImage.getAttribute('src') !== nextUrl) {{
+    spinImage.style.opacity = '0.35';
+    spinImage.src = nextUrl;
+  }}
+  preloadSpinNeighborhood(spinCur);
   updateFrameCounter();
-  updateStripHighlight(idx);
-  if (window.hotspotManager) window.hotspotManager.update(idx);
+  updateStripHighlight(spinCur);
+  if (window.hotspotManager) window.hotspotManager.update(spinCur);
 }}
 
 function updateFrameCounter() {{
@@ -4917,9 +7047,9 @@ function applyZoom() {{
   const limit = container_width() * (z - 1) / 2;
   panX = Math.max(-limit, Math.min(limit, panX));
   panY = Math.max(-limit, Math.min(limit, panY));
-  spinFrames.forEach(f => {{
-    f.style.transform = z > 1 ? `translate(${{panX}}px, ${{panY}}px) scale(${{z}})` : '';
-  }});
+  if (spinImage) {{
+    spinImage.style.transform = z > 1 ? `translate(${{panX}}px, ${{panY}}px) scale(${{z}})` : '';
+  }}
   const zb = document.getElementById('zoomBadge');
   if (zb) {{ zb.textContent = z > 1 ? z.toFixed(1) + 'x' : ''; zb.style.display = z > 1 ? 'block' : 'none'; }}
 }}
@@ -5007,7 +7137,7 @@ function container_width() {{
 }}
 
 function startAuto() {{
-  if (autoRunning) return;
+  if (!EXT_URLS.length || document.hidden || autoRunning) return;
   autoRunning = true;
   document.getElementById('autoBtn').textContent = '⏸';
   var steps = 0, maxSteps = EXT_URLS.length * 2; // ~2 rotations then stop (no infinite spin)
@@ -5035,7 +7165,12 @@ function buildFrameStrip() {{
     const thumb = document.createElement('div');
     thumb.className = 'frame-thumb' + (i === 0 ? ' active' : '');
     thumb.dataset.idx = i;
-    thumb.innerHTML = `<img src="${{url}}" loading="lazy" alt="frame ${{i+1}}">`;
+    const image = document.createElement('img');
+    image.src = url;
+    image.loading = 'lazy';
+    image.decoding = 'async';
+    image.alt = `frame ${{i + 1}}`;
+    thumb.appendChild(image);
     thumb.onclick = () => {{ stopAuto(); showSpinFrame(i); }};
     strip.appendChild(thumb);
   }});
@@ -5044,8 +7179,6 @@ function updateStripHighlight(idx) {{
   document.querySelectorAll('.frame-thumb').forEach((t, i) => {{
     t.classList.toggle('active', i === idx);
   }});
-  const active = document.querySelector('.frame-thumb.active');
-  if (active) active.scrollIntoView({{behavior:'smooth', block:'nearest', inline:'center'}});
 }}
 
 // ── Interior tab ────────────────────────────────────────────────────────────
@@ -5116,7 +7249,12 @@ async function initInterior() {{
     INT_URLS.forEach(url => {{
       const div = document.createElement('div');
       div.className = 'int-thumb';
-      div.innerHTML = `<img src="${{url}}" loading="lazy" alt="interior">`;
+      const image = document.createElement('img');
+      image.src = url;
+      image.loading = 'lazy';
+      image.decoding = 'async';
+      image.alt = 'Interior photo';
+      div.appendChild(image);
       div.onclick = () => openLB(url);
       grid.appendChild(div);
     }});
@@ -5138,7 +7276,12 @@ function initGallery() {{
   GALLERY_URLS.forEach((url, i) => {{
     const item = document.createElement('div');
     item.className = 'gallery-item';
-    item.innerHTML = `<img src="${{url}}" loading="lazy" alt="photo ${{i+1}}">`;
+    const image = document.createElement('img');
+    image.src = url;
+    image.loading = 'lazy';
+    image.decoding = 'async';
+    image.alt = `Photo ${{i + 1}}`;
+    item.appendChild(image);
     item.onclick = () => openLB(url);
     grid.appendChild(item);
   }});
@@ -5151,12 +7294,49 @@ function initVideo() {{
   videoInited = true;
   const container = document.getElementById('videoContainer');
   if (!VIDEO_URL) return;
-  if (VIDEO_TYPE === 'youtube' || VIDEO_URL.includes('youtube.com') || VIDEO_URL.includes('youtu.be')) {{
-    let vid = VIDEO_URL.includes('youtu.be/') ? VIDEO_URL.split('youtu.be/')[1].split('?')[0]
-             : new URLSearchParams(new URL(VIDEO_URL).search).get('v');
-    container.innerHTML = `<iframe src="https://www.youtube.com/embed/${{vid}}?autoplay=0&rel=0" allowfullscreen></iframe>`;
-  }} else {{
-    container.innerHTML = `<video controls src="${{VIDEO_URL}}" style="max-width:100%;max-height:100%;"></video>`;
+
+  let parsed;
+  try {{ parsed = new URL(VIDEO_URL, window.location.origin); }} catch (e) {{ return; }}
+  let embedUrl = '';
+  if (VIDEO_TYPE === 'youtube' && parsed.protocol === 'https:' &&
+      ['www.youtube.com', 'youtube.com'].includes(parsed.hostname)) {{
+    const id = parsed.searchParams.get('v') || '';
+    if (/^[A-Za-z0-9_-]{{11}}$/.test(id)) embedUrl = `https://www.youtube-nocookie.com/embed/${{id}}?autoplay=0&rel=0`;
+  }} else if (VIDEO_TYPE === 'vimeo' && parsed.protocol === 'https:' && parsed.hostname === 'vimeo.com') {{
+    const id = parsed.pathname.split('/').filter(Boolean).pop() || '';
+    if (/^[0-9]{{1,20}}$/.test(id)) embedUrl = `https://player.vimeo.com/video/${{id}}`;
+  }}
+
+  if (embedUrl) {{
+    const frame = document.createElement('iframe');
+    frame.src = embedUrl;
+    frame.title = 'Vehicle walkaround video';
+    frame.loading = 'lazy';
+    frame.referrerPolicy = 'strict-origin-when-cross-origin';
+    frame.allow = 'autoplay; encrypted-media; picture-in-picture; web-share';
+    frame.setAttribute('allowfullscreen', '');
+    container.replaceChildren(frame);
+    return;
+  }}
+
+  // Direct video sources are HTTPS URLs or allowlisted, same-vehicle storage
+  // paths. Assign through the DOM API; never interpolate a URL into HTML.
+  const hasVideoSuffix = ['.mp4', '.m4v', '.webm'].some(ext =>
+    parsed.pathname.toLowerCase().endsWith(ext));
+  const isLocalVehicleVideo = parsed.origin === window.location.origin &&
+    parsed.pathname.startsWith(`/storage/${{VIN}}/`) && hasVideoSuffix;
+  const isRemoteVideo = parsed.protocol === 'https:' && Boolean(parsed.hostname) && hasVideoSuffix;
+  if ((VIDEO_TYPE === 'upload' || VIDEO_TYPE === 'mp4' || VIDEO_TYPE === 'video') &&
+      (isLocalVehicleVideo || isRemoteVideo)) {{
+    const video = document.createElement('video');
+    video.controls = true;
+    video.playsInline = true;
+    video.preload = 'metadata';
+    video.style.maxWidth = '100%';
+    video.style.maxHeight = '100%';
+    video.src = parsed.href;
+    video.addEventListener('error', () => showToast('The video could not be loaded.'));
+    container.replaceChildren(video);
   }}
 }}
 
@@ -5184,12 +7364,17 @@ async function submitLead(e) {{
       body: JSON.stringify(data)
     }});
     if (res.ok) {{
-      document.getElementById('leadFormInner').innerHTML = `
-        <div class="form-success">
-          <div class="success-icon">&#x2705;</div>
-          <h3>Inquiry Sent!</h3>
-          <p>Thank you, ${{data.name}}. We'll contact you at ${{data.email}} shortly.</p>
-        </div>`;
+      const success = document.createElement('div');
+      success.className = 'form-success';
+      const icon = document.createElement('div');
+      icon.className = 'success-icon';
+      icon.textContent = '✅';
+      const heading = document.createElement('h3');
+      heading.textContent = 'Inquiry Sent!';
+      const message = document.createElement('p');
+      message.textContent = `Thank you, ${{String(data.name || '')}}. We'll contact you at ${{String(data.email || '')}} shortly.`;
+      success.append(icon, heading, message);
+      document.getElementById('leadFormInner').replaceChildren(success);
       trackEvent('lead_submitted', {{vin: VIN}});
     }} else {{
       btn.disabled = false;
@@ -5331,7 +7516,7 @@ trackEvent('viewer_open', {{vin: VIN}});
   if(location.hash==='#interior' && ib && !ib.classList.contains('hidden')){{ switchTab('interior'); }} }})();
 
 // ── Background Selector ─────────────────────────────────────────────────────
-let activeBgSlug = '{vehicle.get("background_id", "") or ""}';
+let activeBgSlug = {active_bg_slug_js};
 
 async function loadBackgrounds() {{
   const grid = document.getElementById('bgGrid');
@@ -5375,7 +7560,8 @@ async function selectBg(slug, el) {{
     const fd = new FormData();
     fd.append('background_slug', slug);
     fd.append('turntable_style', slug === 'none' ? 'none' : 'studio_shadow');
-    await fetch('/api/vehicle/' + VIN + '/background', {{method:'POST', body:fd}});
+    const response = await fetch('/api/vehicle/' + encodeURIComponent(VIN) + '/background', {{method:'POST', body:fd}});
+    if (!response.ok) throw new Error('Background save failed');
     showToast('Background updated. Re-finalize to apply to frames.');
   }} catch(e) {{
     showToast('Failed to save background.');
@@ -5393,95 +7579,25 @@ loadBackgrounds();
 # ROUTES — EMBED (iframe-ready, minimal chrome)
 # =============================================================================
 @app.get("/embed/{vin}")
-async def embed_vehicle(vin: str):
-    vin = vin.upper()
-    vehicle_dir = STORAGE_DIR / vin
-    
-    if not vehicle_dir.exists():
+def embed_vehicle(vin: str):
+    """Minimal, safe iframe wrapper around the shared 360 viewer component."""
+    vin = validate_vehicle_id(vin)
+    vehicle = db_get_vehicle(vin)
+    try:
+        _safe_vehicle_directory(vin)
+    except HTTPException:
         return HTMLResponse("<h1>Vehicle not found</h1>", status_code=404)
-    
-    # Prefer spin directory (interpolated frames), fallback to exterior
-    spin_dir = vehicle_dir / "spin"
-    if spin_dir.exists() and any(spin_dir.glob("spin_*.jpg")):
-        ext_frames = sorted([f.name for f in spin_dir.glob("spin_*.jpg")])
-        frame_path_prefix = f"/storage/{vin}/spin"
-    else:
-        ext_frames = sorted([f.name for f in (vehicle_dir / "exterior").glob("*.jpg")]) if (vehicle_dir / "exterior").exists() else []
-        frame_path_prefix = f"/storage/{vin}/exterior"
-    
-    int_photos = sorted([f.name for f in (vehicle_dir / "interior").glob("*.jpg")]) if (vehicle_dir / "interior").exists() else []
-    
-    info = db_get_vehicle(vin) or {"vin": vin, "year": "", "make": "", "model": ""}
-    title = f"{info.get('year','')} {info.get('make','')} {info.get('model','')}".strip() or vin
-    
-    frame_tags = "\n".join(
-        f'<img src="{frame_path_prefix}/{f}" style="display:none" data-idx="{i}">'
-        for i, f in enumerate(ext_frames)
-    )
-    interior_tags = "\n".join(
-        f'<div style="border-radius:4px;overflow:hidden;"><img src="/storage/{vin}/interior/{p}" loading="lazy" style="width:100%;height:100%;object-fit:cover;"></div>'
-        for p in int_photos
-    )
-    
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{title}</title>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Playfair+Display:wght@700&display=swap');
-        * {{ margin:0; padding:0; box-sizing:border-box; }}
-        body {{ font-family:'Inter',sans-serif; background:#0a1628; color:#f5f0e8; overflow-x:hidden; }}
-        .tabs {{ display:flex; background:#0f2040; border-bottom:1px solid #1a2e50; }}
-        .tab {{ flex:1; padding:0.7rem; background:transparent; border:none; color:#a0aab4; cursor:pointer; text-align:center; font-size:0.9rem; font-family:'Inter',sans-serif; }}
-        .tab.active {{ color:#c9a84c; box-shadow:inset 0 -2px 0 #c9a84c; }}
-        .tc {{ display:none; }} .tc.active {{ display:block; }}
-        #spin {{ width:100%; height:420px; cursor:grab; position:relative; background:#0a1628; touch-action:none; user-select:none; }}
-        #spin:active {{ cursor:grabbing; }}
-        #spin img {{ width:100%; height:100%; object-fit:contain; position:absolute; inset:0; pointer-events:none; }}
-        .hint {{ position:absolute; bottom:0.6rem; left:50%; transform:translateX(-50%); background:rgba(15,32,64,0.85); padding:0.3rem 0.8rem; border-radius:12px; font-size:0.75rem; color:#a0aab4; border:1px solid #1a2e50; }}
-        .ig {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:0.5rem; padding:0.5rem; }}
-        .ig div {{ aspect-ratio:16/10; }}
-        .brand {{ text-align:center; padding:0.4rem; font-size:0.7rem; color:#a0aab4; }}
-        @media(max-width:600px) {{ #spin {{ height:260px; }} }}
-    </style>
-</head>
-<body>
-    <div class="tabs">
-        <button class="tab active" onclick="st('e')">Exterior 360&deg;</button>
-        <button class="tab" onclick="st('i')">Interior</button>
-    </div>
-    <div id="e" class="tc active">
-        <div id="spin">
-            {frame_tags}
-            <div class="hint" id="hint">&larr; Drag to spin &rarr;</div>
-        </div>
-    </div>
-    <div id="i" class="tc">
-        <div class="ig">{interior_tags}</div>
-    </div>
-    <div class="brand">Powered by LotVue Pro</div>
-    <script>
-        const F=document.querySelectorAll('#spin img');
-        let c=0,d=false,sx=0,sf=0,ai=null;
-        // Preload
-        let ld=0;
-        F.forEach(img=>{{const p=new Image();p.onload=()=>{{ld++;if(ld===F.length){{if(F.length)F[0].style.display='block';ar();}}}};p.onerror=()=>ld++;p.src=img.src;}});
-        function ar(){{let n=0;ai=setInterval(()=>{{c=(c+1)%F.length;sh();n++;if(n>=F.length){{clearInterval(ai);ai=null;}}}},70);}}
-        function sa(){{if(ai){{clearInterval(ai);ai=null;}}}}
-        function sh(){{F.forEach(f=>f.style.display='none');if(F[c])F[c].style.display='block';}}
-        const S=document.getElementById('spin');
-        S.onmousedown=e=>{{sa();d=true;sx=e.clientX;sf=c;document.getElementById('hint').style.display='none';}};
-        S.onmousemove=e=>{{if(!d)return;const dx=e.clientX-sx,fd=Math.round(dx/15);if(fd){{c=((sf-fd)%F.length+F.length)%F.length;sh();}}}};
-        S.onmouseup=()=>d=false;S.onmouseleave=()=>d=false;
-        S.ontouchstart=e=>{{sa();d=true;sx=e.touches[0].clientX;sf=c;document.getElementById('hint').style.display='none';}};
-        S.ontouchmove=e=>{{if(!d)return;const dx=e.touches[0].clientX-sx,fd=Math.round(dx/15);if(fd){{c=((sf-fd)%F.length+F.length)%F.length;sh();}}}};
-        S.ontouchend=()=>d=false;
-        function st(id){{document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',id==='e'?i===0:i===1));document.querySelectorAll('.tc').forEach(t=>t.classList.remove('active'));document.getElementById(id).classList.add('active');}}
-    </script>
-</body>
-</html>"""
+    if not vehicle or vehicle.get("status", "active") != "active":
+        return HTMLResponse("<h1>Vehicle not found</h1>", status_code=404)
+    safe_vin = html_lib.escape(vin, quote=True)
+    html = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LotVue Pro vehicle viewer</title>
+<style>html,body{{margin:0;width:100%;height:100%;background:#0a1226}}
+lotvue-spin{{display:block;width:100%;height:100%}}</style></head>
+<body><lotvue-spin vin="{safe_vin}"></lotvue-spin>
+<script type="module">import "/static/lotvue_spin.js";</script></body></html>"""
     return HTMLResponse(html)
 
 
@@ -5489,8 +7605,11 @@ async def embed_vehicle(vin: str):
 # ROUTES — DEALER SETTINGS
 # =============================================================================
 @app.get("/settings")
-async def dealer_settings():
-    dealer = db_get_dealer("default") or {"name": "default", "display_name": "", "phone": "", "email": "", "address": "", "website": "", "logo_url": "", "brand_color": "#58a6ff"}
+def dealer_settings(request: Request):
+    email = _authenticated_user_email(request)
+    dealer = _account_dealer(email) or {"name": "", "display_name": "", "phone": "", "email": "", "address": "", "website": "", "logo_url": "", "brand_color": "#58a6ff"}
+    dealer = {key: html_lib.escape(str(value or ""), quote=True) for key, value in dealer.items()}
+    dealer.setdefault("brand_color", "#58a6ff")
     
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -5599,17 +7718,16 @@ VALID_WORKFLOW_STATUSES = ["intake", "photos", "processing", "review", "publishe
 @app.put("/api/vehicle/{vin}/workflow")
 async def update_workflow_status(vin: str, request: Request):
     """Update vehicle workflow status: intake → photos → processing → review → published"""
-    body = await request.json()
-    new_status = body.get("status", "").lower()
+    body = await _read_json_object_limited(request, 4096)
+    vin = validate_vehicle_id(vin)
+    new_status = str(body.get("status", "")).strip().lower()
     if new_status not in VALID_WORKFLOW_STATUSES:
         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {VALID_WORKFLOW_STATUSES}")
-    vehicle = db_get_vehicle(vin)
+    await run_in_threadpool(_require_vehicle_owner, request, vin)
+    vehicle = await run_in_threadpool(db_get_vehicle, vin)
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("UPDATE vehicles SET workflow_status=? WHERE vin=?", (new_status, vin))
-    conn.commit()
-    conn.close()
+    await run_in_threadpool(_write_workflow_status, vin, new_status)
     return {"status": "ok", "vin": vin, "workflow_status": new_status}
 
 
@@ -5617,7 +7735,8 @@ async def update_workflow_status(vin: str, request: Request):
 # API — DEALER
 # =============================================================================
 @app.post("/api/dealer")
-async def save_dealer(
+def save_dealer(
+    request: Request,
     display_name: str = Form(""),
     phone: str = Form(""),
     email: str = Form(""),
@@ -5625,33 +7744,57 @@ async def save_dealer(
     website: str = Form(""),
     brand_color: str = Form("#58a6ff")
 ):
-    db_upsert_dealer("default", display_name=display_name, phone=phone, email=email, address=address, website=website, brand_color=brand_color)
+    actor_email = _authenticated_user_email(request)
+    for field_name, value, maximum in (
+        ("display name", display_name, 120), ("phone", phone, 40), ("email", email, 254),
+        ("address", address, 300), ("website", website, 300),
+    ):
+        if len(value or "") > maximum:
+            raise HTTPException(status_code=400, detail=f"{field_name} is too long")
+    if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email.strip()):
+        raise HTTPException(status_code=400, detail="Enter a valid dealer email")
+    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", brand_color):
+        raise HTTPException(status_code=400, detail="Brand color must be a six-digit hex color")
+    dealer = _account_dealer(actor_email, create=True)
+    if not dealer:
+        raise HTTPException(status_code=500, detail="Dealer profile could not be created")
+    db_upsert_dealer(
+        dealer["name"], display_name=display_name.strip(), phone=phone.strip(),
+        email=email.strip().lower() or actor_email, address=address.strip(),
+        website=website.strip(), brand_color=brand_color, user_email=actor_email,
+    )
     return {"status": "ok"}
 
 
 @app.get("/api/dealer")
-async def get_dealer():
-    dealer = db_get_dealer("default")
-    return dealer or {"name": "default", "display_name": "", "brand_color": "#58a6ff"}
+def get_dealer_api(request: Request):
+    email = _authenticated_user_email(request)
+    dealer = _account_dealer(email)
+    return dealer or {"name": "", "display_name": "", "brand_color": "#58a6ff"}
 
 
 @app.get("/api/vehicles")
-async def get_vehicles_api():
-    vehicles = db_get_vehicles()
-    return vehicles
+def get_vehicles_api(request: Request):
+    actor_email = _authenticated_user_email(request)
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    return db_get_vehicles() if owner_email and actor_email == owner_email else db_get_vehicles_by_email(actor_email)
 
 
 # =============================================================================
 # API — DELETE
 # =============================================================================
 @app.delete("/api/vehicle/{vin}")
-async def delete_vehicle(vin: str):
-    vin = vin.upper()
-    vehicle_dir = STORAGE_DIR / vin
-    
+def delete_vehicle(vin: str, request: Request):
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    vehicle_dir = (STORAGE_DIR / vin).resolve()
+    if vehicle_dir.parent != STORAGE_DIR.resolve():
+        raise HTTPException(status_code=400, detail="Invalid vehicle path")
     if vehicle_dir.exists():
         shutil.rmtree(vehicle_dir)
-    
     db_delete_vehicle(vin)
     return {"status": "ok"}
 
@@ -5660,13 +7803,17 @@ async def delete_vehicle(vin: str):
 # API — UPDATE VEHICLE METADATA (price, mileage, color)
 # =============================================================================
 @app.post("/api/vehicle/{vin}/meta")
-async def update_vehicle_meta(
+def update_vehicle_meta(
     vin: str,
+    request: Request,
     price: str = Form(""),
     mileage: str = Form(""),
     color: str = Form(""),
 ):
-    vin = vin.upper()
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    if len(price) > 32 or len(mileage) > 32 or len(color) > 80:
+        raise HTTPException(status_code=400, detail="Vehicle metadata is too long")
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute(
         "UPDATE vehicles SET price=?, mileage=?, color=? WHERE vin=?",
@@ -5683,17 +7830,24 @@ async def update_vehicle_meta(
 # =============================================================================
 
 @app.get("/api/vin/{vin}/decode")
-async def decode_vin(vin: str):
-    """Decode VIN using NHTSA vPIC API (free). Returns year/make/model/trim/engine/transmission/etc."""
-    vin = vin.upper().strip()
-    if len(vin) < 11:
-        raise HTTPException(status_code=400, detail="VIN must be at least 11 characters")
+def decode_vin(vin: str, request: Request):
+    """Decode an 11–17 character VIN; an existing vehicle may only be updated by its owner."""
+    vin = (vin or "").strip().upper()
+    if not re.fullmatch(r"[A-HJ-NPR-Z0-9]{11,17}", vin):
+        raise HTTPException(status_code=400, detail="VIN must contain 11–17 valid VIN characters")
+    _authenticated_user_email(request)
+    existing = db_get_vehicle(vin)
+    if existing:
+        _require_vehicle_owner(request, vin)
 
     try:
         import urllib.request
-        url = f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{vin}?format=json"
+        url = f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{quote(vin, safe='')}?format=json"
         with urllib.request.urlopen(url, timeout=8) as resp:
-            data = json.loads(resp.read().decode())
+            raw_response = resp.read(512 * 1024 + 1)
+        if len(raw_response) > 512 * 1024:
+            raise HTTPException(status_code=502, detail="VIN decoder returned an oversized response")
+        data = json.loads(raw_response)
 
         if not data.get("Results"):
             return {"status": "error", "message": "No results from NHTSA"}
@@ -5701,7 +7855,8 @@ async def decode_vin(vin: str):
         r = data["Results"][0]
 
         def clean(val):
-            return val.strip() if val and val.strip() not in ["", "0", "Not Applicable"] else ""
+            text = str(val or "").strip()
+            return text if text not in {"", "0", "Not Applicable"} else ""
 
         decoded = {
             "vin": vin,
@@ -5722,8 +7877,7 @@ async def decode_vin(vin: str):
         # Clean up engine string
         decoded["engine"] = decoded["engine"].strip()
 
-        # Auto-save to DB if VIN exists
-        existing = db_get_vehicle(vin)
+        # Auto-save only the record checked above against this tenant.
         if existing:
             conn = sqlite3.connect(str(DB_PATH))
             conn.execute("""
@@ -5767,43 +7921,61 @@ async def decode_vin(vin: str):
 
         return {"status": "ok", "decoded": decoded, "pricing": pricing}
 
+    except HTTPException:
+        raise
     except Exception as e:
-        # Return partial data if NHTSA is unreachable
-        print(f"[VIN Decode] Error for {vin}: {e}")
-        return {"status": "error", "message": str(e), "decoded": {}}
+        print(f"[VIN Decode] {type(e).__name__} for {vin}")
+        return {"status": "error", "message": "VIN decoder is temporarily unavailable", "decoded": {}}
 
 
 @app.get("/api/backgrounds")
-async def get_backgrounds(category: str = None):
-    """Return the backgrounds library (system + dealer custom)."""
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    if category:
+def get_backgrounds(category: str = None):
+    """List packaged public system backgrounds from the canonical asset catalog."""
+    if category is not None and (len(category) > 40 or not re.fullmatch(r"[A-Za-z0-9_-]+", category)):
+        raise HTTPException(status_code=400, detail="Invalid background category")
+    with closing(sqlite3.connect(str(DB_PATH), timeout=5)) as conn:
+        conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT * FROM backgrounds WHERE is_active=1 AND category=? ORDER BY is_system DESC, name",
-            (category,)
+            "SELECT id,slug FROM backgrounds WHERE is_active=1 AND is_system=1 "
+            "ORDER BY category,name"
         ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM backgrounds WHERE is_active=1 ORDER BY is_system DESC, category, name"
-        ).fetchall()
-    conn.close()
-    return [{k: row[k] for k in row.keys()} for row in rows]
+    assets = {asset["slug"]: asset for asset in list_background_assets(include_none=True)}
+    result = []
+    for row in rows:
+        asset = assets.get(row["slug"])
+        if not asset or (category and asset["category"] != category):
+            continue
+        result.append({"id": row["id"], **asset})
+    return result
 
 
 @app.post("/api/vehicle/{vin}/background")
-async def set_vehicle_background(
+def set_vehicle_background(
     vin: str,
+    request: Request,
     background_slug: str = Form(""),
     turntable_style: str = Form("studio_shadow"),
 ):
-    """Set the background and turntable style for a vehicle."""
-    vin = vin.upper()
+    """Set the background and turntable style for a vehicle owned by this tenant."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    background_slug = background_slug.strip()
+    if len(background_slug) > 80 or turntable_style not in {"studio_shadow", "concrete", "glossy_black", "none"}:
+        raise HTTPException(status_code=400, detail="Invalid background selection")
     conn = sqlite3.connect(str(DB_PATH))
-    conn.execute(
+    background = conn.execute(
+        "SELECT 1 FROM backgrounds WHERE slug=? AND is_active=1", (background_slug,)
+    ).fetchone()
+    if not background:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Unknown background")
+    cur = conn.execute(
         "UPDATE vehicles SET background_id=?, turntable_style=? WHERE vin=?",
         (background_slug, turntable_style, vin)
     )
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     conn.commit()
     conn.close()
     return {"status": "ok", "vin": vin, "background_slug": background_slug, "turntable_style": turntable_style}
@@ -5815,69 +7987,88 @@ async def set_vehicle_background(
 # =============================================================================
 
 @app.get("/api/vehicles/{vin}/viewer")
-async def get_vehicle_viewer_data(vin: str):
-    """Returns all data needed to hydrate the 5-tab viewer widget."""
-    vin = vin.upper()
-    vehicle_dir = STORAGE_DIR / vin
-    if not vehicle_dir.exists():
+def get_vehicle_viewer_data(vin: str):
+    """Public, read-only viewer manifest for active inventory; never expose tenant fields."""
+    vin = validate_vehicle_id(vin)
+    info = db_get_vehicle(vin)
+    if not info or info.get("status", "active") != "active":
         raise HTTPException(status_code=404, detail="Vehicle not found")
+    vehicle_dir = _safe_vehicle_directory(vin)
 
-    # Exterior frames
-    spin_dir = vehicle_dir / "spin"
-    if spin_dir.exists() and any(spin_dir.glob("spin_*.jpg")):
-        ext_frames = sorted([f.name for f in spin_dir.glob("spin_*.jpg")])
-        frame_prefix = f"/storage/{vin}/spin"
+    def image_names(subdir: str, suffixes: set[str], prefix: str = "") -> list[str]:
+        directory = vehicle_dir / subdir
+        if directory.is_symlink():
+            return []
+        try:
+            resolved_dir = directory.resolve(strict=True)
+            if (resolved_dir.parent != vehicle_dir or resolved_dir.name != subdir
+                    or not resolved_dir.is_dir()):
+                return []
+            with os.scandir(resolved_dir) as entries:
+                return heapq.nsmallest(
+                    300,
+                    (entry.name for entry in entries
+                     if not entry.is_symlink()
+                     and entry.is_file(follow_symlinks=False)
+                     and Path(entry.name).suffix.lower() in suffixes
+                     and (not prefix or entry.name.startswith(prefix))
+                     and not entry.name.startswith(".")
+                     and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", entry.name)),
+                )
+        except OSError:
+            return []
+
+    spin_frames = image_names("spin", {".jpg"}, "spin_")
+    if spin_frames:
+        frame_subdir = "spin"
+        ext_frames = spin_frames
     else:
-        ext_dir = vehicle_dir / "exterior"
-        ext_frames = sorted([f.name for f in ext_dir.glob("*.jpg")]) if ext_dir.exists() else []
-        frame_prefix = f"/storage/{vin}/exterior"
-    ext_urls = [f"{frame_prefix}/{f}" for f in ext_frames]
-
-    # Interior photos
-    int_dir = vehicle_dir / "interior"
-    int_photos = sorted([f.name for f in int_dir.glob("*.jpg")]) if int_dir.exists() else []
-    int_urls = [f"/storage/{vin}/interior/{f}" for f in int_photos]
-
-    # Interior panoramas
-    pano_dir = vehicle_dir / "panoramas"
-    pano_files = []
-    if pano_dir.exists():
-        for ext in ["*.jpg", "*.jpeg", "*.png"]:
-            pano_files += sorted([f.name for f in pano_dir.glob(ext)])
-    pano_urls = [{"src": f"/storage/{vin}/panoramas/{f}", "name": f"Scene {i+1}"} for i, f in enumerate(pano_files)]
-
-    # Gallery photos
-    gallery_dir = vehicle_dir / "gallery"
-    gallery_files = []
-    if gallery_dir.exists():
-        for ext in ["*.jpg", "*.jpeg", "*.png"]:
-            gallery_files += sorted([f.name for f in gallery_dir.glob(ext)])
-    gallery_urls = [f"/storage/{vin}/gallery/{f}" for f in gallery_files]
+        frame_subdir = "exterior"
+        ext_frames = image_names("exterior", {".jpg", ".jpeg", ".png", ".webp"})
+    ext_urls = [f"/storage/{vin}/{frame_subdir}/{name}" for name in ext_frames]
+    int_urls = [f"/storage/{vin}/interior/{name}" for name in image_names("interior", {".jpg", ".jpeg", ".png", ".webp"})]
+    pano_files = image_names("panoramas", {".jpg", ".jpeg", ".png", ".webp"})
+    pano_urls = [{"src": f"/storage/{vin}/panoramas/{name}", "name": f"Scene {i+1}"}
+                 for i, name in enumerate(pano_files)]
+    gallery_urls = [f"/storage/{vin}/gallery/{name}"
+                    for name in image_names("gallery", {".jpg", ".jpeg", ".png", ".webp"})]
     if not gallery_urls:
-        gallery_urls = ext_urls  # fallback to exterior frames
+        gallery_urls = ext_urls
 
-    # DB info
-    info = db_get_vehicle(vin) or {"vin": vin, "year": "", "make": "", "model": ""}
+    video_url, video_type = "", ""
+    try:
+        video_url, video_type = normalize_video_source(
+            info.get("video_url", ""), info.get("video_type", ""), vin
+        )
+    except HTTPException:
+        pass
+    logo_url = str(info.get("dealer_logo_url", "") or "")[:2048]
+    if logo_url and not (
+        (logo_url.startswith(("/static/", f"/storage/{vin}/", "/storage/_brand/"))
+         and ".." not in urlsplit(logo_url).path.split("/"))
+        or (urlsplit(logo_url).scheme == "https" and bool(urlsplit(logo_url).hostname)
+            and not urlsplit(logo_url).username and not urlsplit(logo_url).password)
+    ):
+        logo_url = ""
 
+    public_info = {
+        key: str(info.get(key, "") or "")[:500]
+        for key in ("year", "make", "model", "price", "mileage", "color")
+    }
     return {
         "vin": vin,
-        "title": f"{info.get('year','')} {info.get('make','')} {info.get('model','')}".strip() or vin,
-        "year": info.get("year", ""),
-        "make": info.get("make", ""),
-        "model": info.get("model", ""),
-        "price": info.get("price", ""),
-        "mileage": info.get("mileage", ""),
-        "color": info.get("color", ""),
-        "video_url": info.get("video_url", ""),
-        "video_type": info.get("video_type", ""),
-        "dealer_logo_url": info.get("dealer_logo_url", ""),
+        "title": f"{public_info['year']} {public_info['make']} {public_info['model']}".strip() or vin,
+        **public_info,
+        "video_url": video_url,
+        "video_type": video_type,
+        "dealer_logo_url": logo_url,
         "exterior_frames": ext_urls,
         "interior_photos": int_urls,
         "interior_panoramas": pano_urls,
         "gallery_photos": gallery_urls,
-        "has_interior": len(int_urls) > 0 or len(pano_urls) > 0,
-        "has_gallery": len(gallery_urls) > 0,
-        "has_video": bool(info.get("video_url", "")),
+        "has_interior": bool(int_urls or pano_urls),
+        "has_gallery": bool(gallery_urls),
+        "has_video": bool(video_url),
         "frame_count": len(ext_urls),
     }
 
@@ -5886,13 +8077,16 @@ async def get_vehicle_viewer_data(vin: str):
 # ROUTE — CINEMATIC 3D VIEWER (Module 3)
 # =============================================================================
 @app.get("/view3d/{vin}")
-async def view3d(vin: str):
+def view3d(vin: str):
     """Honest 3D routing: TRUE gaussian-splat viewer when scene.ply exists,
     else the real-photo 360 spin. A customer must only ever see the REAL
     vehicle — never the procedural placeholder car (viewer3d.js legacy)."""
     from fastapi.responses import RedirectResponse
-    vin_safe = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
-    if (STORAGE_DIR / vin_safe / "splat" / "scene.ply").exists():
+    vin_safe = validate_vehicle_id(vin)
+    vehicle = db_get_vehicle(vin_safe)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    if (STORAGE_DIR / vin_safe / "splat" / "scene.ply").is_file():
         return RedirectResponse(f"/splat3d/{vin_safe}", status_code=302)
     if (STORAGE_DIR / vin_safe).exists() or db_get_vehicle(vin_safe):
         return RedirectResponse(f"/view/{vin_safe}", status_code=302)
@@ -6005,39 +8199,57 @@ async def view3d(vin: str):
     return HTMLResponse(html)
 
 
-from pydantic import BaseModel as _BaseModel
-from typing import Optional as _Optional
+from pydantic import BaseModel as _BaseModel, Field as _Field
 
 class LeadSubmission(_BaseModel):
-    vin: str
-    name: str
-    email: str
-    phone: _Optional[str] = ""
-    message: _Optional[str] = ""
-    wants_video: _Optional[int] = 0
-    wants_test_drive: _Optional[int] = 0
-    source: _Optional[str] = "viewer"
+    vin: str = _Field(min_length=1, max_length=32)
+    name: str = _Field(min_length=1, max_length=120)
+    email: str = _Field(min_length=3, max_length=254)
+    phone: str = _Field(default="", max_length=40)
+    message: str = _Field(default="", max_length=2000)
+    wants_video: int = _Field(default=0, ge=0, le=1)
+    wants_test_drive: int = _Field(default=0, ge=0, le=1)
+    source: str = _Field(default="viewer", max_length=32)
+
 
 @app.post("/api/leads")
-async def submit_lead(lead: LeadSubmission):
-    """Receives a lead inquiry from the viewer widget and stores it."""
-    conn = sqlite3.connect(str(DB_PATH))
-    cur = conn.execute("""
-        INSERT INTO leads (vin, name, email, phone, message, wants_video, wants_test_drive, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        lead.vin.upper(), lead.name, lead.email, lead.phone or "",
-        lead.message or "", lead.wants_video or 0, lead.wants_test_drive or 0,
-        lead.source or "viewer", datetime.now().isoformat()
-    ))
-    lead_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    print(f"[Lead] New inquiry: {lead.name} <{lead.email}> for VIN {lead.vin}")
+def submit_buyer_lead(lead: LeadSubmission, request: Request):
+    """Receive a bounded buyer inquiry for an existing published vehicle."""
+    _check_public_lead_rate(request)
+    vin = validate_vehicle_id(lead.vin)
+    name = re.sub(r"[\x00-\x1f\x7f]", "", lead.name).strip()
+    email = lead.email.strip().lower()
+    phone = re.sub(r"[\x00-\x1f\x7f]", "", lead.phone or "").strip()
+    message = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", lead.message or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=400, detail="Enter a valid email address")
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    source = lead.source.strip().lower()
+    if source not in {"viewer", "vdp", "embed", "widget", "website"}:
+        source = "viewer"
+    dealer_id = 0
+    tenant_email = str(vehicle.get("user_email", "") or "").strip().lower()
+    dealer = db_get_dealer_by_email(tenant_email) if tenant_email else None
+    if dealer:
+        dealer_id = int(dealer["id"])
+    with sqlite3.connect(str(DB_PATH), timeout=5) as conn:
+        cur = conn.execute("""
+            INSERT INTO leads (dealer_id, vin, name, email, phone, message, wants_video,
+                               wants_test_drive, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (dealer_id, vin, name, email, phone, message, lead.wants_video,
+              lead.wants_test_drive, source, datetime.now().isoformat()))
+        lead_id = cur.lastrowid
+    print(f"[Lead] New inquiry for VIN {vin}")
     try:
         from a2_extensions import notify_lead
-        notify_lead({"id": lead_id, "vin": lead.vin.upper(), "name": lead.name,
-                     "email": lead.email, "phone": lead.phone or "", "message": lead.message or "",
+        notify_lead({"id": lead_id, "vin": vin, "name": name,
+                     "email": email, "phone": phone, "message": message,
                      "wants_video": lead.wants_video, "wants_test_drive": lead.wants_test_drive})
     except Exception as e:
         print(f"[Lead-Notify] hook error (lead still stored): {e}")
@@ -6045,28 +8257,67 @@ async def submit_lead(lead: LeadSubmission):
 
 
 @app.get("/api/leads")
-async def get_leads(vin: str = None):
-    """Returns all leads, optionally filtered by VIN."""
+def get_leads(
+    request: Request,
+    vin: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+):
+    """List only leads attached to the signed-in dealer's vehicles."""
+    email = _authenticated_user_email(request)
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    limit = max(1, min(limit, 200))
+    conditions = []
+    params = []
+    if vin:
+        conditions.append("l.vin=?")
+        params.append(validate_vehicle_id(vin))
+    if status:
+        if len(status) > 40:
+            raise HTTPException(status_code=400, detail="Status filter is too long")
+        conditions.append("l.status=?")
+        params.append(status)
+    if not owner_email or email != owner_email:
+        conditions.append("EXISTS (SELECT 1 FROM vehicles v WHERE v.vin=l.vin AND LOWER(v.user_email)=?)")
+        params.append(email)
+    where = " AND ".join(conditions) or "1=1"
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    if vin:
-        rows = conn.execute("SELECT * FROM leads WHERE vin=? ORDER BY created_at DESC", (vin.upper(),)).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM leads ORDER BY created_at DESC LIMIT 200").fetchall()
+    rows = conn.execute(
+        f"SELECT l.* FROM leads l WHERE {where} ORDER BY l.created_at DESC, l.id DESC LIMIT ?",
+        (*params, limit),
+    ).fetchall()
     conn.close()
-    return [{k: row[k] for k in row.keys()} for row in rows]
+    return {"status": "ok", "leads": [dict(row) for row in rows], "count": len(rows)}
 
-
-class AnalyticsEvent(_BaseModel):
-    vin: str
-    event_type: str
-    data: dict = {}
-    ts: _Optional[int] = None
 
 @app.post("/api/analytics/event")
-async def track_analytics_event(event: AnalyticsEvent):
-    """Lightweight analytics beacon — logs viewer events to console and future DB."""
-    print(f"[Analytics] {event.event_type} | VIN={event.vin} | {event.data}")
+async def track_analytics_event(request: Request):
+    """Accept only small, bounded viewer events for active vehicles."""
+    _check_public_analytics_rate(request)
+    body = await _read_json_object_limited(request, 8192)
+    vin = validate_vehicle_id(str(body.get("vin", "")))
+    vehicle = await run_in_threadpool(db_get_vehicle, vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    event_type = str(body.get("event_type", "")).strip().lower()
+    if event_type not in {"viewer_open", "tab_switch", "lead_submitted"}:
+        raise HTTPException(status_code=400, detail="Unsupported viewer event")
+    supplied = body.get("data", {})
+    if not isinstance(supplied, dict) or len(supplied) > 12:
+        raise HTTPException(status_code=400, detail="Event data must be a small object")
+    safe_data = {}
+    for key, value in supplied.items():
+        if (not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", key)
+                or not isinstance(value, (str, int, float, bool, type(None)))):
+            continue
+        if isinstance(value, str):
+            safe_data[key] = "".join(ch for ch in value if ord(ch) >= 32 and ord(ch) != 127)[:120]
+        else:
+            safe_data[key] = value
+    if len(json.dumps(safe_data, ensure_ascii=True)) > 2048:
+        raise HTTPException(status_code=400, detail="Event data is too large")
+    print(f"[Analytics] {event_type} | VIN={vin} | {json.dumps(safe_data, ensure_ascii=True)}")
     return {"status": "ok"}
 
 
@@ -6074,36 +8325,71 @@ async def track_analytics_event(event: AnalyticsEvent):
 # API — AI VIDEO WALKAROUND (Module 4)
 # =============================================================================
 @app.post("/api/vehicle/{vin}/walkaround")
-async def generate_vehicle_walkaround(vin: str):
-    """Start AI video walkaround generation for a vehicle."""
+def generate_vehicle_walkaround(vin: str, request: Request):
+    """Start a walkaround job for an active vehicle the requester owns."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
     info = db_get_vehicle(vin)
-    if not info:
+    if not info or info.get("status", "active") != "active":
         raise HTTPException(status_code=404, detail="Vehicle not found")
 
-    from ai_studio.video_walkaround import generate_walkaround, get_walkaround_status
+    from ai_studio.video_walkaround import (
+        MAX_WALKAROUND_VALIDATION_BYTES,
+        generate_walkaround,
+        get_walkaround_status,
+        mark_walkaround_failed,
+    )
 
     status = get_walkaround_status(vin)
-    if status.get("status") == "processing":
+    job_key = f"walkaround:{vin}"
+    active_states = {"starting", "queued", "processing"}
+    if status.get("status") in active_states or _background_job_running(job_key):
         return {"status": "already_running", "progress": status.get("progress", 0)}
 
     def _run():
-        generate_walkaround(vin, info)
+        try:
+            generate_walkaround(
+                vin,
+                info,
+                max_photo_bytes=MAX_PHOTO_MB * 1024 * 1024,
+                max_image_pixels=MAX_UPLOAD_IMAGE_PIXELS,
+                validation_bytes_limit=min(
+                    MAX_PHOTO_BATCH_MB * 1024 * 1024,
+                    MAX_WALKAROUND_VALIDATION_BYTES,
+                ),
+            )
+        except Exception:
+            mark_walkaround_failed(vin)
+            raise
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-
+    submission = _submit_background_job(job_key, _run)
+    if submission == "already_running":
+        return {"status": "already_running", "progress": status.get("progress", 0)}
+    if submission == "busy":
+        raise HTTPException(status_code=429, detail="Background processing capacity is full",
+                            headers={"Retry-After": "30"})
     return {"status": "started", "vin": vin}
 
 
 @app.get("/api/vehicle/{vin}/walkaround-status")
-async def walkaround_status(vin: str):
-    """Get walkaround generation status."""
+def walkaround_status(vin: str, request: Request):
+    """Get walkaround status for an active vehicle the requester owns."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     from ai_studio.video_walkaround import get_walkaround_status
     status = get_walkaround_status(vin)
+    status_name = status.get("status")
+    active_states = {"starting", "queued", "processing"}
+    job_running = _background_job_running(f"walkaround:{vin}")
+    if job_running and status_name not in active_states and status_name != "error":
+        return {"status": "queued", "progress": 0, "step": "Waiting for a background worker"}
 
-    # Also check if video already exists
+    # A previous public output must not hide an active job or a newer failure.
     video_path = STORAGE_DIR / vin / "walkaround" / "walkaround.mp4"
-    if video_path.exists() and status.get("status") != "processing":
+    if video_path.exists() and status_name not in active_states and status_name != "error":
         size_mb = round(video_path.stat().st_size / (1024 * 1024), 1)
         return {
             "status": "done",
@@ -6119,12 +8405,14 @@ async def walkaround_status(vin: str):
 # =============================================================================
 
 @app.get("/api/vehicle/{vin}/market-price")
-async def get_market_price(vin: str):
-    """Estimate market value for a vehicle based on specs."""
+def get_market_price(vin: str, request: Request):
+    """Estimate market value for an active vehicle the requester owns."""
     from ai_studio.market_pricing import estimate_market_price
 
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
     vehicle = db_get_vehicle(vin)
-    if not vehicle:
+    if not vehicle or vehicle.get("status", "active") != "active":
         raise HTTPException(status_code=404, detail="Vehicle not found")
 
     pricing = estimate_market_price(vehicle)
@@ -6136,22 +8424,22 @@ async def set_vehicle_price(vin: str, request: Request):
     """Set asking price and get updated market comparison."""
     from ai_studio.market_pricing import estimate_market_price
 
-    body = await request.json()
-    price = body.get("price", 0)
-
-    vehicle = db_get_vehicle(vin)
+    body = await _read_json_object_limited(request, 4096)
+    vin = validate_vehicle_id(vin)
+    await run_in_threadpool(_require_vehicle_owner, request, vin)
+    raw_price = body.get("price", "")
+    price = str(raw_price if raw_price is not None else "").replace("$", "").replace(",", "").strip()
+    if price and (len(price) > 16 or not re.fullmatch(r"[0-9]+(?:\.[0-9]{1,2})?", price)
+                  or not 0 <= float(price) <= 100_000_000):
+        raise HTTPException(status_code=400, detail="Price must be a non-negative amount up to $100,000,000")
+    vehicle = await run_in_threadpool(db_get_vehicle, vin)
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
 
-    # Update price in DB
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("UPDATE vehicles SET price=? WHERE vin=?", (price, vin))
-    conn.commit()
-    conn.close()
-
-    # Re-fetch and price
-    vehicle = db_get_vehicle(vin)
-    pricing = estimate_market_price(vehicle)
+    # Update price in DB, then compute local comps outside the event loop.
+    await run_in_threadpool(_write_vehicle_price, vin, price)
+    vehicle = await run_in_threadpool(db_get_vehicle, vin)
+    pricing = await run_in_threadpool(estimate_market_price, vehicle)
     return {"status": "ok", "vin": vin, "price": price, "pricing": pricing}
 
 
@@ -6160,55 +8448,48 @@ async def set_vehicle_price(vin: str, request: Request):
 # =============================================================================
 
 @app.get("/api/syndication/facebook-csv")
-async def syndication_facebook():
-    """Export all published vehicles as Facebook Marketplace catalog CSV."""
+def syndication_facebook(request: Request):
+    """Export only the authenticated tenant's active inventory as a catalog CSV."""
     from ai_studio.listing_syndication import export_facebook_csv
 
-    vehicles = db_get_vehicles()
-    published = [v for v in vehicles if v.get("workflow_status") == "published" or v.get("status") == "active"]
-    if not published:
-        published = vehicles  # fallback: export all if none published
-
-    csv_data = export_facebook_csv(published)
+    actor_email = _authenticated_user_email(request)
+    vehicles = db_get_vehicles_by_email(actor_email)
+    csv_data = export_facebook_csv(vehicles)
     return Response(content=csv_data, media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=facebook_catalog.csv"})
 
 
 @app.get("/api/syndication/xml-feed")
-async def syndication_xml():
-    """Export vehicles as XML feed for CarGurus/AutoTrader/Cars.com."""
+def syndication_xml(request: Request):
+    """Export only the authenticated tenant's active inventory as XML."""
     from ai_studio.listing_syndication import export_xml_feed
 
-    vehicles = db_get_vehicles()
-    published = [v for v in vehicles if v.get("workflow_status") == "published" or v.get("status") == "active"]
-    if not published:
-        published = vehicles
-
-    xml_data = export_xml_feed(published)
+    actor_email = _authenticated_user_email(request)
+    vehicles = db_get_vehicles_by_email(actor_email)
+    xml_data = export_xml_feed(vehicles)
     return Response(content=xml_data, media_type="application/xml",
                     headers={"Content-Disposition": "attachment; filename=inventory_feed.xml"})
 
 
 @app.get("/api/syndication/json")
-async def syndication_json():
-    """Export vehicles as JSON API feed."""
+def syndication_json(request: Request):
+    """Export only the authenticated tenant's active inventory as JSON."""
     from ai_studio.listing_syndication import export_json_api
 
-    vehicles = db_get_vehicles()
-    published = [v for v in vehicles if v.get("workflow_status") == "published" or v.get("status") == "active"]
-    if not published:
-        published = vehicles
-
-    return export_json_api(published)
+    actor_email = _authenticated_user_email(request)
+    vehicles = db_get_vehicles_by_email(actor_email)
+    return export_json_api(vehicles)
 
 
 @app.get("/api/vehicle/{vin}/craigslist")
-async def syndication_craigslist(vin: str):
-    """Generate Craigslist-ready HTML posting for a vehicle."""
+def syndication_craigslist(vin: str, request: Request):
+    """Generate Craigslist-ready HTML for an active vehicle the caller owns."""
     from ai_studio.listing_syndication import export_craigslist_html
 
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
     vehicle = db_get_vehicle(vin)
-    if not vehicle:
+    if not vehicle or vehicle.get("status", "active") != "active":
         raise HTTPException(status_code=404, detail="Vehicle not found")
 
     html = export_craigslist_html(vehicle)
@@ -6216,12 +8497,14 @@ async def syndication_craigslist(vin: str):
 
 
 @app.get("/api/vehicle/{vin}/embed")
-async def syndication_embed(vin: str):
-    """Generate embeddable HTML widget for dealer websites."""
+def syndication_embed(vin: str, request: Request):
+    """Generate an embeddable widget for an active vehicle the caller owns."""
     from ai_studio.listing_syndication import export_embed_html
 
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
     vehicle = db_get_vehicle(vin)
-    if not vehicle:
+    if not vehicle or vehicle.get("status", "active") != "active":
         raise HTTPException(status_code=404, detail="Vehicle not found")
 
     html = export_embed_html(vehicle)
@@ -6239,87 +8522,196 @@ import json as _json_mod
 # Paths for commercial generator
 # lotvue env is fine here: WAN GPU work happens inside the ComfyUI server (:8188)
 # via wan_comfy_api; Kokoro TTS is verified working in the lotvue env.
-_COMFYUI_PYTHON = os.environ.get("COMFYUI_PYTHON", r"E:\Miniconda3\envs\lotvue\python.exe")
+_COMFYUI_PYTHON = os.environ.get("COMFYUI_PYTHON") or sys.executable
 _COMMERCIAL_SCRIPT = str(BASE_DIR / "commercial_pipeline.py")
+_COMMERCIAL_JOB_LOCK = _threading.Lock()
 
 
-def _run_commercial_pipeline_bg(vin: str, vehicle: dict, image_path: str):
-    """Run commercial pipeline in background thread"""
-    commercial_dir = os.path.join(str(STORAGE_DIR), vin, "commercial")
-    os.makedirs(commercial_dir, exist_ok=True)
-    status_file = os.path.join(commercial_dir, "status.json")
+def _write_commercial_status(status_file: Path, payload: dict) -> None:
+    """Atomically replace job status so pollers never read a partial JSON file."""
+    temp_file = status_file.with_suffix(".json.tmp")
+    temp_file.write_text(_json_mod.dumps(payload), encoding="utf-8")
+    os.replace(temp_file, status_file)
+
+
+def _run_commercial_pipeline_bg(
+    vin: str, vehicle: dict, image_path: str, script: str, style: str,
+    job_token: str, lock_file: Path,
+):
+    """Run commercial pipeline without retaining potentially large logs in RAM."""
+    commercial_dir = Path(STORAGE_DIR) / vin / "commercial"
+    commercial_dir.mkdir(parents=True, exist_ok=True)
+    status_file = commercial_dir / "status.json"
+    log_file = commercial_dir / "pipeline.log"
     try:
-        with open(status_file, "w") as f:
-            _json_mod.dump({"status": "running", "step": "starting", "progress": 0, "vin": vin}, f)
-
-        result = _subprocess.run(
-            [
-                _COMFYUI_PYTHON, _COMMERCIAL_SCRIPT,
-                "--vin", vin,
-                "--image", image_path,
-                "--year", str(vehicle.get("year", "")),
-                "--make", str(vehicle.get("make", "")),
-                "--model", str(vehicle.get("model", "")),
-                "--trim", str(vehicle.get("trim_level", "")),
-                "--engine", str(vehicle.get("engine", "")),
-                "--transmission", str(vehicle.get("transmission", "")),
-                "--price", str(vehicle.get("price", "")),
-                "--dealer", str(vehicle.get("dealer_name") or vehicle.get("display_name") or "ABUZ8 Auto Demo")
-            ],
-            capture_output=True, text=True, timeout=900
-        )
-        if result.returncode != 0:
-            with open(status_file, "w") as f:
-                _json_mod.dump({"status": "error", "vin": vin, "error": result.stderr[-500:]}, f)
+        _write_commercial_status(status_file, {
+            "status": "running", "step": "starting", "progress": 0, "vin": vin
+        })
+        command = [
+            _COMFYUI_PYTHON, _COMMERCIAL_SCRIPT,
+            "--vin", vin,
+            "--image", image_path,
+            "--year", str(vehicle.get("year", "")),
+            "--make", str(vehicle.get("make", "")),
+            "--model", str(vehicle.get("model", "")),
+            "--trim", str(vehicle.get("trim_level", "")),
+            "--engine", str(vehicle.get("engine", "")),
+            "--transmission", str(vehicle.get("transmission", "")),
+            "--price", str(vehicle.get("price", "")),
+            "--dealer", str(vehicle.get("dealer_name") or vehicle.get("display_name") or "ABUZ8 Auto Demo"),
+            "--style", style,
+        ]
+        if script:
+            command.extend(["--script", script])
+        with log_file.open("ab") as log:
+            result = _subprocess.run(
+                command, stdout=log, stderr=_subprocess.STDOUT,
+                timeout=900, check=False
+            )
+        video_file = commercial_dir / "commercial.mp4"
+        if result.returncode != 0 or not video_file.is_file() or video_file.stat().st_size <= 0:
+            try:
+                with log_file.open("rb") as log:
+                    log.seek(max(0, log.seek(0, os.SEEK_END) - 8192))
+                    error_text = log.read().decode("utf-8", errors="replace")[-500:]
+            except OSError:
+                error_text = "Commercial pipeline failed without a readable log"
+            _write_commercial_status(status_file, {
+                "status": "error", "vin": vin,
+                "error": error_text or f"Pipeline exited with status {result.returncode}"
+            })
         else:
+            # The pipeline writes its own completed progress state. Ensure the
+            # success artifact actually exists before considering the job done.
             print(f"[Commercial] Pipeline completed for VIN {vin}")
-    except Exception as e:
-        with open(status_file, "w") as f:
-            _json_mod.dump({"status": "error", "vin": vin, "error": str(e)}, f)
-        print(f"[Commercial] Error for VIN {vin}: {e}")
+    except Exception as exc:
+        try:
+            _write_commercial_status(status_file, {"status": "error", "vin": vin, "error": str(exc)[:500]})
+        except OSError:
+            pass
+        print(f"[Commercial] Error for VIN {vin}: {exc}")
+    finally:
+        try:
+            if lock_file.read_text(encoding="utf-8").strip() == job_token:
+                lock_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-@app.post("/api/vehicle/{vin}/generate-commercial")
-async def generate_commercial_endpoint(vin: str):
-    """Start AI commercial generation for a vehicle. Runs async in background."""
+def _validate_commercial_options(body: dict) -> tuple[str, str]:
+    script = body.get("script", "")
+    style = body.get("style", "cinematic")
+    if not isinstance(script, str) or len(script) > 600:
+        raise HTTPException(status_code=422, detail="Script must be text with at most 600 characters")
+    if any(ord(char) < 32 and char not in "\\n\\r\\t" for char in script):
+        raise HTTPException(status_code=422, detail="Script contains unsupported control characters")
+    if not isinstance(style, str) or style not in {"cinematic", "social", "showroom"}:
+        raise HTTPException(status_code=422, detail="Unsupported commercial style")
+    return script.strip(), style
+
+
+def _start_commercial_generation(vin: str, request: Request, script: str = "", style: str = "cinematic"):
+    """Start a commercial job; callers run this blocking DB/network/filesystem work in a thread."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
     vehicle = db_get_vehicle(vin)
-    if not vehicle:
+    if not vehicle or vehicle.get("status", "active") != "active":
         raise HTTPException(status_code=404, detail="Vehicle not found")
+    interpreter = Path(_COMFYUI_PYTHON).expanduser()
+    if not interpreter.is_file() and not shutil.which(_COMFYUI_PYTHON):
+        raise HTTPException(status_code=503, detail="Commercial generation interpreter is not configured")
+    if not Path(_COMMERCIAL_SCRIPT).is_file():
+        raise HTTPException(status_code=503, detail="Commercial generation pipeline is not installed")
+    if not _comfyui_is_available():
+        raise HTTPException(status_code=503, detail="ComfyUI is unavailable; try again after it starts")
 
-    commercial_dir = os.path.join(str(STORAGE_DIR), vin, "commercial")
-    status_file = os.path.join(commercial_dir, "status.json")
+    storage_root = STORAGE_DIR.resolve()
+    vehicle_dir = (storage_root / vin).resolve()
+    if vehicle_dir.parent != storage_root or not vehicle_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Vehicle storage not found")
+    commercial_path = vehicle_dir / "commercial"
+    commercial_path.mkdir(parents=True, exist_ok=True)
+    status_file = commercial_path / "status.json"
 
-    # Check if already running
-    if os.path.exists(status_file):
-        with open(status_file) as f:
-            current = _json_mod.load(f)
-        if current.get("status") == "running":
-            return {"status": "already_running", "message": "Commercial generation already in progress"}
-
-    # Find best image for this vehicle — check spin/, exterior/, then thumbnail
-    image_path = None
-    for subdir in ["spin", "exterior"]:
-        candidate_dir = os.path.join(str(STORAGE_DIR), vin, subdir)
-        if os.path.exists(candidate_dir):
-            frames = sorted([f for f in os.listdir(candidate_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+    def _find_image() -> Path | None:
+        for subdir in ("spin", "exterior"):
+            directory = (vehicle_dir / subdir).resolve()
+            if directory.parent != vehicle_dir or not directory.is_dir():
+                continue
+            frames = sorted(
+                path for path in directory.iterdir()
+                if path.is_file()
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,180}\.(?:jpg|jpeg|png)", path.name, re.IGNORECASE)
+                and path.resolve().parent == directory
+            )
             if frames:
-                idx = max(0, len(frames) // 4)
-                image_path = os.path.join(candidate_dir, frames[idx])
-                break
-    # Last resort: thumbnail
-    if not image_path or not os.path.exists(image_path):
-        thumb = os.path.join(str(STORAGE_DIR), vin, "thumbnail.jpg")
-        if os.path.exists(thumb):
-            image_path = thumb
-    if not image_path or not os.path.exists(image_path):
+                return frames[max(0, len(frames) // 4)]
+        thumbnail = vehicle_dir / "thumbnail.jpg"
+        if thumbnail.is_file() and thumbnail.resolve().parent == vehicle_dir:
+            return thumbnail.resolve()
+        return None
+
+    image_path = _find_image()
+    if not image_path:
         raise HTTPException(status_code=400, detail="No vehicle images found. Upload exterior photos first.")
 
-    t = _threading.Thread(
-        target=_run_commercial_pipeline_bg,
-        args=(vin, vehicle, image_path),
-        daemon=True
-    )
-    t.start()
+    # Coordinate duplicate requests across both threads and app worker processes.
+    lock_file = commercial_path / ".job.lock"
+    with _COMMERCIAL_JOB_LOCK:
+        if lock_file.is_file():
+            try:
+                stale = time.time() - lock_file.stat().st_mtime >= 1800
+            except OSError:
+                stale = False
+            if not stale:
+                return {"status": "already_running", "message": "Commercial generation already in progress"}
+            lock_file.unlink(missing_ok=True)
+
+        job_token = uuid.uuid4().hex
+        try:
+            descriptor = os.open(str(lock_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return {"status": "already_running", "message": "Commercial generation already in progress"}
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as lock_handle:
+                lock_handle.write(job_token)
+                lock_handle.flush()
+                os.fsync(lock_handle.fileno())
+            _write_commercial_status(status_file, {
+                "status": "running", "step": "starting", "progress": 0, "vin": vin
+            })
+            submission = _submit_background_job(
+                f"commercial:{vin}",
+                _run_commercial_pipeline_bg,
+                vin, vehicle, str(image_path), script, style, job_token, lock_file,
+            )
+            if submission != "started":
+                try:
+                    if lock_file.read_text(encoding="utf-8").strip() == job_token:
+                        lock_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if submission == "busy":
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Background processing capacity is full",
+                        headers={"Retry-After": "30"},
+                    )
+                return {"status": "already_running", "message": "Commercial generation already in progress"}
+        except HTTPException:
+            try:
+                if lock_file.read_text(encoding="utf-8").strip() == job_token:
+                    lock_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        except Exception as exc:
+            try:
+                if lock_file.read_text(encoding="utf-8").strip() == job_token:
+                    lock_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise HTTPException(status_code=500, detail="Could not start commercial generation") from exc
 
     return {
         "status": "started",
@@ -6328,32 +8720,63 @@ async def generate_commercial_endpoint(vin: str):
     }
 
 
+@app.post("/api/vehicle/{vin}/generate-commercial")
+async def generate_commercial_endpoint(vin: str, request: Request):
+    """Backward-compatible vehicle-scoped commercial job endpoint."""
+    body = await _read_json_object_limited(request, 8192)
+    script, style = _validate_commercial_options(body)
+    return await run_in_threadpool(
+        _start_commercial_generation, vin, request, script, style
+    )
+
+
 @app.get("/api/vehicle/{vin}/commercial-status")
-async def commercial_status_endpoint(vin: str):
-    """Poll commercial generation status. Returns progress and URL when done."""
-    commercial_dir = os.path.join(str(STORAGE_DIR), vin, "commercial")
-    status_file = os.path.join(commercial_dir, "status.json")
+def commercial_status_endpoint(vin: str, request: Request):
+    """Poll private generation status for an active vehicle owned by the requester."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    commercial_dir = (STORAGE_DIR / vin / "commercial").resolve()
+    expected_parent = (STORAGE_DIR / vin).resolve()
+    if commercial_dir.parent != expected_parent:
+        raise HTTPException(status_code=400, detail="Invalid vehicle path")
+    status_file = commercial_dir / "status.json"
 
-    if not os.path.exists(status_file):
+    if not status_file.is_file():
         return {"status": "not_started", "vin": vin}
-
-    with open(status_file) as f:
-        data = _json_mod.load(f)
+    try:
+        if status_file.stat().st_size > 64 * 1024:
+            raise ValueError("Status file too large")
+        data = _json_mod.loads(status_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Invalid status format")
+    except (OSError, ValueError, TypeError):
+        return {"status": "error", "vin": vin, "error": "Generation status is unavailable"}
 
     if data.get("status") == "done":
-        mp4_path = os.path.join(commercial_dir, "commercial.mp4")
-        if os.path.exists(mp4_path):
+        mp4_path = commercial_dir / "commercial.mp4"
+        if mp4_path.is_file() and mp4_path.stat().st_size > 0 and mp4_path.resolve().parent == commercial_dir:
             data["url"] = f"/storage/{vin}/commercial/commercial.mp4"
-            data["size_mb"] = round(os.path.getsize(mp4_path) / (1024 * 1024), 1)
-
+            data["size_mb"] = round(mp4_path.stat().st_size / (1024 * 1024), 1)
+        else:
+            return {"status": "error", "vin": vin, "error": "Generated video is missing"}
     return data
 
 
 @app.delete("/api/vehicle/{vin}/commercial")
-async def delete_commercial_endpoint(vin: str):
-    """Delete generated commercial and reset status."""
-    commercial_dir = os.path.join(str(STORAGE_DIR), vin, "commercial")
-    if os.path.exists(commercial_dir):
+def delete_commercial_endpoint(vin: str, request: Request):
+    """Delete a generated commercial only when the requester owns the vehicle."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    commercial_dir = (STORAGE_DIR / vin / "commercial").resolve()
+    if commercial_dir.parent != (STORAGE_DIR / vin).resolve():
+        raise HTTPException(status_code=400, detail="Invalid vehicle path")
+    if commercial_dir.exists():
         import shutil as _shutil
         _shutil.rmtree(commercial_dir)
     return {"status": "deleted", "vin": vin}
@@ -6363,7 +8786,7 @@ async def delete_commercial_endpoint(vin: str):
 # ROUTES — PUBLIC URL
 # =============================================================================
 @app.get("/public-url")
-async def public_url_page():
+def public_url_page():
     html = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6429,94 +8852,184 @@ async def public_url_page():
 # =============================================================================
 # API — AI PHOTO STUDIO (Module 2)
 # =============================================================================
-@app.post("/api/vehicle/{vin}/process-photos")
-async def process_vehicle_photos(vin: str, request: Request):
-    """
-    Run the AI Photo Studio pipeline on all exterior photos for a vehicle.
-    Enhances photos: bg removal → showroom bg → enhance → plate blur.
-    """
-    vehicle = db_get_vehicle(vin)
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
-
-    vehicle_dir = STORAGE_DIR / vin
-    exterior_dir = vehicle_dir / "exterior"
-    studio_dir = vehicle_dir / "studio"
-    studio_dir.mkdir(exist_ok=True)
-
-    if not exterior_dir.exists() or not list(exterior_dir.glob("*.jpg")):
-        raise HTTPException(status_code=400, detail="No exterior photos found")
-
-    # Parse options
+def _run_photo_studio_job(
+    vin: str, background: str, upscale: bool, kind: str, max_photos: int,
+    require_background_removal: bool = False,
+) -> None:
+    """Run the shared PhotoProcessor into a staged directory and publish atomically."""
+    stage_dir = None
     try:
-        body = await request.json()
-    except:
-        body = {}
-    background = body.get("background", "studio_white")
-    do_upscale = body.get("upscale", False)
+        import tempfile
+        from ai_studio import PhotoProcessor
 
-    # Update workflow status to processing
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("UPDATE vehicles SET workflow_status='processing' WHERE vin=?", (vin,))
-    conn.commit()
-    conn.close()
+        vehicle_dir = _safe_vehicle_directory(vin)
+        exterior_dir = _ensure_safe_vehicle_subdir(vin, "exterior")
+        studio_dir = _ensure_safe_vehicle_subdir(vin, "studio", create=True)
+        photo_count = _count_matching_files(exterior_dir, (".jpg", ".jpeg", ".png", ".webp"))
+        total = min(photo_count, max_photos)
+        _write_pipeline_job(
+            vin, kind, "running", step="processing", progress=5, total=total,
+        )
+        stage_dir = Path(tempfile.mkdtemp(prefix=".studio-stage-", dir=vehicle_dir))
+        results = PhotoProcessor(
+            background_name=background,
+            upscale=upscale,
+            require_background_removal=require_background_removal,
+        ).process_batch(str(exterior_dir), str(stage_dir), max_photos=max_photos)
+        succeeded = sum(result.get("status") == "ok" for result in results)
+        degraded = sum(result.get("status") == "degraded" for result in results)
+        failed = sum(result.get("status") == "error" for result in results)
+        produced = succeeded + degraded
+        if produced:
+            _replace_directory(stage_dir, studio_dir)
+            stage_dir = None
+        if produced == 0:
+            _write_pipeline_job(
+                vin, kind, "error", step="failed", progress=100, total=total,
+                failed=failed or total,
+                message="No photos were processed; previous studio outputs were preserved.",
+            )
+            return
 
-    # Run AI pipeline in background thread
-    import threading
-
-    def _run_pipeline():
+        final_status = "degraded" if degraded or failed else "completed"
+        _write_pipeline_job(
+            vin, kind, final_status, step="ready", progress=100, total=len(results),
+            succeeded=succeeded, degraded=degraded, failed=failed,
+            message=f"Processed {produced} photo(s); {failed} failed. Review all outputs before publishing.",
+        )
+    except Exception as exc:
+        print(f"[Photo Studio] job failed for {vin}: {type(exc).__name__}: {exc}")
         try:
-            from ai_studio import PhotoProcessor
-            processor = PhotoProcessor(background_name=background, upscale=do_upscale)
-            results = processor.process_batch(str(exterior_dir), str(studio_dir))
-            success = sum(1 for r in results if r["status"] == "ok")
-            print(f"[AI Studio] {vin}: {success}/{len(results)} photos processed")
+            _write_pipeline_job(
+                vin, kind, "error", step="failed", progress=0,
+                message="Photo processing failed; previous studio outputs were preserved.",
+                failed=1,
+            )
+        except sqlite3.Error:
+            pass
+    finally:
+        if stage_dir is not None and stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
-            # Update to review status
-            conn2 = sqlite3.connect(str(DB_PATH))
-            conn2.execute("UPDATE vehicles SET workflow_status='review' WHERE vin=?", (vin,))
-            conn2.commit()
-            conn2.close()
-        except Exception as e:
-            print(f"[AI Studio] Pipeline error for {vin}: {e}")
-            import traceback; traceback.print_exc()
 
-    thread = threading.Thread(target=_run_pipeline, daemon=True)
-    thread.start()
-
+def _queue_photo_studio_job(
+    vin: str,
+    *,
+    background: str,
+    upscale: bool = False,
+    kind: str = "photo_studio",
+    max_photos: int = 72,
+    require_rembg: bool = False,
+) -> dict:
+    """Validate a shared-engine job request and submit it to the bounded worker pool."""
+    if kind not in {"photo_studio", "background_studio"}:
+        raise ValueError("Unknown photo pipeline kind")
+    if require_rembg and not REMBG_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Background replacement requires an explicitly selected, operator-approved model; no photos were changed.",
+        )
+    if background != "none" and background_asset_path(background) is None:
+        raise HTTPException(status_code=400, detail="Unknown packaged background")
+    exterior_dir = _ensure_safe_vehicle_subdir(vin, "exterior")
+    photo_count = _count_matching_files(exterior_dir, (".jpg", ".jpeg", ".png", ".webp"))
+    if not photo_count:
+        raise HTTPException(status_code=400, detail="No supported exterior photos found")
+    if photo_count > 72:
+        raise HTTPException(status_code=413, detail="Photo Studio is limited to 72 photos per vehicle job")
+    total = min(photo_count, max_photos)
+    _write_pipeline_job(
+        vin, kind, "queued", step="queued", progress=0, total=total,
+        message="Photo processing is queued.",
+    )
+    submission = _submit_background_job(
+        f"{kind}:{vin}", _run_photo_studio_job,
+        vin, background, upscale, kind, max_photos, require_rembg,
+    )
+    if submission == "busy":
+        _write_pipeline_job(
+            vin, kind, "error", step="queued", progress=0, total=total,
+            message="Background processing capacity is full; retry in a moment.",
+        )
+        raise HTTPException(
+            status_code=429, detail="Background processing capacity is full",
+            headers={"Retry-After": "30"},
+        )
     return {
-        "status": "processing",
+        "status": submission,
         "vin": vin,
-        "message": f"AI photo studio processing {len(list(exterior_dir.glob('*.jpg')))} photos",
+        "job_kind": kind,
+        "photo_count": total,
         "background": background,
-        "upscale": do_upscale,
+        "upscale": upscale,
+        "status_url": f"/api/studio/vehicles/{vin}/jobs",
     }
 
 
+@app.post("/api/vehicle/{vin}/process-photos")
+async def process_vehicle_photos(vin: str, request: Request):
+    """
+    Run the shared PhotoProcessor: optional cut-out, packaged backdrop, enhancement,
+    heuristic plate-blur attempt, and optional ComfyUI upscale. Missing rembg is
+    explicitly reported as a degraded result, not successful background removal.
+    """
+    vin = validate_vehicle_id(vin)
+    await run_in_threadpool(_require_vehicle_owner, request, vin)
+    vehicle = await run_in_threadpool(db_get_vehicle, vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    body = await _read_json_object_limited(request, 4096)
+    background = str(body.get("background", "studio_white")).strip()
+    do_upscale = body.get("upscale", False)
+    if not isinstance(do_upscale, bool):
+        raise HTTPException(status_code=400, detail="upscale must be a boolean")
+    if not re.fullmatch(r"[a-z0-9_-]{1,64}", background):
+        raise HTTPException(status_code=400, detail="Invalid background name")
+
+    return await run_in_threadpool(
+        _queue_photo_studio_job, vin,
+        background=background, upscale=do_upscale,
+        kind="photo_studio", max_photos=72, require_rembg=False,
+    )
+
+
 @app.get("/api/vehicle/{vin}/studio-photos")
-async def get_studio_photos(vin: str):
-    """Get list of AI-processed studio photos for a vehicle."""
-    studio_dir = STORAGE_DIR / vin / "studio"
-    if not studio_dir.exists():
+def get_studio_photos(vin: str, request: Request):
+    """Get studio derivatives only for an active vehicle the requester owns."""
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    try:
+        studio_dir = _ensure_safe_vehicle_subdir(vin, "studio")
+    except HTTPException:
         return {"photos": [], "count": 0}
-    photos = sorted(studio_dir.glob("*.jpg"))
+    try:
+        with os.scandir(studio_dir) as entries:
+            photos = heapq.nsmallest(
+                72,
+                (entry.name for entry in entries
+                 if not entry.is_symlink() and entry.is_file(follow_symlinks=False)
+                 and entry.name.startswith("studio_") and entry.name.endswith(".jpg")),
+            )
+    except OSError:
+        photos = []
     return {
-        "photos": [f"/storage/{vin}/studio/{p.name}" for p in photos],
+        "photos": [f"/storage/{vin}/studio/{filename}" for filename in photos],
         "count": len(photos),
     }
 
 
 @app.get("/api/ai-studio/backgrounds")
-async def list_studio_backgrounds():
-    """List available AI studio backgrounds."""
-    bg_dir = BASE_DIR / "ai_studio" / "backgrounds"
-    if not bg_dir.exists():
-        return {"backgrounds": []}
-    bgs = []
-    for f in sorted(bg_dir.glob("*.jpg")):
-        name = f.stem.replace("_", " ").title()
-        bgs.append({"slug": f.stem, "name": name, "path": f"/ai-studio-bg/{f.name}"})
-    return {"backgrounds": bgs}
+def list_studio_backgrounds():
+    """Expose the same packaged asset catalog used by the 360 renderer."""
+    backgrounds = [
+        {**asset, "path": asset["url"] or asset["thumbnail_url"]}
+        for asset in list_background_assets()
+    ]
+    return {"backgrounds": backgrounds, "count": len(backgrounds)}
 
 
 # Serve studio photos
@@ -6531,10 +9044,35 @@ if _AI_STUDIO_BG_DIR.exists():
 # =============================================================================
 # ROUTES — AI COMMERCIAL
 # =============================================================================
-COMFY_HOST = "http://127.0.0.1:8188"
+COMFY_HOST = (os.getenv("COMFYUI_URL") or "http://127.0.0.1:8188").rstrip("/")
+
+
+def _comfyui_is_available() -> bool:
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"{COMFY_HOST}/system_stats", timeout=2) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
+@app.get("/api/comfyui/status")
+async def comfyui_status(request: Request):
+    """Probe ComfyUI server-side and report owner-configured scene workflow state."""
+    from ai_studio.background_studio import comfyui_scene_workflow_configured
+
+    await run_in_threadpool(_authenticated_user_email, request)
+    available = await run_in_threadpool(_comfyui_is_available)
+    workflow_configured = await run_in_threadpool(comfyui_scene_workflow_configured)
+    return {
+        "available": available,
+        "scene_workflow_configured": workflow_configured,
+        "scene_generation_available": available and workflow_configured,
+    }
+
 
 @app.get("/ai-commercial")
-async def ai_commercial_page():
+def ai_commercial_page():
     html = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6617,10 +9155,10 @@ async def ai_commercial_page():
         
         <div class="card">
             <h2>🔧 ComfyUI Integration</h2>
-            <p style="color:#8b949e;margin-bottom:1rem;">This feature uses your local ComfyUI installation to generate videos.</p>
+            <p style="color:#8b949e;margin-bottom:1rem;">Video generation runs through the server-configured ComfyUI service; this page never connects to localhost directly.</p>
             <pre>ComfyUI Status: <span id="comfyStatus">Checking...</span></pre>
             <p style="color:#8b949e;margin-top:1rem;font-size:0.9rem;">
-                Make sure ComfyUI is running at <code>http://127.0.0.1:8188</code>
+                Configure the server-side <code>COMFYUI_URL</code> and <code>COMFYUI_PYTHON</code> settings.
             </p>
         </div>
         
@@ -6650,56 +9188,94 @@ async def ai_commercial_page():
                 });
             });
         
-        // Check ComfyUI status
-        fetch('http://127.0.0.1:8188/system_stats')
-            .then(() => document.getElementById('comfyStatus').textContent = '✅ Connected')
-            .catch(() => document.getElementById('comfyStatus').textContent = '❌ Not running');
+        // Probe ComfyUI through the authenticated backend proxy (never browser localhost).
+        fetch('/api/comfyui/status')
+            .then(r => r.ok ? r.json() : Promise.reject())
+            .then(data => document.getElementById('comfyStatus').textContent = data.available ? '✅ Connected' : '❌ Not running')
+            .catch(() => document.getElementById('comfyStatus').textContent = '❌ Not configured');
         
-        // Generate form
+        // Generate a tenant-owned job and poll its real server-side status.
         document.getElementById('generateForm').onsubmit = async e => {
             e.preventDefault();
             const btn = document.getElementById('generateBtn');
             const status = document.getElementById('status');
             const preview = document.getElementById('videoPreview');
-            
+            const vin = document.getElementById('vehicleSelect').value;
+            if (!vin) {
+                status.style.display = 'block';
+                status.className = 'status error';
+                status.textContent = 'Select a vehicle first.';
+                return;
+            }
             btn.disabled = true;
-            btn.textContent = 'Generating...';
+            btn.textContent = 'Starting...';
             status.style.display = 'block';
             status.className = 'status pending';
-            status.textContent = 'Connecting to ComfyUI and generating video... This may take a few minutes.';
+            status.textContent = 'Starting commercial generation...';
             preview.style.display = 'none';
-            
             try {
-                const vin = document.getElementById('vehicleSelect').value;
-                const script = document.getElementById('scriptInput').value;
-                const style = document.getElementById('styleSelect').value;
-                
                 const response = await fetch('/api/generate-commercial', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({vin, script, style})
+                    body: JSON.stringify({
+                        vin,
+                        script: document.getElementById('scriptInput').value,
+                        style: document.getElementById('styleSelect').value
+                    })
                 });
-                
                 const result = await response.json();
-                
-                if (result.status === 'ok') {
-                    status.className = 'status ready';
-                    status.textContent = 'Video generated successfully!';
-                    document.getElementById('videoPlayer').src = result.video_url;
-                    document.getElementById('downloadLink').href = result.video_url;
-                    preview.style.display = 'block';
-                } else {
-                    status.className = 'status error';
-                    status.textContent = 'Error: ' + result.error;
+                if (!response.ok) throw new Error(result.detail || result.error || 'Request failed (' + response.status + ')');
+                if (result.status !== 'started' && result.status !== 'already_running') {
+                    throw new Error(result.detail || result.error || 'Commercial job did not start');
                 }
+                await pollCommercial(vin, btn, status, preview);
             } catch (err) {
                 status.className = 'status error';
-                status.textContent = 'Connection failed. Is ComfyUI running?';
+                status.textContent = err.message || 'Commercial request failed.';
+                btn.disabled = false;
+                btn.textContent = 'Generate Commercial';
             }
-            
+        };
+
+        async function pollCommercial(vin, btn, status, preview) {
+            const startedAt = Date.now();
+            while (Date.now() - startedAt < 16 * 60 * 1000) {
+                await new Promise(resolve => setTimeout(resolve, 2500));
+                try {
+                    const response = await fetch('/api/vehicle/' + encodeURIComponent(vin) + '/commercial-status');
+                    const data = await response.json();
+                    if (!response.ok) throw new Error(data.detail || 'Could not read job status');
+                    if (data.status === 'done') {
+                        if (typeof data.url !== 'string' || data.url !== '/storage/' + vin + '/commercial/commercial.mp4') {
+                            throw new Error('Generated video URL is invalid.');
+                        }
+                        status.className = 'status ready';
+                        status.textContent = 'Video generated successfully!' + (data.size_mb ? ' (' + data.size_mb + ' MB)' : '');
+                        document.getElementById('videoPlayer').src = data.url;
+                        document.getElementById('downloadLink').href = data.url;
+                        preview.style.display = 'block';
+                        btn.disabled = false;
+                        btn.textContent = 'Generate Commercial';
+                        return;
+                    }
+                    if (data.status === 'error') throw new Error(data.error || 'Commercial generation failed.');
+                    const progress = Number.isFinite(Number(data.progress)) ? Number(data.progress) : 0;
+                    status.className = 'status pending';
+                    status.textContent = (data.step || 'Generating commercial...') + ' (' + progress + '%)';
+                    btn.textContent = 'Generating ' + progress + '%';
+                } catch (err) {
+                    status.className = 'status error';
+                    status.textContent = err.message || 'Could not read generation status.';
+                    btn.disabled = false;
+                    btn.textContent = 'Generate Commercial';
+                    return;
+                }
+            }
+            status.className = 'status error';
+            status.textContent = 'Generation is taking longer than expected. Check the dashboard for status.';
             btn.disabled = false;
             btn.textContent = 'Generate Commercial';
-        };
+        }
     </script>
 </body>
 </html>"""
@@ -6711,35 +9287,23 @@ async def ai_commercial_page():
 # =============================================================================
 @app.post("/api/generate-commercial")
 async def generate_commercial(request: Request):
-    try:
-        body = await request.json()
-        vin = body.get('vin', '')
-        script = body.get('script', '')
-        style = body.get('style', 'cinematic')
-        
-        if not vin:
-            return {"status": "error", "error": "No vehicle selected"}
-        
-        import urllib.request
-        try:
-            urllib.request.urlopen(f"{COMFY_HOST}/system_stats", timeout=2)
-        except:
-            return {"status": "error", "error": "ComfyUI is not running. Start it first."}
-        
-        return {
-            "status": "ok",
-            "message": "Commercial generation initiated",
-            "video_url": f"/storage/{vin}/commercial.mp4"
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    """Start an authenticated commercial job using the legacy page's form."""
+    body = await _read_json_object_limited(request, 16 * 1024)
+    vin_value = body.get("vin", "")
+    if not isinstance(vin_value, str) or not vin_value.strip():
+        raise HTTPException(status_code=422, detail="Select a vehicle")
+    vin = validate_vehicle_id(vin_value)
+    script, style = _validate_commercial_options(body)
+    return await run_in_threadpool(
+        _start_commercial_generation, vin, request, script, style
+    )
 
 
 # =============================================================================
 # ROUTES — MOBILE CAPTURE (Phase 8)
 # =============================================================================
 @app.get("/capture-mobile")
-async def capture_mobile():
+def capture_mobile():
     html = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7052,29 +9616,41 @@ async def capture_mobile():
         }}
         
         async function uploadAll() {{
-            if (photoFiles.length === 0) {{ alert('Please select photos first'); return; }}
-            const vin = document.getElementById('vinInput').value.trim();
+            if (photoFiles.length < 4) {{ alert('Please select at least 4 photos first.'); return; }}
+            let usedVin = document.getElementById('vinInput').value.trim();
             const btn = document.getElementById('uploadBtn');
             btn.disabled = true;
             btn.textContent = 'Uploading...';
-            
             try {{
-                let usedVin = '';
                 for (let i = 0; i < photoFiles.length; i++) {{
                     const pf = new FormData();
-                    pf.append('vin', vin);
+                    pf.append('vin', usedVin);
                     pf.append('photo', photoFiles[i]);
                     pf.append('index', i.toString());
-                    const r = await fetch('/api/upload/exterior', {{ method: 'POST', body: pf }});
-                    if (r.ok) {{
-                        const data = await r.json();
-                        if (data.vin) usedVin = data.vin;
-                    }}
+                    const response = await fetch('/api/upload/exterior', {{ method: 'POST', body: pf, credentials: 'same-origin' }});
+                    const data = await response.json().catch(() => ({{}}));
+                    if (!response.ok) throw new Error(data.detail || ('Photo upload failed (' + response.status + ')'));
+                    if (data.vin) usedVin = data.vin;
+                    btn.textContent = 'Uploaded ' + (i + 1) + ' of ' + photoFiles.length;
                 }}
-                
-                await fetch('/api/finalize/' + usedVin, {{ method: 'POST' }});
-                btn.textContent = 'Done!';
-                setTimeout(() => window.location.href = '/view/' + usedVin, 500);
+                if (!usedVin) throw new Error('No vehicle identifier was returned by the upload service.');
+                const start = await fetch('/api/finalize/' + encodeURIComponent(usedVin), {{ method: 'POST', credentials: 'same-origin' }});
+                const startData = await start.json().catch(() => ({{}}));
+                if (!start.ok) throw new Error(startData.detail || 'Could not start the 360 renderer');
+                btn.textContent = 'Building 360...';
+                let ready = false;
+                for (let attempt = 0; attempt < 360; attempt++) {{
+                    await new Promise(resolve => setTimeout(resolve, 1500));
+                    const response = await fetch('/api/finalize-status/' + encodeURIComponent(usedVin), {{ credentials: 'same-origin' }});
+                    const status = await response.json().catch(() => ({{}}));
+                    if (!response.ok) throw new Error(status.detail || 'Could not read 360 job status');
+                    if (status.status === 'error') throw new Error(status.message || '360 rendering failed');
+                    if ((status.status === 'completed' || status.status === 'degraded') && status.ready) {{ ready = true; break; }}
+                    btn.textContent = 'Building 360 · ' + (status.progress || 0) + '%';
+                }}
+                if (!ready) throw new Error('The render is still processing. Continue from Dealer Studio.');
+                btn.textContent = 'Ready — review vehicle';
+                setTimeout(() => window.location.href = '/view/' + encodeURIComponent(usedVin), 400);
             }} catch(e) {{
                 alert('Error: ' + e.message);
                 btn.disabled = false;
@@ -7091,7 +9667,16 @@ async def capture_mobile():
 # ROUTES — PRICING PAGE (Phase 7)
 # =============================================================================
 @app.get("/pricing")
-async def pricing_page():
+def pricing_page():
+    if not _pricing_is_approved():
+        return HTMLResponse(
+            "<!doctype html><html lang='en'><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>LotVue360 pricing</title><main style='font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem'>"
+            "<h1>Pricing is being finalized</h1><p>Plans will be published after the offer is confirmed.</p>"
+            "<a href='/'>Return to LotVue360</a></main></html>",
+            status_code=200,
+        )
     html = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7161,7 +9746,7 @@ async def pricing_page():
             
             <div class="plan">
                 <div class="plan-name">Single</div>
-                <div class="plan-price">$2.99</div>
+                <div class="plan-price">__SINGLE_PRICE__</div>
                 <div class="plan-credits">1 vehicle</div>
                 <ul class="plan-features">
                     <li>1 vehicle 360 view</li>
@@ -7173,7 +9758,7 @@ async def pricing_page():
             
             <div class="plan">
                 <div class="plan-name">Starter</div>
-                <div class="plan-price">$19.99</div>
+                <div class="plan-price">__STARTER_PRICE__</div>
                 <div class="plan-credits">10 vehicles</div>
                 <ul class="plan-features">
                     <li>10 vehicle 360 views</li>
@@ -7187,7 +9772,7 @@ async def pricing_page():
             <div class="plan featured">
                 <div class="plan-badge">MOST POPULAR</div>
                 <div class="plan-name">Dealership</div>
-                <div class="plan-price">$75<span>/mo</span></div>
+                <div class="plan-price">__DEALERSHIP_PRICE__<span>/mo</span></div>
                 <div class="plan-credits">Unlimited vehicles</div>
                 <ul class="plan-features">
                     <li>Unlimited vehicles</li>
@@ -7245,6 +9830,13 @@ async def pricing_page():
     </script>
 </body>
 </html>"""
+    for placeholder, plan_id in (
+        ("__SINGLE_PRICE__", "single"),
+        ("__STARTER_PRICE__", "starter"),
+        ("__DEALERSHIP_PRICE__", "dealership"),
+    ):
+        amount = float(PLANS[plan_id]["price"])
+        html = html.replace(placeholder, f"${amount:,.2f}")
     return HTMLResponse(html)
 
 
@@ -7252,7 +9844,7 @@ async def pricing_page():
 # ROUTES — AUTH PAGES (Phase 7)
 # =============================================================================
 @app.get("/register")
-async def register_page():
+def register_page():
     html = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7296,7 +9888,7 @@ async def register_page():
             </div>
             <div class="fg">
                 <label>Password</label>
-                <input type="password" name="password" required placeholder="Create a password">
+                <input type="password" name="password" required minlength="12" maxlength="1024" autocomplete="new-password" placeholder="At least 12 characters">
             </div>
             <button type="submit" class="btn">Create Account</button>
         </form>
@@ -7331,7 +9923,7 @@ async def register_page():
 
 
 @app.get("/login")
-async def login_page():
+def login_page():
     html = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7451,30 +10043,53 @@ if os.environ.get("LOTVUE_SEED_DEMO", "0") == "1":
 # =============================================================================
 
 @app.post("/api/leads/submit")
-async def submit_lead(request: Request):
-    """Submit a new lead and auto-score + schedule follow-ups."""
+async def submit_public_lead(request: Request):
+    """Submit a bounded public inquiry; only its vehicle's dealer receives dealer data."""
     from ai_studio.lead_engine import score_lead, generate_lead_response, schedule_follow_up_sequence, build_digital_dossier
-    body = await request.json()
-    name = body.get("name", "")
-    email = body.get("email", "")
-    phone = body.get("phone", "")
-    vin = body.get("vin", "")
-    message = body.get("message", "")
-    source = body.get("source", "website")
-    wants_test_drive = body.get("wants_test_drive", 0)
-    wants_video = body.get("wants_video", 0)
-
+    _check_public_lead_rate(request)
+    raw_body = await _read_limited_body(request, 8192)
+    try:
+        body = json.loads(raw_body or b"{}")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
+    name = re.sub(r"[\x00-\x1f\x7f]", "", str(body.get("name", "")))[:120].strip()
+    email = re.sub(r"[\x00-\x1f\x7f]", "", str(body.get("email", "")))[:254].strip().lower()
+    phone = re.sub(r"[\x00-\x1f\x7f]", "", str(body.get("phone", "")))[:40].strip()
+    vin = validate_vehicle_id(str(body.get("vin", ""))) if body.get("vin") else ""
+    message = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str(body.get("message", "")))[:2000].strip()
+    source = str(body.get("source", "website"))[:32].strip().lower()
+    wants_test_drive = int(bool(body.get("wants_test_drive", 0)))
+    wants_video = int(bool(body.get("wants_video", 0)))
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
     if not email and not phone:
         raise HTTPException(status_code=400, detail="Email or phone required")
+    if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=400, detail="Enter a valid email address")
+    vehicle = await run_in_threadpool(db_get_vehicle, vin) if vin else None
+    if vin and (not vehicle or vehicle.get("status") != "active"):
+        raise HTTPException(status_code=404, detail="Vehicle not found")
 
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.execute("""
-        INSERT INTO leads (vin, name, email, phone, message, source, wants_test_drive, wants_video)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (vin, name, email, phone, message, source, wants_test_drive, wants_video))
-    lead_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    source = source if source in {"website", "viewer", "vdp", "embed", "widget"} else "website"
+    dealer_id = 0
+    tenant_email = str((vehicle or {}).get("user_email", "") or "").strip().lower()
+    dealer = await run_in_threadpool(db_get_dealer_by_email, tenant_email) if tenant_email else None
+    if dealer:
+        dealer_id = int(dealer["id"])
+    lead_id = await run_in_threadpool(
+        _insert_public_lead,
+        dealer_id,
+        vin,
+        name,
+        email,
+        phone,
+        message,
+        source,
+        wants_test_drive,
+        wants_video,
+    )
 
     lead = {
         "id": lead_id, "name": name, "email": email, "phone": phone,
@@ -7483,32 +10098,30 @@ async def submit_lead(request: Request):
     }
 
     # Auto-score
-    vehicle = db_get_vehicle(vin) if vin else None
+    vehicle = await run_in_threadpool(db_get_vehicle, vin) if vin else None
     scoring = score_lead(lead, vehicle)
 
-    # Auto-generate response
-    response_msg = generate_lead_response(lead, vehicle)
+    # Local LLM / SMTP model calls are synchronous; keep them off the ASGI loop.
+    response_msg = await run_in_threadpool(generate_lead_response, lead, vehicle)
 
     # Schedule follow-up sequence
-    follow_ups = schedule_follow_up_sequence(lead_id, scoring["grade"])
+    follow_ups = await run_in_threadpool(
+        schedule_follow_up_sequence, lead_id, scoring["grade"]
+    )
 
     # Build digital dossier if vehicle exists
     dossier = None
     if vehicle:
-        dossier = build_digital_dossier(lead, vehicle)
+        dossier = await run_in_threadpool(build_digital_dossier, lead, vehicle)
 
-    # dealer intel (scoring, dossier, auto-response) only goes back to a
-    # signed-in caller — an anonymous buyer just gets a confirmation
+    # Dealer-only intelligence goes back only to the actual vehicle tenant.
     is_dealer = False
-    try:
-        from auth_gate import _bearer_or_cookie
-        from a2_extensions import _jwt_secret, JWT_ALG
-        from jose import jwt as _jwt
-        tok = _bearer_or_cookie(request)
-        if tok:
-            is_dealer = _jwt.decode(tok, _jwt_secret(), algorithms=[JWT_ALG]).get("type") == "access"
-    except Exception:
-        is_dealer = False
+    if vin:
+        try:
+            await run_in_threadpool(_require_vehicle_owner, request, vin)
+            is_dealer = True
+        except HTTPException:
+            is_dealer = False
     if not is_dealer:
         return {"status": "ok", "lead_id": lead_id, "message": "Thanks — the dealer will reach out shortly."}
     return {
@@ -7521,25 +10134,8 @@ async def submit_lead(request: Request):
     }
 
 
-@app.get("/api/leads")
-async def list_leads(status: str = None, limit: int = 50):
-    """List all leads with optional status filter."""
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    query = "SELECT * FROM leads WHERE 1=1"
-    params = []
-    if status:
-        query += " AND status=?"
-        params.append(status)
-    query += " ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
-    return {"status": "ok", "leads": [dict(r) for r in rows], "count": len(rows)}
-
-
 @app.get("/api/leads/{lead_id}")
-async def get_lead_detail(lead_id: int):
+def get_lead_detail(lead_id: int, request: Request):
     """Get full lead detail with scoring and follow-up history."""
     from ai_studio.lead_engine import score_lead, build_digital_dossier
     conn = sqlite3.connect(str(DB_PATH))
@@ -7549,6 +10145,11 @@ async def get_lead_detail(lead_id: int):
         conn.close()
         raise HTTPException(status_code=404, detail="Lead not found")
     lead = dict(lead)
+    try:
+        _require_lead_owner(request, lead)
+    except Exception:
+        conn.close()
+        raise
 
     vehicle = None
     if lead.get("vin"):
@@ -7562,7 +10163,7 @@ async def get_lead_detail(lead_id: int):
     try:
         rows = conn.execute("SELECT * FROM follow_ups WHERE lead_id=? ORDER BY scheduled_for", (lead_id,)).fetchall()
         follow_ups = [dict(r) for r in rows]
-    except:
+    except sqlite3.OperationalError:
         pass
 
     # Get appointments
@@ -7570,7 +10171,7 @@ async def get_lead_detail(lead_id: int):
     try:
         rows = conn.execute("SELECT * FROM appointments WHERE lead_id=? ORDER BY scheduled_at", (lead_id,)).fetchall()
         appointments = [dict(r) for r in rows]
-    except:
+    except sqlite3.OperationalError:
         pass
 
     conn.close()
@@ -7585,7 +10186,7 @@ async def get_lead_detail(lead_id: int):
 
 
 @app.get("/api/leads/{lead_id}/response")
-async def generate_lead_response_endpoint(lead_id: int, response_type: str = "initial"):
+def generate_lead_response_endpoint(lead_id: int, request: Request, response_type: str = "initial"):
     """Generate AI response for a lead (SMS + email)."""
     from ai_studio.lead_engine import generate_lead_response
     conn = sqlite3.connect(str(DB_PATH))
@@ -7595,56 +10196,83 @@ async def generate_lead_response_endpoint(lead_id: int, response_type: str = "in
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     lead = dict(lead)
+    _require_lead_owner(request, lead)
     vehicle = db_get_vehicle(lead.get("vin", "")) if lead.get("vin") else None
     response = generate_lead_response(lead, vehicle, response_type=response_type)
     return {"status": "ok", "response": response}
 
 
 @app.get("/api/lead-analytics")
-async def lead_analytics():
-    """Get lead funnel analytics."""
+def lead_analytics(request: Request):
+    """Get lead funnel analytics for the authenticated tenant."""
     from ai_studio.lead_engine import get_lead_analytics
-    analytics = get_lead_analytics()
+    email = _authenticated_user_email(request)
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    analytics = get_lead_analytics(None if owner_email and email == owner_email else email)
     return {"status": "ok", "analytics": analytics}
 
 
 @app.get("/api/appointments/slots")
-async def available_appointment_slots(days: int = 7):
-    """Get available appointment time slots."""
+def available_appointment_slots(request: Request, days: int = 7):
+    """Get available appointment time slots for the authenticated tenant."""
     from ai_studio.lead_engine import get_available_slots
-    slots = get_available_slots(days_ahead=days)
+    email = _authenticated_user_email(request)
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    days = max(1, min(days, 30))
+    slots = get_available_slots(days_ahead=days, user_email=None if owner_email and email == owner_email else email)
     return {"status": "ok", "slots": slots, "count": len(slots)}
 
 
 @app.post("/api/appointments/book")
 async def book_appointment_endpoint(request: Request):
-    """Book an appointment for a lead."""
+    """Book an appointment only for a lead owned by the signed-in dealer."""
     from ai_studio.lead_engine import book_appointment
-    body = await request.json()
-    lead_id = body.get("lead_id")
-    slot = body.get("datetime")
-    apt_type = body.get("type", "test_drive")
-    notes = body.get("notes", "")
-    if not lead_id or not slot:
+    raw = await _read_limited_body(request, 4096)
+    try:
+        body = json.loads(raw or b"{}")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
+    try:
+        lead_id = int(body.get("lead_id", 0))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Valid lead_id required") from exc
+    slot = str(body.get("datetime", ""))[:64]
+    apt_type = str(body.get("type", "test_drive"))
+    notes = re.sub(r"[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]", "", str(body.get("notes", "")))[:500]
+    if lead_id <= 0 or not slot:
         raise HTTPException(status_code=400, detail="lead_id and datetime required")
-    result = book_appointment(lead_id, slot, apt_type, notes)
+    if apt_type not in {"test_drive", "viewing", "trade_eval", "financing"}:
+        raise HTTPException(status_code=400, detail="Unsupported appointment type")
+    lead = await run_in_threadpool(_read_lead_record, lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    actor_email = await run_in_threadpool(_require_lead_owner, request, lead)
+    result = await run_in_threadpool(
+        book_appointment, lead_id, slot, apt_type, notes, user_email=actor_email
+    )
     if "error" in result:
-        raise HTTPException(status_code=404, detail=result["error"])
+        raise HTTPException(status_code=400, detail=result["error"])
     return {"status": "ok", "appointment": result}
 
 
 @app.get("/api/followup-queue")
-async def follow_up_queue():
-    """Get pending follow-ups ready to send."""
+def follow_up_queue(request: Request):
+    """Get pending follow-ups for the authenticated tenant."""
     from ai_studio.lead_engine import get_follow_up_queue
-    queue = get_follow_up_queue()
+    email = _authenticated_user_email(request)
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    queue = get_follow_up_queue(None if owner_email and email == owner_email else email)
     return {"status": "ok", "queue": queue, "count": len(queue)}
 
 
 @app.get("/api/dossier/{vin}")
-async def get_dossier(vin: str, lead_id: int = None):
-    """Get digital dossier for a vehicle (optionally personalized for a lead)."""
+def get_dossier(vin: str, request: Request, lead_id: int = None):
+    """Get an owned vehicle's dossier, optionally personalized for its own lead."""
     from ai_studio.lead_engine import build_digital_dossier
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
     vehicle = db_get_vehicle(vin)
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
@@ -7656,6 +10284,9 @@ async def get_dossier(vin: str, lead_id: int = None):
         conn.close()
         if row:
             lead = dict(row)
+            if str(lead.get("vin", "") or "").upper() != vin:
+                raise HTTPException(status_code=404, detail="Lead not found")
+            _require_lead_owner(request, lead)
     dossier = build_digital_dossier(lead, vehicle)
     return {"status": "ok", "dossier": dossier}
 
@@ -7667,19 +10298,23 @@ async def get_dossier(vin: str, lead_id: int = None):
 
 @app.post("/api/vehicle/{vin}/video-ad")
 async def generate_video_ad(vin: str, request: Request):
-    """Generate a video ad script for a vehicle."""
+    """Generate a bounded video ad script for an active vehicle the caller owns."""
     from ai_studio.video_ads import generate_video_ad_script
-    vehicle = db_get_vehicle(vin)
-    if not vehicle:
+    vin = validate_vehicle_id(vin)
+    await run_in_threadpool(_require_vehicle_owner, request, vin)
+    vehicle = await run_in_threadpool(db_get_vehicle, vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
         raise HTTPException(status_code=404, detail="Vehicle not found")
-    body = await request.json()
+    body = await _read_json_object_limited(request, 8192)
     ad_type = body.get("type", "listing")
-    script = generate_video_ad_script(vehicle, ad_type=ad_type)
+    if not isinstance(ad_type, str) or ad_type not in {"listing", "social", "personalized"}:
+        raise HTTPException(status_code=422, detail="Unsupported video ad type")
+    script = await run_in_threadpool(generate_video_ad_script, vehicle, ad_type=ad_type)
     return {"status": "ok", "script": script}
 
 
 @app.post("/api/leads/{lead_id}/personalized-video")
-async def personalized_video_response(lead_id: int):
+def personalized_video_response(lead_id: int, request: Request):
     """Generate personalized video response for a lead (Impel AI style)."""
     from ai_studio.video_ads import generate_personalized_response
     conn = sqlite3.connect(str(DB_PATH))
@@ -7689,6 +10324,7 @@ async def personalized_video_response(lead_id: int):
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     lead = dict(lead)
+    _require_lead_owner(request, lead)
     vehicle = db_get_vehicle(lead.get("vin", "")) if lead.get("vin") else None
     if not vehicle:
         raise HTTPException(status_code=404, detail="No vehicle linked to this lead")
@@ -7697,9 +10333,14 @@ async def personalized_video_response(lead_id: int):
 
 
 @app.get("/api/vehicle/{vin}/video-ads")
-async def list_video_ads(vin: str):
-    """List generated video ads for a vehicle."""
+def list_video_ads(vin: str, request: Request):
+    """List generated ads for an active vehicle the caller owns."""
     from ai_studio.video_ads import get_video_ad_status
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     result = get_video_ad_status(vin)
     return {"status": "ok", **result}
 
@@ -7710,51 +10351,140 @@ async def list_video_ads(vin: str):
 # =============================================================================
 
 @app.get("/api/backgrounds/scenes")
-async def list_background_scenes():
+def list_background_scenes():
     """List all available background scenes."""
     from ai_studio.background_studio import list_scenes
     scenes = list_scenes()
     return {"status": "ok", "scenes": scenes}
 
 
-@app.post("/api/vehicle/{vin}/background")
+@app.post("/api/vehicle/{vin}/background/process")
 async def apply_background(vin: str, request: Request):
-    """Apply AI background replacement to all photos for a vehicle."""
-    from ai_studio.background_studio import process_vehicle_photos
-    body = await request.json()
+    """Queue strict scene replacement through the shared PhotoProcessor engine."""
+    from ai_studio.background_studio import PREMIUM_SCENES
+
+    vin = validate_vehicle_id(vin)
+    await run_in_threadpool(_require_vehicle_owner, request, vin)
+    vehicle = await run_in_threadpool(db_get_vehicle, vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    body = await _read_json_object_limited(request, 8192)
     scene_id = body.get("scene", "clean-studio")
-    result = process_vehicle_photos(vin, scene_id)
-    if "error" in result and result.get("processed", 0) == 0:
-        raise HTTPException(status_code=404, detail=result["error"])
-    return {"status": "ok", **result}
+    if not isinstance(scene_id, str) or scene_id not in PREMIUM_SCENES:
+        raise HTTPException(status_code=400, detail="Unknown background scene")
+    background_slug = scene_asset_slug(scene_id)
+    if not background_slug:
+        raise HTTPException(status_code=400, detail="Scene has no packaged background asset")
+    return await run_in_threadpool(
+        _queue_photo_studio_job, vin,
+        background=background_slug, upscale=False,
+        kind="background_studio", max_photos=20, require_rembg=True,
+    )
 
 
 @app.post("/api/photo/remove-background")
 async def remove_bg_endpoint(file: UploadFile = File(...)):
-    """Remove background from a single uploaded photo."""
+    """Remove a background from a bounded upload without trusting its filename."""
     from ai_studio.background_studio import remove_background
+    from rembg_runtime import ModelNotConfiguredError
+    from starlette.background import BackgroundTask
     import tempfile
-    # Save upload
-    tmp = Path(tempfile.mkdtemp()) / file.filename
-    with open(tmp, "wb") as f:
-        content = await file.read()
-        f.write(content)
-    # Process
-    output = remove_background(str(tmp))
-    return FileResponse(output, media_type="image/png", filename="no_background.png")
+
+    raw = await _read_upload_limited(file, MAX_PHOTO_MB * 1024 * 1024)
+    await run_in_threadpool(_verify_uploaded_image, raw, Path(file.filename or "image").name)
+
+    temp_dir = Path(await run_in_threadpool(
+        tempfile.mkdtemp, prefix="lotvue-background-"
+    ))
+    input_path = temp_dir / "input-image"
+    try:
+        await run_in_threadpool(input_path.write_bytes, raw)
+        del raw
+        output = await run_in_threadpool(remove_background, str(input_path))
+    except (ModuleNotFoundError, ModelNotConfiguredError) as exc:
+        await run_in_threadpool(shutil.rmtree, temp_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=503,
+            detail="No explicitly approved background-removal model is configured",
+        ) from exc
+    except Exception as exc:
+        await run_in_threadpool(shutil.rmtree, temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=422, detail="Could not remove this image background") from exc
+    return FileResponse(
+        output,
+        media_type="image/png",
+        filename="no_background.png",
+        background=BackgroundTask(shutil.rmtree, temp_dir, ignore_errors=True),
+    )
 
 
 @app.post("/api/photo/composite")
 async def composite_endpoint(request: Request):
-    """Composite a no-background photo onto a scene."""
-    from ai_studio.background_studio import composite_on_scene
-    body = await request.json()
-    vehicle_png = body.get("image_path")
+    """Run an explicit local composite or configured ComfyUI scene workflow."""
+    from ai_studio.background_studio import (
+        PREMIUM_SCENES,
+        ComfyUIWorkflowConfigurationError,
+        composite_on_scene,
+        generate_scene_with_comfyui,
+    )
+
+    body = await _read_json_object_limited(request, 8192)
+    image_ref = body.get("image_path")
     scene_id = body.get("scene", "clean-studio")
-    if not vehicle_png:
+    engine = body.get("engine", "local")
+    if not isinstance(image_ref, str) or not image_ref or len(image_ref) > 2048:
         raise HTTPException(status_code=400, detail="image_path required")
-    result = composite_on_scene(vehicle_png, scene_id)
-    return {"status": "ok", "output": result}
+    if not isinstance(scene_id, str) or scene_id not in PREMIUM_SCENES:
+        raise HTTPException(status_code=400, detail="Unknown background scene")
+    if not isinstance(engine, str) or engine not in {"local", "comfyui"}:
+        raise HTTPException(status_code=400, detail="engine must be 'local' or 'comfyui'")
+
+    vin, image_path = await run_in_threadpool(_resolve_vehicle_image_ref, image_ref)
+    await run_in_threadpool(_require_vehicle_owner, request, vin)
+    output_dir = await run_in_threadpool(
+        _ensure_safe_vehicle_subdir, vin, "studio", create=True
+    )
+    output_suffix = "_comfyui" if engine == "comfyui" else ""
+    output_path = output_dir / f"{image_path.stem}_{scene_id}{output_suffix}.jpg"
+    renderer = generate_scene_with_comfyui if engine == "comfyui" else composite_on_scene
+    scene_slot_acquired = False
+    if engine == "comfyui":
+        scene_slot_acquired = _COMFYUI_SCENE_JOB_SLOTS.acquire(blocking=False)
+        if not scene_slot_acquired:
+            raise HTTPException(
+                status_code=429,
+                detail="ComfyUI scene-generation capacity is full; retry later.",
+                headers={"Retry-After": "30"},
+            )
+    try:
+        await run_in_threadpool(renderer, str(image_path), scene_id, str(output_path))
+    except ComfyUIWorkflowConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="ComfyUI scene generation timed out; no generated output was published.",
+        ) from exc
+    except (RuntimeError, OSError) as exc:
+        if engine == "comfyui":
+            raise HTTPException(
+                status_code=503,
+                detail="ComfyUI scene generation failed; no generated output was published.",
+            ) from exc
+        raise HTTPException(status_code=422, detail="Could not composite this image") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Could not process this image") from exc
+    finally:
+        if scene_slot_acquired:
+            _COMFYUI_SCENE_JOB_SLOTS.release()
+
+    return {
+        "status": "ok",
+        "engine": "comfyui_workflow" if engine == "comfyui" else "local_image_composite",
+        "ai_generated": engine == "comfyui",
+        "review_required": engine == "comfyui",
+        "output": f"/storage/{vin}/studio/{output_path.name}",
+    }
 
 
 # =============================================================================
@@ -7763,8 +10493,14 @@ async def composite_endpoint(request: Request):
 # =============================================================================
 
 @app.get("/api/reviews")
-async def list_reviews(platform: str = None, status: str = None, limit: int = 50):
-    """List reviews with optional filtering."""
+def list_reviews(request: Request, platform: str = None, status: str = None, limit: int = 50):
+    """List the platform-wide reputation record for its configured owner."""
+    _require_platform_owner(request)
+    if platform is not None and len(platform) > 40:
+        raise HTTPException(status_code=400, detail="Platform filter is too long")
+    if status is not None and len(status) > 40:
+        raise HTTPException(status_code=400, detail="Status filter is too long")
+    limit = max(1, min(int(limit), 200))
     from ai_studio.reputation_manager import get_reviews
     reviews = get_reviews(platform, status, limit)
     return {"status": "ok", "reviews": reviews, "count": len(reviews)}
@@ -7772,35 +10508,62 @@ async def list_reviews(platform: str = None, status: str = None, limit: int = 50
 
 @app.post("/api/reviews")
 async def add_review_endpoint(request: Request):
-    """Add a review and get auto-generated response."""
+    """Add a bounded review and get an auto-generated response."""
+    await run_in_threadpool(_require_platform_owner, request)
+    raw = await _read_limited_body(request, 16 * 1024)
+    try:
+        body = json.loads(raw or b"{}")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
     from ai_studio.reputation_manager import add_review
-    body = await request.json()
-    platform = body.get("platform", "google")
-    reviewer = body.get("reviewer_name", "Customer")
-    rating = body.get("rating", 5)
-    text = body.get("review_text", "")
-    result = add_review(platform, reviewer, rating, text)
+    platform = str(body.get("platform", "google")).strip().lower()
+    if platform not in {"google", "facebook", "yelp", "dealer_rater", "cars.com", "edmunds", "other"}:
+        raise HTTPException(status_code=400, detail="Unsupported review platform")
+    reviewer = "".join(ch for ch in str(body.get("reviewer_name", "Customer")) if ord(ch) >= 32 and ord(ch) != 127)[:120].strip()
+    try:
+        rating = int(body.get("rating", 5))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Rating must be an integer from 1 to 5") from exc
+    text = "".join(ch for ch in str(body.get("review_text", "")) if ord(ch) in (9, 10, 13) or ord(ch) >= 32 and ord(ch) != 127)[:5000]
+    if not reviewer or not 1 <= rating <= 5 or len(text) > 5000:
+        raise HTTPException(status_code=400, detail="Invalid reviewer, rating, or review length")
+    result = await run_in_threadpool(add_review, platform, reviewer, rating, text)
     return {"status": "ok", **result}
 
 
 @app.post("/api/reviews/{review_id}/respond")
 async def respond_review(review_id: int, request: Request):
-    """Save a response to a review."""
+    """Save a bounded response to a review."""
+    await run_in_threadpool(_require_platform_owner, request)
+    raw = await _read_limited_body(request, 8192)
+    try:
+        body = json.loads(raw or b"{}")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
     from ai_studio.reputation_manager import respond_to_review
-    body = await request.json()
-    response_text = body.get("response", "")
-    if not response_text:
-        raise HTTPException(status_code=400, detail="response text required")
-    result = respond_to_review(review_id, response_text)
+    response_text = "".join(ch for ch in str(body.get("response", "")) if ord(ch) in (9, 10, 13) or ord(ch) >= 32 and ord(ch) != 127).strip()[:4000]
+    if not response_text or len(response_text) > 4000 or review_id < 1:
+        raise HTTPException(status_code=400, detail="Response text is required and must be at most 4,000 characters")
+    result = await run_in_threadpool(respond_to_review, review_id, response_text)
+    if result.get("error"):
+        raise HTTPException(status_code=404, detail=result["error"])
     return {"status": "ok", **result}
 
 
 @app.get("/api/reviews/{review_id}/generate-response")
-async def generate_review_response(review_id: int):
+def generate_review_response(review_id: int, request: Request):
     """Auto-generate an AI response for a review."""
+    _require_platform_owner(request)
+    if review_id < 1:
+        raise HTTPException(status_code=400, detail="Invalid review id")
     from ai_studio.reputation_manager import generate_review_response as gen_resp
     # reviews live in lotvue.db (reputation_manager's DB), not vehicles.db
-    conn = sqlite3.connect(str(BASE_DIR / "lotvue.db"))
+    from ai_studio.reputation_manager import DB_PATH as REVIEW_DB_PATH
+    conn = sqlite3.connect(str(REVIEW_DB_PATH))
     conn.row_factory = sqlite3.Row
     row = conn.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
     conn.close()
@@ -7812,8 +10575,9 @@ async def generate_review_response(review_id: int):
 
 
 @app.get("/api/reputation/dashboard")
-async def reputation_dashboard():
-    """Get reputation analytics dashboard data."""
+def reputation_dashboard(request: Request):
+    """Get platform-wide reputation analytics for the configured owner."""
+    _require_platform_owner(request)
     from ai_studio.reputation_manager import get_reputation_dashboard
     dashboard = get_reputation_dashboard()
     return {"status": "ok", "dashboard": dashboard}
@@ -7831,13 +10595,17 @@ app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")
 # Trains on the GPU workstation (Brush + COLMAP); buyers view the .ply in-browser.
 # =============================================================================
 @app.get("/splat3d/{vin}")
-async def splat3d_viewer(vin: str):
+def splat3d_viewer(vin: str):
     from fastapi.responses import RedirectResponse
-    return RedirectResponse(f"/static/splat_viewer.html?vin={vin.upper()}")
+    vin = validate_vehicle_id(vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    return RedirectResponse(f"/static/splat_viewer.html?vin={quote(vin, safe='')}")
 
 
 @app.get("/3d-studio")
-async def studio_3d_page():
+def studio_3d_page():
     from fastapi.responses import HTMLResponse
     html = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -8014,17 +10782,23 @@ async function poll(){
 
 
 @app.get("/api/vehicle/{vin}/3d-status")
-async def vehicle_3d_status(vin: str):
-    # sanitize to a safe folder name (no path traversal) — same rule as generate-3d
-    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
+def vehicle_3d_status(vin: str, request: Request):
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
+    vehicle = db_get_vehicle(vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     sp = STORAGE_DIR / vin / "splat"
     data = {}
     st = sp / "status.json"
-    if st.exists():
+    if st.is_file():
         try:
-            data = json.loads(st.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
+            if st.stat().st_size > 64 * 1024:
+                raise ValueError("Status file too large")
+            parsed = json.loads(st.read_text(encoding="utf-8"))
+            data = parsed if isinstance(parsed, dict) else {}
+        except (OSError, ValueError, TypeError):
+            data = {"status": "error", "error": "3D job status is unavailable"}
     data["ready"] = (sp / "scene.ply").exists()
     if data["ready"]:
         data.setdefault("url", f"/storage/{vin}/splat/scene.ply")
@@ -8035,7 +10809,7 @@ async def vehicle_3d_status(vin: str):
 
 
 @app.post("/api/vehicle/{vin}/generate-3d")
-async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
+async def generate_3d(request: Request, vin: str, video: Optional[UploadFile] = File(None),
                       photos: Optional[List[UploadFile]] = File(None),
                       steps: str = Form("7000"),
                       style: str = Form("natural"),
@@ -8043,18 +10817,21 @@ async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
                       force: str = Form("")):  # "1" bypasses the capture quality gate
     from validate_video import validate_dir as _gate_dir, \
         validate_video_file as _gate_video, gate_summary as _gate_sum
-    # Accept any vehicle ID (real VIN or freeform) — sanitize to a safe folder name.
-    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
-    if not vin:
-        raise HTTPException(status_code=400, detail="Provide a vehicle VIN or ID")
+    vin = validate_vehicle_id(vin)
+    await run_in_threadpool(_require_vehicle_owner, request, vin)
+    vehicle = await run_in_threadpool(db_get_vehicle, vin)
+    if not vehicle or vehicle.get("status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     style = (style or "natural").strip().lower()
-    if style not in ("natural", "studio", "branded"):
-        style = "natural"
+    if style not in {"natural", "studio", "branded"}:
+        raise HTTPException(status_code=422, detail="Unsupported 3D render style")
     backdrop = (backdrop or "light").strip().lower()
     if backdrop not in ("light", "white", "silver", "warm", "blue"):
         backdrop = "light"
-    vdir = STORAGE_DIR / vin
-    (vdir / "splat").mkdir(parents=True, exist_ok=True)
+    vdir = await run_in_threadpool(_safe_vehicle_directory, vin)
+    await run_in_threadpool(_ensure_safe_vehicle_subdir, vin, "splat", create=True)
+    if _background_job_running(f"gaussian3d:{vin}"):
+        return JSONResponse({"error": "A 3D reconstruction is already running for this vehicle"}, status_code=409)
     try:
         steps_i = max(2000, min(int(steps), 30000))
     except ValueError:
@@ -8064,47 +10841,58 @@ async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
     # and auto-upgrade to true 3D when the capture supports it.
     real_photos = [p for p in (photos or []) if getattr(p, "filename", "")]
     if real_photos:
-        pdir = vdir / "_3dphotos"
-        if pdir.exists():
-            shutil.rmtree(pdir, ignore_errors=True)
-        pdir.mkdir(parents=True, exist_ok=True)
+        if len(real_photos) < 4:
+            raise HTTPException(status_code=400, detail="Upload at least 4 photos.")
+        if len(real_photos) > 72:
+            raise HTTPException(status_code=413, detail="Upload no more than 72 photos per 3D job")
+        import tempfile
+        pdir = await run_in_threadpool(
+            _ensure_safe_vehicle_subdir, vin, "_3dphotos", create=True
+        )
+        # Build and validate beside the live directory, then atomically swap it.
+        # A rejected retry must not erase the last usable capture set.
+        stage_dir = Path(await run_in_threadpool(
+            tempfile.mkdtemp, prefix=".3dphotos-stage-", dir=vdir
+        ))
         saved = 0
-        for i, p in enumerate(real_photos):
-            data = await p.read()
-            if not data or len(data) > MAX_PHOTO_MB * 1024 * 1024:
-                continue
-            try:  # convert ANY format (incl. HEIC/webp) to jpg
-                img = Image.open(io.BytesIO(data)).convert("RGB")
-                img.save(pdir / f"p_{i+1:04d}.jpg", "JPEG", quality=92)
-                saved += 1
-            except Exception:
-                continue
-        if saved < 4:
-            raise HTTPException(status_code=400, detail="Upload at least 4 readable photos.")
-        # ── P0 QUALITY GATE — the exact input class that caused COLMAP 2/N ────
-        gate = _gate_dir(pdir)
-        if gate["verdict"] == "FAIL" and force != "1":
-            shutil.rmtree(pdir, ignore_errors=True)
-            raise HTTPException(status_code=422, detail={
-                "error": "capture_rejected", "gate": _gate_sum(gate)})
-        if gate["verdict"] == "FAIL":
-            print(f"[gate] FORCED past FAIL for {vin} (photos): {gate['reasons']}")
+        batch_bytes = 0
+        try:
+            for i, photo in enumerate(real_photos):
+                data = await _read_upload_limited(photo, MAX_PHOTO_MB * 1024 * 1024)
+                batch_bytes += len(data)
+                if batch_bytes > MAX_PHOTO_BATCH_MB * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="Photo batch exceeds the total size limit")
+                filename = Path(photo.filename or "photo").name
+                saved_photo = await run_in_threadpool(
+                    _process_3d_photo, data, filename, stage_dir / f"p_{i+1:04d}.jpg"
+                )
+                if saved_photo:
+                    saved += 1
+                del data
+            if saved < 4:
+                raise HTTPException(status_code=400, detail="Upload at least 4 readable photos with a 256px minimum dimension.")
+            # ── P0 QUALITY GATE — the exact input class that caused COLMAP 2/N ────
+            gate = await run_in_threadpool(_gate_dir, stage_dir)
+            if gate["verdict"] == "FAIL" and force != "1":
+                raise HTTPException(status_code=422, detail={
+                    "error": "capture_rejected", "gate": _gate_sum(gate)})
+            if gate["verdict"] == "FAIL":
+                print(f"[gate] FORCED past FAIL for {vin} (photos): {gate['reasons']}")
+            await run_in_threadpool(_replace_directory, stage_dir, pdir)
+        finally:
+            await run_in_threadpool(_remove_directory_if_exists, stage_dir)
         mode_args = ["--images", str(pdir)]
     elif video is not None and getattr(video, "filename", ""):
         walk = vdir / "walkaround.mp4"
-        content = await video.read()
-        if len(content) > MAX_VIDEO_MB * 1024 * 1024 * 6:
-            raise HTTPException(status_code=413, detail="Walkaround video too large")
-        with open(walk, "wb") as f:
-            f.write(content)
+        await _save_upload_limited(video, walk, MAX_VIDEO_MB * 1024 * 1024)
         # ── P0 QUALITY GATE — reject before COLMAP/Brush burn GPU-hours ───────
         try:
-            gate = _gate_video(walk)
+            gate = await run_in_threadpool(_gate_video, walk)
         except Exception as e:
             gate = {"verdict": "FAIL", "reasons": [f"unreadable video: {e}"],
                     "frames": 0, "checks": {}}
         if gate["verdict"] == "FAIL" and force != "1":
-            walk.unlink(missing_ok=True)
+            await run_in_threadpool(_unlink_file, walk)
             raise HTTPException(status_code=422, detail={
                 "error": "capture_rejected", "gate": _gate_sum(gate)})
         if gate["verdict"] == "FAIL":
@@ -8113,12 +10901,23 @@ async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
     else:
         raise HTTPException(status_code=400, detail="Upload a walkaround video or 4+ photos.")
 
-    (vdir / "splat" / "status.json").write_text(
-        json.dumps({"status": "running", "step": "queued", "progress": 1, "vin": vin}), encoding="utf-8")
-    subprocess.Popen(
-        [sys.executable, str(BASE_DIR / "gaussian_3d.py"), "--vin", vin, *mode_args,
-         "--steps", str(steps_i), "--style", style, "--backdrop", backdrop],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(BASE_DIR))
+    await run_in_threadpool(
+        _write_gaussian_status, vin,
+        {"status": "running", "step": "queued", "progress": 1, "vin": vin},
+    )
+    submission = _submit_background_job(
+        f"gaussian3d:{vin}", _run_gaussian_3d_job, vin, mode_args, steps_i, style, backdrop
+    )
+    if submission != "started":
+        await run_in_threadpool(_write_gaussian_status, vin, {
+            "status": "error", "step": "queued", "progress": 0, "vin": vin,
+            "error": "A 3D reconstruction is already running" if submission == "already_running"
+                     else "Background processing capacity is full; retry shortly",
+        })
+        if submission == "already_running":
+            return JSONResponse({"error": "A 3D reconstruction is already running for this vehicle"}, status_code=409)
+        raise HTTPException(status_code=429, detail="Background processing capacity is full",
+                            headers={"Retry-After": "30"})
     return {"status": "started", "vin": vin, "style": style, "backdrop": backdrop,
             "status_url": f"/api/vehicle/{vin}/3d-status", "viewer": f"/splat3d/{vin}",
             "gate": _gate_sum(gate)}
@@ -8126,8 +10925,9 @@ async def generate_3d(vin: str, video: Optional[UploadFile] = File(None),
 
 # ── Dealer branding assets (for the "branded" turntable style) ───────────────
 @app.get("/api/brand/assets")
-async def brand_assets_status():
-    """Report which dealer-branding assets are currently on disk (for the studio UI)."""
+def brand_assets_status(request: Request):
+    """Report platform-wide brand assets to the configured owner only."""
+    _require_platform_owner(request)
     bdir = STORAGE_DIR / "_brand"
     bg = None
     for n in ("background.jpg", "background.jpeg", "background.png"):
@@ -8138,34 +10938,30 @@ async def brand_assets_status():
 
 
 @app.post("/api/brand/assets")
-async def brand_assets_upload(background: Optional[UploadFile] = File(None),
+async def brand_assets_upload(request: Request,
+                              background: Optional[UploadFile] = File(None),
                               logo: Optional[UploadFile] = File(None)):
-    """Save the dealer's backdrop and/or logo used by the 'branded' turntable style.
-    Background is normalized to a JPG; logo keeps transparency as PNG."""
-    bdir = STORAGE_DIR / "_brand"
-    bdir.mkdir(parents=True, exist_ok=True)
+    """Save platform-wide branded turntable assets; only the configured owner may change them."""
+    await run_in_threadpool(_require_platform_owner, request)
+    bdir = await run_in_threadpool(_ensure_brand_storage_dir)
     saved = {}
     if background is not None and getattr(background, "filename", ""):
-        data = await background.read()
-        if len(data) > MAX_PHOTO_MB * 1024 * 1024:
-            raise HTTPException(status_code=413, detail=f"Background too large (max {MAX_PHOTO_MB}MB)")
-        try:
-            img = Image.open(io.BytesIO(data)).convert("RGB")
-        except Exception:
-            raise HTTPException(status_code=400, detail="Background isn't a readable image")
-        for n in ("background.jpg", "background.jpeg", "background.png"):
-            (bdir / n).unlink(missing_ok=True)        # drop stale variants
-        img.save(bdir / "background.jpg", "JPEG", quality=92)
+        data = await _read_upload_limited(background, MAX_PHOTO_MB * 1024 * 1024)
+        await run_in_threadpool(
+            _process_brand_background, data, Path(background.filename or "background").name,
+            bdir / "background.jpg",
+        )
+        for name in ("background.jpeg", "background.png"):
+            await run_in_threadpool(_unlink_file, bdir / name)
+        del data
         saved["background"] = "/storage/_brand/background.jpg"
     if logo is not None and getattr(logo, "filename", ""):
-        data = await logo.read()
-        if len(data) > MAX_PHOTO_MB * 1024 * 1024:
-            raise HTTPException(status_code=413, detail=f"Logo too large (max {MAX_PHOTO_MB}MB)")
-        try:
-            img = Image.open(io.BytesIO(data)).convert("RGBA")   # keep transparency
-        except Exception:
-            raise HTTPException(status_code=400, detail="Logo isn't a readable image")
-        img.save(bdir / "logo.png", "PNG")
+        data = await _read_upload_limited(logo, MAX_PHOTO_MB * 1024 * 1024)
+        await run_in_threadpool(
+            _process_brand_logo, data, Path(logo.filename or "logo").name,
+            bdir / "logo.png",
+        )
+        del data
         saved["logo"] = "/storage/_brand/logo.png"
     if not saved:
         raise HTTPException(status_code=400, detail="Upload a background and/or a logo image")
@@ -8173,8 +10969,11 @@ async def brand_assets_upload(background: Optional[UploadFile] = File(None),
 
 
 @app.post("/api/brand/clear")
-async def brand_assets_clear(target: str = Form("all")):
-    """Remove dealer-branding assets (target = all | background | logo)."""
+def brand_assets_clear(request: Request, target: str = Form("all")):
+    """Remove platform-wide branding assets; only the configured owner may change them."""
+    _require_platform_owner(request)
+    if target not in {"all", "background", "logo"}:
+        raise HTTPException(status_code=400, detail="target must be all, background, or logo")
     bdir = STORAGE_DIR / "_brand"
     targets = ("background", "logo") if target == "all" else (target,)
     removed = []
@@ -8343,13 +11142,16 @@ if(!PANOS.length){ document.getElementById('pins').innerHTML='<div class="empty"
 
 
 @app.get("/interior-studio/{vin}")
-async def interior_studio_page(vin: str):
+def interior_studio_page(vin: str, request: Request):
     from fastapi.responses import HTMLResponse
-    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
+    vin = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, vin)
     pano_dir = STORAGE_DIR / vin / "panoramas"
-    pano_files = sorted([f.name for f in pano_dir.glob("*.jpg")] +
-                        [f.name for f in pano_dir.glob("*.jpeg")] +
-                        [f.name for f in pano_dir.glob("*.png")]) if pano_dir.exists() else []
+    pano_files = sorted(
+        f.name for f in pano_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in {".jpg", ".jpeg", ".png"}
+        and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", f.name)
+    ) if pano_dir.exists() else []
     import json as _json
     panos_js = _json.dumps([{"src": f"/storage/{vin}/panoramas/{f}", "file": f, "name": f"Scene {i+1}"}
                             for i, f in enumerate(pano_files)])
@@ -8390,12 +11192,15 @@ try:
 except Exception as _h_err:
     print(f"[H-Import] dealer importer not loaded: {_h_err}")
 
+from studio_agent import register_studio_agent
+register_studio_agent(app)
+
 
 # =============================================================================
 # LEAD FOLLOW-UP — one-click unsubscribe (public) + opt-in autonomous dispatcher
 # =============================================================================
 @app.get("/api/unsubscribe")
-async def lead_unsubscribe(e: str = "", p: str = ""):
+def lead_unsubscribe(e: str = "", p: str = ""):
     from fastapi.responses import HTMLResponse
     try:
         from ai_studio.lead_engine import record_opt_out
@@ -8409,30 +11214,30 @@ async def lead_unsubscribe(e: str = "", p: str = ""):
         "</body></html>")
 
 
-@app.on_event("startup")
-async def _start_followup_dispatcher():
-    """Autonomous BDC drip sender. DEFAULT OFF — set LOTVUE_AUTO_FOLLOWUP=1 to enable.
-    Polls the follow_ups queue and sends due email/SMS touches (compliant: opt-out +
-    unsubscribe footer). Email needs SMTP, SMS needs Twilio; otherwise it's a no-op."""
+def _start_followup_dispatcher() -> threading.Event | None:
+    """Start the optional autonomous BDC sender and return its shutdown signal."""
     if os.getenv("LOTVUE_AUTO_FOLLOWUP", "0") != "1":
         print("[Follow-up] autonomous dispatcher OFF (set LOTVUE_AUTO_FOLLOWUP=1 to enable)")
-        return
-    import threading, time as _t
+        return None
+
+    stop_event = threading.Event()
+    interval = _bounded_env_int("LOTVUE_FOLLOWUP_INTERVAL_S", 300, 30, 86_400)
 
     def _loop():
         from ai_studio.lead_engine import send_due_follow_ups
-        interval = int(os.getenv("LOTVUE_FOLLOWUP_INTERVAL_S", "300"))
-        while True:
+        while not stop_event.is_set():
             try:
                 summary = send_due_follow_ups()
                 if summary.get("sent") or summary.get("dealer_tasks"):
                     print(f"[Follow-up] dispatch: {summary}")
-            except Exception as ex:
-                print(f"[Follow-up] dispatcher error: {ex}")
-            _t.sleep(interval)
+            except Exception as exc:
+                print(f"[Follow-up] dispatcher error: {type(exc).__name__}: {exc}")
+            if stop_event.wait(interval):
+                break
 
-    threading.Thread(target=_loop, daemon=True).start()
+    threading.Thread(target=_loop, name="lotvue-followups", daemon=True).start()
     print("[Follow-up] autonomous dispatcher ON")
+    return stop_event
 
 
 from auth_gate import install_auth_gate

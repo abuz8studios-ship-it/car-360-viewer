@@ -1,89 +1,91 @@
-"""
-LotVue Pro — Background Removal & Swap
-Uses rembg (already in lotvue conda env) for background removal.
-Composites car on showroom background with proper positioning.
-"""
-import io
-import numpy as np
-from PIL import Image, ImageFilter
-from typing import Tuple, Optional
+"""Photo background cut-out and compositing primitives for the Photo Studio."""
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
+from PIL import Image
 
 
 def remove_background(img: Image.Image) -> Tuple[Image.Image, Optional[Image.Image]]:
+    """Return a rembg cutout and alpha mask, or the original plus ``None``.
+
+    A missing optional dependency is deliberately represented by ``mask=None``.
+    Callers must treat that as an unavailable cut-out, never as a successful
+    transparent image.
     """
-    Remove background from car photo using rembg.
-    Returns (car_isolated_RGBA, mask_L).
-    """
-    try:
-        from rembg import remove
-        # rembg returns RGBA with transparent background
-        result = remove(img)
-        if result.mode != "RGBA":
-            result = result.convert("RGBA")
-        # Extract mask from alpha channel
-        mask = result.split()[3]
-        return result, mask
-    except ImportError:
-        print("[BG Swap] rembg not available, returning original with white bg")
+    from rembg_runtime import is_enabled, remove
+    if not is_enabled():
+        print("[BG Swap] no explicitly approved rembg model is configured")
         return img.convert("RGBA"), None
 
-
-def composite_on_showroom(car_rgba: Image.Image, background_path: str,
-                          position: str = "center-bottom",
-                          car_scale: float = 0.85) -> Image.Image:
-    """
-    Composite the isolated car onto a showroom background.
-
-    Args:
-        car_rgba: Car image with transparent background (RGBA)
-        background_path: Path to background image
-        position: Where to place car — "center-bottom" (default), "center"
-        car_scale: Scale car to this fraction of background width
-
-    Returns:
-        Composited image (RGB)
-    """
-    bg = Image.open(background_path).convert("RGBA")
-
-    # Scale car to fit nicely on background
-    bg_w, bg_h = bg.size
-    car_w, car_h = car_rgba.size
-
-    # Calculate target width
-    target_w = int(bg_w * car_scale)
-    scale_factor = target_w / car_w
-    target_h = int(car_h * scale_factor)
-
-    # Resize car
-    car_resized = car_rgba.resize((target_w, target_h), Image.LANCZOS)
-
-    # Position car on background
-    if position == "center-bottom":
-        x = (bg_w - target_w) // 2
-        y = bg_h - target_h - int(bg_h * 0.05)  # 5% padding from bottom
-    elif position == "center":
-        x = (bg_w - target_w) // 2
-        y = (bg_h - target_h) // 2
-    else:
-        x = (bg_w - target_w) // 2
-        y = bg_h - target_h - int(bg_h * 0.05)
-
-    # Composite
-    bg.paste(car_resized, (x, y), car_resized)
-
-    return bg.convert("RGB")
+    try:
+        result = remove(img)
+    except Exception as exc:
+        print(f"[BG Swap] background removal unavailable: {type(exc).__name__}")
+        return img.convert("RGBA"), None
+    if result.mode != "RGBA":
+        result = result.convert("RGBA")
+    alpha = result.getchannel("A")
+    # A useful cut-out must contain both foreground and background. All-opaque
+    # output retained the photo; all-transparent output lost the vehicle entirely.
+    if alpha.getextrema() in {(0, 0), (255, 255)}:
+        alpha.close()
+        result.close()
+        return img.convert("RGBA"), None
+    return result, alpha
 
 
-def create_gradient_background(width: int = 1920, height: int = 1080,
-                                top_color: tuple = (248, 250, 252),
-                                bottom_color: tuple = (220, 225, 230)) -> Image.Image:
-    """Create a clean gradient background for when no background image is available."""
+def composite_on_showroom(
+    car_rgba: Image.Image,
+    background_path: str,
+    position: str = "center-bottom",
+    car_scale: float = 0.85,
+) -> Image.Image:
+    """Place a transparent vehicle cutout on a packaged showroom background."""
+    if not 0.1 <= float(car_scale) <= 1.0:
+        raise ValueError("car_scale must be between 0.1 and 1.0")
+
+    with Image.open(background_path) as source:
+        background = source.convert("RGBA")
+    try:
+        bg_w, bg_h = background.size
+        car_w, car_h = car_rgba.size
+        target_w = max(1, int(bg_w * car_scale))
+        target_h = max(1, int(bg_h * 0.82))
+        scale = min(target_w / max(car_w, 1), target_h / max(car_h, 1))
+        resized = car_rgba.resize(
+            (max(1, int(car_w * scale)), max(1, int(car_h * scale))),
+            Image.Resampling.LANCZOS,
+        )
+        try:
+            x = max(0, (bg_w - resized.width) // 2)
+            if position == "center":
+                y = max(0, (bg_h - resized.height) // 2)
+            else:
+                y = max(0, bg_h - resized.height - int(bg_h * 0.05))
+            background.alpha_composite(resized, (x, y))
+            return background.convert("RGB")
+        finally:
+            resized.close()
+    finally:
+        background.close()
+
+
+def create_gradient_background(
+    width: int = 1920,
+    height: int = 1080,
+    top_color: tuple = (248, 250, 252),
+    bottom_color: tuple = (220, 225, 230),
+) -> Image.Image:
+    """Create a simple fallback gradient when no scene asset is selected."""
     img = Image.new("RGB", (width, height))
     pixels = img.load()
     for y in range(height):
-        r = int(top_color[0] + (bottom_color[0] - top_color[0]) * y / height)
-        g = int(top_color[1] + (bottom_color[1] - top_color[1]) * y / height)
-        b = int(top_color[2] + (bottom_color[2] - top_color[2]) * y / height)
+        ratio = y / max(height - 1, 1)
+        color = tuple(
+            int(top_color[channel] + (bottom_color[channel] - top_color[channel]) * ratio)
+            for channel in range(3)
+        )
         for x in range(width):
-            pixels[x, y] = (r, g, b)
+            pixels[x, y] = color
     return img

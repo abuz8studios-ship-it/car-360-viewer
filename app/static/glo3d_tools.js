@@ -130,7 +130,7 @@
 
   function openTestDrive() {
     show('<button class="lv-x" onclick="_lvClose()">×</button><h3>Book a Test Drive</h3><p class="sub">Pick a time for ' + TITLE + '.</p><label>Time</label><select id="tds"><option>Loading…</option></select>' + contactFields() + '<button class="lv-go" id="tdgo">Request Test Drive</button>');
-    api('/api/leadmagnet/test-drive-slots').then(function (d) {
+    api('/api/leadmagnet/test-drive-slots?vin=' + encodeURIComponent(VIN)).then(function (d) {
       var sel = document.getElementById('tds'); sel.innerHTML = '';
       (d.slots || []).forEach(function (s) { var o = document.createElement('option'); var lbl = (s.label || s.datetime || s); o.value = (s.datetime || s); o.textContent = lbl; sel.appendChild(o); });
       if (!sel.options.length) { var o = document.createElement('option'); o.textContent = 'Any time — we\'ll confirm'; o.value = 'flexible'; sel.appendChild(o); }

@@ -16,20 +16,20 @@ Usage:
   python gaussian_3d.py --vin VIN --video PATH   [--steps 7000] [--max-frames 150]
   python gaussian_3d.py --vin VIN --images DIR   [--steps 7000]
 """
-import os, sys, json, time, shutil, struct, argparse, subprocess
+import os, sys, json, time, shutil, struct, argparse, subprocess, tempfile
 from pathlib import Path
+
+from app_paths import BASE_DIR, STORAGE_DIR
 
 if sys.platform == "win32":
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-BASE_DIR = Path(__file__).resolve().parent
-STORAGE_DIR = BASE_DIR / "storage"
-FFMPEG = os.environ.get("FFMPEG_PATH", r"E:\ABU\AI\ffmpeg\ffmpeg.exe")
-FFPROBE = os.environ.get("FFPROBE_PATH", r"E:\ABU\AI\ffmpeg\ffprobe.exe")
-COLMAP = os.environ.get("COLMAP_EXE", r"E:\ABU\colmap\bin\colmap.exe")
-BRUSH = os.environ.get("BRUSH_EXE", r"E:\ABU\brush\brush_app.exe")
+FFMPEG = os.getenv("FFMPEG_PATH") or shutil.which("ffmpeg") or "ffmpeg"
+FFPROBE = os.getenv("FFPROBE_PATH") or shutil.which("ffprobe") or "ffprobe"
+COLMAP = os.getenv("COLMAP_EXE") or shutil.which("colmap") or "colmap"
+BRUSH = os.getenv("BRUSH_EXE") or shutil.which("brush") or "brush"
 
 _VIN = "UNKNOWN"
 _STATUS = None
@@ -38,7 +38,9 @@ _STATE = {}
 
 def _write(extra):
     if _STATUS:
-        _STATUS.write_text(json.dumps({**_STATE, **extra, "vin": _VIN}), encoding="utf-8")
+        temp_path = _STATUS.with_suffix(_STATUS.suffix + ".tmp")
+        temp_path.write_text(json.dumps({**_STATE, **extra, "vin": _VIN}), encoding="utf-8")
+        os.replace(temp_path, _STATUS)
 
 
 def set_status(step, progress, **extra):
@@ -62,10 +64,15 @@ def set_error(msg):
 
 def _run(cmd, timeout, label):
     print(f"[3D] $ {label}"); sys.stdout.flush()
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if r.returncode != 0:
-        raise RuntimeError(f"{label} failed (exit {r.returncode}): {(r.stderr or r.stdout or '')[-500:]}")
-    return r
+    # COLMAP/FFmpeg can produce very large logs; spool to disk rather than
+    # retaining all stdout/stderr in the worker's memory.
+    with tempfile.TemporaryFile(mode="w+b") as log:
+        result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
+        if result.returncode != 0:
+            log.seek(max(0, log.seek(0, os.SEEK_END) - 8192))
+            tail = log.read().decode("utf-8", errors="replace")[-500:]
+            raise RuntimeError(f"{label} failed (exit {result.returncode}): {tail}")
+    return result
 
 
 # ── frame gathering ──────────────────────────────────────────────────────────
@@ -483,9 +490,12 @@ def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=854, TARGET_W=0.80, style=
     try:
         import numpy as np
         from PIL import Image, ImageOps, ImageFilter, ImageDraw
-        from rembg import remove, new_session
+        from rembg_runtime import is_enabled, remove, require_session
     except Exception as e:
-        print(f"[3D] stabilize unavailable (rembg): {e}")
+        print(f"[3D] stabilize unavailable (rembg runtime): {type(e).__name__}")
+        return False
+    if not is_enabled():
+        print("[3D] stabilize unavailable: no explicitly approved rembg model is configured")
         return False
     # Per-call style wins; else the install default (env); else natural (Ahmad's pick).
     style = (style or os.environ.get("LOTVUE_SPIN_STYLE", "natural")).lower()
@@ -493,12 +503,11 @@ def _stabilize_frames(sel, out_dir, OUT_W=1280, OUT_H=854, TARGET_W=0.80, style=
         style = "natural"
     cutout = style in ("studio", "branded")   # both cut the car out onto a backdrop
     try:
-        sess = None
-        for m in ("isnet-general-use", "u2net", "u2netp"):
-            try:
-                sess = new_session(m); print(f"[3D] segmentation model: {m}"); break
-            except Exception:
-                continue
+        try:
+            sess = require_session()
+        except Exception as exc:
+            print(f"[3D] selected segmentation model could not load: {type(exc).__name__}")
+            return False
         # ── Pass A: segment every frame, collect car box + per-frame car color means ──
         origs, alphas, bboxes, means = [], [], [], []
         last = None

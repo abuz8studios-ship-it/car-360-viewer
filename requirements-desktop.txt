@@ -1,0 +1,16 @@
+# Self-contained Windows/macOS/Linux desktop release build.
+-r requirements.txt
+
+# Frozen as runtime code only. No checkpoint is selected or downloaded unless
+# an operator configures a model and acknowledges that model's terms.
+rembg[cpu]>=2.0.60,<3
+
+# Static, platform-specific FFmpeg + FFprobe pair copied into app/bin by the build.
+static-ffmpeg>=3,<4
+
+# Native launcher build and tray menu. The macOS binding is an optional tray
+# backend; the local browser workflow remains functional without it.
+pyinstaller>=6.11,<7
+pystray>=0.19,<1
+pyobjc-framework-Cocoa==12.2.2; sys_platform == "darwin"
+curl-cffi>=0.7,<1

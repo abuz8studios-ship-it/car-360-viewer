@@ -11,43 +11,76 @@ Adds the features found missing in the 2026-06-11 parity audit vs LOTVUE360_EXAC
 Wired in from main.py via:  from a2_extensions import register_extensions; register_extensions(app)
 """
 
+import csv
 import io
 import os
-import csv
-import json
-import math
-import zipfile
-import sqlite3
+import re
+import shutil
 import smtplib
-import threading
+import sqlite3
 import subprocess
-from pathlib import Path
-from email.mime.text import MIMEText
+import tempfile
+import threading
+import uuid
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
 from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Header
-from fastapi.responses import Response, FileResponse, StreamingResponse
-from pydantic import BaseModel
+from app_paths import BASE_DIR, DATA_DIR, DB_PATH, STORAGE_DIR
+from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi.responses import FileResponse, Response
 from PIL import Image, ImageDraw, ImageFilter
+from pydantic import BaseModel, Field
+from security import (
+    hash_password,
+    needs_rehash,
+    secure_cookie_for_request,
+    verify_password,
+)
 
-BASE_DIR = Path(__file__).resolve().parent
-STORAGE_DIR = BASE_DIR / "storage"
 STATIC_DIR = BASE_DIR / "static"
-DB_PATH = BASE_DIR / "vehicles.db"
 def _ffmpeg_path():
-    p = os.getenv("LOTVUE_FFMPEG") or os.getenv("FFMPEG_PATH")
-    if p and Path(p).exists():
-        return Path(p)
-    for cand in (BASE_DIR / "bin" / "ffmpeg.exe",
-                 BASE_DIR.parents[1] / "AI" / "ffmpeg" / "ffmpeg.exe"):
-        if cand.exists():
-            return cand
-    return Path("ffmpeg.exe")
+    configured = os.getenv("LOTVUE_FFMPEG") or os.getenv("FFMPEG_PATH")
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if configured_path.is_file():
+            return configured_path
+        located = shutil.which(configured)
+        if located:
+            return Path(located)
+    executable = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    bundled = BASE_DIR / "bin" / executable
+    if bundled.is_file():
+        return bundled
+    legacy = BASE_DIR.parents[1] / "AI" / "ffmpeg" / "ffmpeg.exe"
+    if os.name == "nt" and legacy.is_file():
+        return legacy
+    return Path(shutil.which(executable) or executable)
 
 FFMPEG = _ffmpeg_path()
 
 router = APIRouter()
+_LEAD_NOTIFY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="lotvue-notify")
+_LEAD_NOTIFY_SLOTS = threading.BoundedSemaphore(16)
+
+
+def _submit_lead_notification(target) -> bool:
+    """Keep SMTP/Twilio work off request threads with a bounded queue."""
+    if not _LEAD_NOTIFY_SLOTS.acquire(blocking=False):
+        print("[Lead-Notify] notification queue full; lead remains stored")
+        return False
+    try:
+        future = _LEAD_NOTIFY_EXECUTOR.submit(target)
+    except Exception:
+        _LEAD_NOTIFY_SLOTS.release()
+        return False
+    future.add_done_callback(lambda _future: _LEAD_NOTIFY_SLOTS.release())
+    return True
 
 
 def _db():
@@ -56,36 +89,66 @@ def _db():
     return conn
 
 
+MAX_EXPORT_FRAMES = 72
+MAX_EXPORT_INPUT_BYTES = 512 * 1024 * 1024
+
+
 def _frames_dir(vin: str):
-    """Same resolution order as the viewer: processed spin frames first, then raw exterior."""
-    vdir = STORAGE_DIR / vin.upper()
-    spin = vdir / "spin"
-    if spin.exists() and any(spin.glob("spin_*.jpg")):
-        return spin, sorted(spin.glob("spin_*.jpg"))
-    ext = vdir / "exterior"
-    if ext.exists():
-        return ext, sorted(ext.glob("*.jpg"))
+    """Resolve a bounded set of regular vehicle frames; never follow storage symlinks."""
+    vin = (vin or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{1,32}", vin):
+        return None, []
+    storage_root = STORAGE_DIR.resolve()
+    vdir = STORAGE_DIR / vin
+    if vdir.is_symlink() or vdir.resolve().parent != storage_root or not vdir.is_dir():
+        return None, []
+
+    for subdir, pattern in (("spin", "spin_*.jpg"), ("exterior", "*.jpg")):
+        directory = vdir / subdir
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        resolved_dir = directory.resolve()
+        frames = []
+        for candidate in sorted(directory.glob(pattern)):
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            if (candidate.is_symlink() or resolved.parent != resolved_dir or not resolved.is_file()
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}\.jpg", candidate.name)):
+                continue
+            frames.append(resolved)
+            if len(frames) >= MAX_EXPORT_FRAMES:
+                break
+        if frames:
+            return resolved_dir, frames
     return None, []
 
 
 # =============================================================================
 # 1. LEAD EMAIL NOTIFICATION
 # =============================================================================
+def _tenant_lead_contact(vin: str) -> tuple[str, str]:
+    vin = str(vin or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{1,32}", vin):
+        return "", ""
+    try:
+        conn = _db()
+        row = conn.execute(
+            "SELECT d.email, d.phone FROM vehicles v LEFT JOIN dealers d "
+            "ON LOWER(COALESCE(NULLIF(d.user_email,''),d.email,''))=LOWER(v.user_email) "
+            "WHERE v.vin=? AND v.status='active' ORDER BY d.id LIMIT 1", (vin,)
+        ).fetchone()
+        conn.close()
+        return (str(row["email"] or "").strip(), str(row["phone"] or "").strip()) if row else ("", "")
+    except Exception:
+        return "", ""
+
+
 def notify_lead(lead: dict):
-    """Email the dealer about a new lead. Config via env:
-    LOTVUE_SMTP_HOST / LOTVUE_SMTP_PORT / LOTVUE_SMTP_USER / LOTVUE_SMTP_PASS /
-    LOTVUE_SMTP_FROM / LOTVUE_NOTIFY_EMAIL. No-op (logged) when unconfigured."""
+    """Send lead notices only to the dealer linked to the active vehicle."""
     host = os.getenv("LOTVUE_SMTP_HOST", "")
-    to_addr = os.getenv("LOTVUE_NOTIFY_EMAIL", "")
-    if not to_addr:
-        try:
-            conn = _db()
-            row = conn.execute("SELECT email FROM dealers WHERE email != '' ORDER BY id LIMIT 1").fetchone()
-            conn.close()
-            if row:
-                to_addr = row["email"]
-        except Exception:
-            pass
+    to_addr, _tenant_phone = _tenant_lead_contact(lead.get("vin", ""))
     if not host or not to_addr:
         print(f"[Lead-Notify] SMTP unconfigured (LOTVUE_SMTP_HOST/LOTVUE_NOTIFY_EMAIL) — lead {lead.get('id')} stored, no email sent")
         return False
@@ -118,7 +181,7 @@ def notify_lead(lead: dict):
         except Exception as e:
             print(f"[Lead-Notify] FAILED: {e}")
 
-    threading.Thread(target=_send, daemon=True).start()
+    _submit_lead_notification(_send)
     _notify_lead_sms(lead)
     return True
 
@@ -129,13 +192,15 @@ def _notify_lead_sms(lead: dict):
     sid = os.getenv("TWILIO_ACCOUNT_SID", "")
     token = os.getenv("TWILIO_AUTH_TOKEN", "")
     from_n = os.getenv("TWILIO_FROM_NUMBER", "")
-    to_n = os.getenv("LOTVUE_NOTIFY_SMS", "")
+    _tenant_email, to_n = _tenant_lead_contact(lead.get("vin", ""))
     if not (sid and token and from_n and to_n):
         return False
 
     def _send_sms():
         try:
-            import urllib.request, urllib.parse, base64
+            import base64
+            import urllib.parse
+            import urllib.request
             body = (f"LotVue lead: {lead.get('name','?')} {lead.get('phone','')} "
                     f"re {lead.get('vin','')}"
                     f"{' wants test drive' if lead.get('wants_test_drive') else ''}")
@@ -150,31 +215,67 @@ def _notify_lead_sms(lead: dict):
         except Exception as e:
             print(f"[Lead-SMS] FAILED: {e}")
 
-    threading.Thread(target=_send_sms, daemon=True).start()
-    return True
+    return _submit_lead_notification(_send_sms)
+
+
+def _safe_csv_value(value):
+    """Prefix spreadsheet formulas even when whitespace precedes the operator."""
+    if isinstance(value, str) and value.lstrip(" \t\r\n")[:1] in {"=", "+", "-", "@"}:
+        return "'" + value
+    return value
 
 
 # =============================================================================
 # 2. LEADS CSV EXPORT
 # =============================================================================
 @router.get("/api/leads-export.csv")
-async def export_leads_csv(vin: Optional[str] = None, status: Optional[str] = None):
+def export_leads_csv(request: Request, vin: Optional[str] = None, status: Optional[str] = None):
+    """Export only the authenticated dealer's lead rows, with spreadsheet formula guards."""
+    token = request.headers.get("authorization", "")
+    token = token[7:].strip() if token.lower().startswith("bearer ") else request.cookies.get("lotvue_token", "")
+    try:
+        payload = jwt.decode(token, _jwt_secret(), algorithms=[JWT_ALG])
+    except JWTError as exc:
+        raise HTTPException(401, "Sign in required") from exc
+    email = str(payload.get("sub", "")).strip().lower()
+    if payload.get("type") != "access" or not email:
+        raise HTTPException(401, "Sign in required")
+    if vin and not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", vin.strip()):
+        raise HTTPException(400, "Invalid vehicle identifier")
+    if status and len(status) > 40:
+        raise HTTPException(400, "Status filter is too long")
     conn = _db()
-    q = "SELECT * FROM leads WHERE 1=1"
+    if not conn.execute("SELECT 1 FROM users WHERE LOWER(email)=?", (email,)).fetchone():
+        conn.close()
+        raise HTTPException(401, "User no longer exists")
+    clauses = []
     params = []
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    if not owner_email or email != owner_email:
+        clauses.append("EXISTS (SELECT 1 FROM vehicles v WHERE v.vin=leads.vin AND LOWER(v.user_email)=?)")
+        params.append(email)
     if vin:
-        q += " AND vin=?"; params.append(vin.upper())
+        clauses.append("leads.vin=?")
+        params.append(vin.strip().upper())
     if status:
-        q += " AND status=?"; params.append(status)
-    q += " ORDER BY created_at DESC"
-    rows = conn.execute(q, params).fetchall()
+        clauses.append("leads.status=?")
+        params.append(status)
+    where = " AND ".join(clauses) or "1=1"
+    rows = conn.execute(
+        f"SELECT * FROM leads WHERE {where} ORDER BY created_at DESC, id DESC LIMIT 10000",
+        params,
+    ).fetchall()
     conn.close()
     buf = io.StringIO()
     w = csv.writer(buf)
     cols = ["id", "vin", "name", "email", "phone", "message", "wants_video", "wants_test_drive", "source", "status", "created_at"]
     w.writerow(cols)
-    for r in rows:
-        w.writerow([r[c] if c in r.keys() else "" for c in cols])
+    for row in rows:
+        values = []
+        for col in cols:
+            value = row[col] if col in row.keys() else ""
+            values.append(_safe_csv_value(value))
+        w.writerow(values)
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=lotvue_leads.csv"})
 
@@ -183,7 +284,7 @@ async def export_leads_csv(vin: Optional[str] = None, status: Optional[str] = No
 # 3. EXPORT FORMATS — QR / GIF / MP4 / FRAME / ZIP
 # =============================================================================
 @router.get("/api/vehicle/{vin}/export/formats")
-async def export_formats(vin: str):
+def export_formats(vin: str):
     _, frames = _frames_dir(vin)
     return {
         "vin": vin.upper(), "frame_count": len(frames),
@@ -198,7 +299,7 @@ async def export_formats(vin: str):
 
 
 @router.get("/api/vehicle/{vin}/export/qr.png")
-async def export_qr(vin: str, size: int = 8):
+def export_qr(vin: str, size: int = 8):
     import qrcode
     base = os.getenv("LOTVUE_PUBLIC_URL", "http://127.0.0.1:8001").rstrip("/")
     img = qrcode.make(f"{base}/view/{vin.upper()}", box_size=max(2, min(size, 20)))
@@ -209,55 +310,93 @@ async def export_qr(vin: str, size: int = 8):
 
 
 @router.get("/api/vehicle/{vin}/export/spin.gif")
-async def export_gif(vin: str, width: int = 640, fps: int = 12):
-    fdir, frames = _frames_dir(vin)
+def export_gif(vin: str, width: int = 640, fps: int = 12):
+    """Build a bounded GIF without retaining full-resolution originals in memory."""
+    _frame_dir, frames = _frames_dir(vin)
     if not frames:
         raise HTTPException(404, "No frames for this vehicle")
-    out_dir = STORAGE_DIR / vin.upper() / "exports"
+    width = max(160, min(width, 640))
+    fps = max(1, min(fps, 30))
+    if sum(frame.stat().st_size for frame in frames) > MAX_EXPORT_INPUT_BYTES:
+        raise HTTPException(413, "Frame set is too large to export")
+
+    vin = vin.strip().upper()
+    out_dir = STORAGE_DIR / vin / "exports"
+    if out_dir.is_symlink():
+        raise HTTPException(404, "Export directory is unavailable")
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"spin_{width}_{fps}.gif"
-    newest_frame = max(f.stat().st_mtime for f in frames)
+    newest_frame = max(frame.stat().st_mtime for frame in frames)
     if not out.exists() or out.stat().st_mtime < newest_frame:
-        imgs = []
-        for f in frames:
-            im = Image.open(f).convert("RGB")
-            h = int(im.height * width / im.width)
-            imgs.append(im.resize((width, h)))
-        imgs[0].save(out, save_all=True, append_images=imgs[1:],
-                     duration=int(1000 / max(1, fps)), loop=0, optimize=True)
-    return FileResponse(out, media_type="image/gif", filename=f"{vin.upper()}_spin.gif")
+        temp_out = out_dir / f".spin-{uuid.uuid4().hex}.gif"
+        images = []
+        try:
+            for frame_path in frames:
+                with Image.open(frame_path) as source:
+                    image_width, image_height = source.size
+                    if (image_width <= 0 or image_height <= 0
+                            or image_width * image_height > 40_000_000):
+                        raise HTTPException(413, "A frame exceeds the safe image pixel limit")
+                    source.thumbnail((width, int(width * 1.5)), Image.Resampling.LANCZOS)
+                    images.append(source.convert("RGB"))
+            images[0].save(temp_out, format="GIF", save_all=True, append_images=images[1:],
+                           duration=max(1, int(1000 / fps)), loop=0, optimize=True)
+            os.replace(temp_out, out)
+        finally:
+            for image in images:
+                image.close()
+            temp_out.unlink(missing_ok=True)
+    return FileResponse(out, media_type="image/gif", filename=f"{vin}_spin.gif")
 
 
 @router.get("/api/vehicle/{vin}/export/spin.mp4")
-async def export_mp4(vin: str, fps: int = 12, loops: int = 3):
-    fdir, frames = _frames_dir(vin)
+def export_mp4(vin: str, fps: int = 12, loops: int = 3):
+    """Encode a short bounded spin clip in a worker thread."""
+    _frame_dir, frames = _frames_dir(vin)
     if not frames:
         raise HTTPException(404, "No frames for this vehicle")
     if not FFMPEG.exists():
         raise HTTPException(500, f"ffmpeg not found at {FFMPEG}")
-    out_dir = STORAGE_DIR / vin.upper() / "exports"
+    fps = max(1, min(fps, 30))
+    loops = max(1, min(loops, 5))
+    if sum(frame.stat().st_size for frame in frames) > MAX_EXPORT_INPUT_BYTES:
+        raise HTTPException(413, "Frame set is too large to export")
+
+    vin = vin.strip().upper()
+    out_dir = STORAGE_DIR / vin / "exports"
+    if out_dir.is_symlink():
+        raise HTTPException(404, "Export directory is unavailable")
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"spin_{fps}.mp4"
-    newest_frame = max(f.stat().st_mtime for f in frames)
+    newest_frame = max(frame.stat().st_mtime for frame in frames)
     if not out.exists() or out.stat().st_mtime < newest_frame:
-        # concat list looped for a longer rotation video
-        lst = out_dir / "frames.txt"
-        with open(lst, "w", encoding="utf-8") as fh:
-            for _ in range(max(1, loops)):
-                for f in frames:
-                    fh.write(f"file '{f.as_posix()}'\nduration {1/max(1,fps):.4f}\n")
-            fh.write(f"file '{frames[0].as_posix()}'\n")
-        cmd = [str(FFMPEG), "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-               "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
-               "-c:v", "libx264", "-preset", "fast", "-crf", "22", str(out)]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0 or not out.exists():
-            raise HTTPException(500, f"ffmpeg failed: {r.stderr[-400:]}")
-    return FileResponse(out, media_type="video/mp4", filename=f"{vin.upper()}_spin.mp4")
+        temp_out = out_dir / f".spin-{uuid.uuid4().hex}.mp4"
+        list_path = out_dir / f".frames-{uuid.uuid4().hex}.txt"
+        try:
+            with list_path.open("w", encoding="utf-8") as stream:
+                for _ in range(loops):
+                    for frame_path in frames:
+                        path_text = frame_path.as_posix()
+                        if any(char in path_text for char in ("\n", "\r", "'")):
+                            raise HTTPException(400, "Storage path cannot be represented for video export")
+                        stream.write(f"file '{path_text}'\nduration {1 / fps:.4f}\n")
+                first_path = frames[0].as_posix()
+                stream.write(f"file '{first_path}'\n")
+            command = [str(FFMPEG), "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                       "-i", str(list_path), "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+                       "-c:v", "libx264", "-preset", "fast", "-crf", "22", str(temp_out)]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=300, check=False)
+            if result.returncode != 0 or not temp_out.is_file() or temp_out.stat().st_size <= 0:
+                raise HTTPException(500, f"ffmpeg failed: {(result.stderr or '')[-400:]}")
+            os.replace(temp_out, out)
+        finally:
+            list_path.unlink(missing_ok=True)
+            temp_out.unlink(missing_ok=True)
+    return FileResponse(out, media_type="video/mp4", filename=f"{vin}_spin.mp4")
 
 
 @router.get("/api/vehicle/{vin}/export/frame/{n}")
-async def export_frame(vin: str, n: int):
+def export_frame(vin: str, n: int):
     _, frames = _frames_dir(vin)
     if not frames:
         raise HTTPException(404, "No frames for this vehicle")
@@ -267,17 +406,35 @@ async def export_frame(vin: str, n: int):
 
 
 @router.get("/api/vehicle/{vin}/export/frames.zip")
-async def export_zip(vin: str):
-    _, frames = _frames_dir(vin)
+def export_zip(vin: str):
+    """Stream source frames to a disk-backed ZIP; avoid whole-archive RAM copies."""
+    _frame_dir, frames = _frames_dir(vin)
     if not frames:
         raise HTTPException(404, "No frames for this vehicle")
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for i, f in enumerate(frames):
-            z.write(f, f"{vin.upper()}_frame_{i+1:02d}.jpg")
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="application/zip",
-                             headers={"Content-Disposition": f"attachment; filename={vin.upper()}_frames.zip"})
+    total_bytes = sum(frame.stat().st_size for frame in frames)
+    if total_bytes > MAX_EXPORT_INPUT_BYTES:
+        raise HTTPException(413, "Frame set is too large to export")
+
+    vin = vin.strip().upper()
+    out_dir = STORAGE_DIR / vin / "exports"
+    if out_dir.is_symlink():
+        raise HTTPException(404, "Export directory is unavailable")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".frames-", suffix=".zip", dir=out_dir)
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_STORED) as archive:
+            for index, frame_path in enumerate(frames, 1):
+                archive.write(frame_path, f"{vin}_frame_{index:02d}.jpg")
+        from starlette.background import BackgroundTask
+        return FileResponse(
+            temp_path, media_type="application/zip", filename=f"{vin}_frames.zip",
+            background=BackgroundTask(temp_path.unlink, missing_ok=True),
+        )
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 # =============================================================================
@@ -332,18 +489,16 @@ TW, TH = 320, 180
 
 
 def _render_bg(top, bottom, style) -> Image.Image:
-    img = Image.new("RGB", (W, H))
-    px = img.load()
-    for y in range(H):
-        t = y / (H - 1)
-        # ease the blend for a softer studio look
-        tt = t * t * (3 - 2 * t)
-        r = int(top[0] + (bottom[0] - top[0]) * tt)
-        g = int(top[1] + (bottom[1] - top[1]) * tt)
-        b = int(top[2] + (bottom[2] - top[2]) * tt)
-        for x in range(0, W, 4):
-            for xx in range(x, min(x + 4, W)):
-                px[xx, y] = (r, g, b)
+    # The old Python-per-pixel loop performed over 80 million assignments while
+    # generating the 40-asset catalog. Vectorize the row gradient and broadcast
+    # it across the width; only one ~6 MiB RGB image is held at a time.
+    progress = np.arange(H, dtype=np.float64) / (H - 1)
+    eased = progress * progress * (3 - 2 * progress)
+    top_rgb = np.asarray(top, dtype=np.float64)
+    bottom_rgb = np.asarray(bottom, dtype=np.float64)
+    rows = (top_rgb + (bottom_rgb - top_rgb) * eased[:, None]).astype(np.uint8)
+    pixels = np.broadcast_to(rows[:, None, :], (H, W, 3)).copy()
+    img = Image.fromarray(pixels)
     d = ImageDraw.Draw(img, "RGBA")
     if style == "floor":
         d.rectangle([0, int(H * 0.72), W, H], fill=(0, 0, 0, 36))
@@ -410,15 +565,40 @@ class ConditionUpdate(BaseModel):
 
 
 @router.post("/api/hotspot/{hotspot_id}/condition")
-async def set_hotspot_condition(hotspot_id: int, body: ConditionUpdate):
+def set_hotspot_condition(hotspot_id: int, body: ConditionUpdate, request: Request):
+    token = request.headers.get("authorization", "")
+    token = token[7:].strip() if token.lower().startswith("bearer ") else request.cookies.get("lotvue_token", "")
+    try:
+        payload = jwt.decode(token, _jwt_secret(), algorithms=[JWT_ALG])
+    except JWTError as exc:
+        raise HTTPException(401, "Sign in required") from exc
+    email = str(payload.get("sub", "")).strip().lower()
+    if payload.get("type") != "access" or not email:
+        raise HTTPException(401, "Sign in required")
     if body.severity and body.severity not in SEVERITIES:
         raise HTTPException(400, f"severity must be one of {SEVERITIES}")
     if body.condition_type and body.condition_type not in CONDITION_TYPES:
         raise HTTPException(400, f"condition_type must be one of {CONDITION_TYPES}")
     conn = _db()
+    if not conn.execute("SELECT 1 FROM users WHERE LOWER(email)=?", (email,)).fetchone():
+        conn.close()
+        raise HTTPException(401, "User no longer exists")
+    hotspot = conn.execute("SELECT vin FROM hotspots WHERE id=?", (hotspot_id,)).fetchone()
+    if not hotspot:
+        conn.close()
+        raise HTTPException(404, "Hotspot not found")
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+    if not (owner_email and email == owner_email):
+        vehicle = conn.execute(
+            "SELECT 1 FROM vehicles WHERE vin=? AND status='active' AND LOWER(user_email)=?",
+            (str(hotspot["vin"]).upper(), email),
+        ).fetchone()
+        if not vehicle:
+            conn.close()
+            raise HTTPException(404, "Hotspot not found")
     cur = conn.execute(
         "UPDATE hotspots SET condition_type=?, severity=?, note=? WHERE id=?",
-        (body.condition_type or "", body.severity or "", body.note or "", hotspot_id),
+        (body.condition_type or "", body.severity or "", (body.note or "")[:500], hotspot_id),
     )
     conn.commit()
     found = cur.rowcount
@@ -429,12 +609,18 @@ async def set_hotspot_condition(hotspot_id: int, body: ConditionUpdate):
 
 
 @router.get("/api/vehicle/{vin}/condition-report.pdf")
-async def condition_report_pdf(vin: str):
-    from reportlab.lib.pagesizes import letter
+def condition_report_pdf(vin: str):
     from reportlab.lib import colors
-    from reportlab.lib.units import inch
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
 
     vin = vin.upper()
     conn = _db()
@@ -494,21 +680,42 @@ async def condition_report_pdf(vin: str):
 # =============================================================================
 # 6. JWT AUTH (python-jose) — layered over existing users table
 # =============================================================================
-from jose import jwt, JWTError
+from jose import JWTError, jwt
 
-_SECRET_FILE = BASE_DIR / ".jwt_secret"
+_SECRET_FILE = DATA_DIR / ".jwt_secret"
 
 
 def _jwt_secret() -> str:
     env = os.getenv("LOTVUE_JWT_SECRET", "")
     if env:
+        if len(env.encode("utf-8")) < 32:
+            raise RuntimeError("LOTVUE_JWT_SECRET must contain at least 32 bytes")
         return env
-    if _SECRET_FILE.exists():
-        return _SECRET_FILE.read_text().strip()
+    try:
+        existing = _SECRET_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        existing = ""
+    if existing:
+        if len(existing.encode("utf-8")) < 32:
+            raise RuntimeError(f"JWT secret file is too short: {_SECRET_FILE}")
+        return existing
+
     import secrets
-    s = secrets.token_hex(32)
-    _SECRET_FILE.write_text(s)
-    return s
+    generated = secrets.token_hex(32)
+    try:
+        # Exclusive create prevents multiple workers from issuing tokens with
+        # different keys during simultaneous first startup; 0600 limits access.
+        fd = os.open(str(_SECRET_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        existing = _SECRET_FILE.read_text(encoding="utf-8").strip()
+        if len(existing.encode("utf-8")) < 32:
+            raise RuntimeError(f"JWT secret file is too short: {_SECRET_FILE}")
+        return existing
+    with os.fdopen(fd, "w", encoding="utf-8") as secret_file:
+        secret_file.write(generated)
+        secret_file.flush()
+        os.fsync(secret_file.fileno())
+    return generated
 
 
 JWT_ALG = "HS256"
@@ -517,8 +724,8 @@ REFRESH_TTL_D = 30
 
 
 class TokenRequest(BaseModel):
-    email: str
-    password: str
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=1024)
 
 
 class RefreshRequest(BaseModel):
@@ -536,28 +743,36 @@ def _make_tokens(email: str, role: str = "user"):
 
 
 @router.post("/api/auth/token")
-async def auth_token(body: TokenRequest, response: Response):
-    import hashlib
+def auth_token(body: TokenRequest, request: Request, response: Response):
+    from auth_rate import check_auth_rate
+    check_auth_rate(request, "login", 8)
+    email = body.email.lower().strip()
     conn = _db()
-    user = conn.execute("SELECT * FROM users WHERE email=?", (body.email.lower().strip(),)).fetchone()
-    conn.close()
-    if not user or user["password_hash"] != hashlib.sha256(body.password.encode()).hexdigest():
+    user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    if not user or not verify_password(body.password, user["password_hash"]):
+        conn.close()
         raise HTTPException(401, "Invalid email or password")
+    if needs_rehash(user["password_hash"]):
+        conn.execute("UPDATE users SET password_hash=? WHERE email=?",
+                     (hash_password(body.password), email))
+        conn.commit()
+    conn.close()
     tokens = _make_tokens(user["email"])
-    # browser sessions: HttpOnly cookie so dashboard fetch() works without headers
+    # Browser sessions use an HttpOnly cookie, marked Secure on HTTPS.
     response.set_cookie("lotvue_token", tokens["access_token"], httponly=True,
-                        samesite="lax", max_age=ACCESS_TTL_H * 3600)
+                        secure=secure_cookie_for_request(request), samesite="lax",
+                        path="/", max_age=ACCESS_TTL_H * 3600)
     return tokens
 
 
 @router.post("/api/auth/logout")
-async def auth_logout(response: Response):
+def auth_logout(response: Response):
     response.delete_cookie("lotvue_token")
     return {"status": "signed_out"}
 
 
 @router.post("/api/auth/refresh")
-async def auth_refresh(body: RefreshRequest):
+def auth_refresh(body: RefreshRequest):
     try:
         payload = jwt.decode(body.refresh_token, _jwt_secret(), algorithms=[JWT_ALG])
         if payload.get("type") != "refresh":
@@ -587,7 +802,7 @@ def current_user(authorization: str = Header(default="")):
 
 
 @router.get("/api/auth/me")
-async def auth_me(authorization: str = Header(default="")):
+def auth_me(authorization: str = Header(default="")):
     return current_user(authorization)
 
 

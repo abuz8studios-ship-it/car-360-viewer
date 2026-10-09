@@ -123,45 +123,127 @@ export class LotVueSpin extends HTMLElement {
   static observedAttributes = ['vin', 'frames'];
 
   connectedCallback() {
-    this.attachShadow({ mode: 'open' }).innerHTML = TPL;
+    if (this._connected) return;
+    this._connected = true;
+    this._raf = null;
+    this._generation = (this._generation || 0) + 1;
+    if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
+    this.shadowRoot.innerHTML = TPL;
     this.$ = s => this.shadowRoot.querySelector(s);
+    this._loadPromises = new Map();
+    this._loadQueue = [];
+    this._activeLoads = 0;
+    this._failedFrames = new Set();
     this.state = {
-      i: 0, n: 0, imgs: [], zoom: 1, px: 0, py: 0,
+      i: 0, n: 0, urls: [], imgs: [], zoom: 1, px: 0, py: 0,
       vel: 0, dragging: false, panning: false, auto: false, ready: false,
     };
-    this.#boot();
+    this.#boot(this._generation);
   }
-  disconnectedCallback() { cancelAnimationFrame(this._raf); this._renderer?.dispose(); }
+
+  disconnectedCallback() {
+    this._connected = false;
+    this._generation = (this._generation || 0) + 1;
+    if (this._raf != null) cancelAnimationFrame(this._raf);
+    this._raf = null;
+    if (this._resizeObserver) this._resizeObserver.disconnect();
+    if (this._introTimer) clearTimeout(this._introTimer);
+    if (this._hintTimer) clearTimeout(this._hintTimer);
+    this._introTimer = this._hintTimer = null;
+    this._stopAuto = null;
+    if (this._globalListeners) {
+      window.removeEventListener('mousemove', this._globalListeners.move);
+      window.removeEventListener('touchmove', this._globalListeners.move);
+      window.removeEventListener('mouseup', this._globalListeners.up);
+      window.removeEventListener('touchend', this._globalListeners.up);
+      this._globalListeners = null;
+    }
+    if (this._hostKeydown) {
+      this.removeEventListener('keydown', this._hostKeydown);
+      this._hostKeydown = null;
+    }
+    if (this.state) {
+      this.state.auto = false;
+      this.state.urls = [];
+      this.state.imgs.fill(null);
+    }
+    for (const task of this._loadQueue || []) task.resolve(null);
+    this._loadPromises?.clear();
+    this._failedFrames?.clear();
+    this._loadQueue = [];
+    this._activeLoads = 0;
+    this._tex?.dispose();
+    this._mesh?.geometry?.dispose();
+    this._mesh?.material?.dispose();
+    if (this._renderer) {
+      this._renderer.renderLists?.dispose();
+      this._renderer.dispose();
+      this._renderer.forceContextLoss();
+      this._renderer = null;
+    }
+    this._tex = this._mesh = this._scene = this._cam = null;
+    this._fit = this._renderLoop = null;
+    this._hsEls = this._dotEls = null;
+    this._rendererWidth = this._rendererHeight = 0;
+    this._renderDirty = false;
+    this.manifest = null;
+  }
 
   /* ------------------------------------------------------------------ boot */
-  async #boot() {
+  async #boot(generation) {
     let urls = [];
     const attr = this.getAttribute('frames');
     if (attr) { try { urls = JSON.parse(attr); } catch (e) {} }
-    if (!urls.length) {
-      const vin = this.getAttribute('vin');
+    if (!Array.isArray(urls) || !urls.length) {
+      const vin = (this.getAttribute('vin') || '').trim();
+      if (!/^[A-Za-z0-9_-]{1,32}$/.test(vin)) {
+        this.#fail('Invalid vehicle identifier.'); return;
+      }
       try {
-        const m = await (await fetch(`/api/viewer/${vin}/manifest`)).json();
-        urls = m.spin_frames || [];
-        this.manifest = m;
+        const response = await fetch(`/api/viewer/${encodeURIComponent(vin)}/manifest`, {
+          credentials: 'same-origin',
+        });
+        if (!response.ok) throw new Error('Manifest unavailable');
+        const manifest = await response.json();
+        urls = manifest.spin_frames || [];
+        this.manifest = manifest;
       } catch (e) {}
     }
-    if (!urls.length) { this.#fail('No 360° frames for this vehicle.'); return; }
+    if (!this.isConnected || generation !== this._generation) return;
+    if (!Array.isArray(urls) || !urls.length) { this.#fail('No 360° frames for this vehicle.'); return; }
+    if (urls.length > 120) { this.#fail('This spin has too many frames to display safely.'); return; }
 
-    this.state.n = urls.length;
+    this.state.urls = urls.map(source => this.#safeFrameUrl(source));
+    this.state.urls.forEach((url, index) => { if (!url) this._failedFrames.add(index); });
+    if (!this.state.urls.some(Boolean)) { this.#fail('No valid 360° frame URLs were found.'); return; }
+    this.state.n = this.state.urls.length;
+    this.state.imgs = new Array(this.state.n).fill(null);
     this.#three();
-    await this.#preload(urls);
-    if (!this.state.imgs.filter(Boolean).length) { this.#fail('Frames failed to load.'); return; }
-
     this.#dots();
     this.#bind();
-    this.#show(0);
+
+    const first = await this.#preload(this.state.urls);
+    if (!this.isConnected || generation !== this._generation) return;
+    if (first < 0) { this.#fail('Frames failed to load.'); return; }
+    this.#show(first);
     this.state.ready = true;
     this.$('canvas').classList.add('ready');
     this.$('.load').classList.add('gone');
     this.$('.bar').classList.add('on');
     this.#intro();
     this.dispatchEvent(new CustomEvent('lotvue:spin-ready', { detail: { frames: this.state.n } }));
+  }
+
+  #safeFrameUrl(source) {
+    if (typeof source !== 'string' || !source || source.length > 2048) return null;
+    try {
+      const url = new URL(source, document.baseURI);
+      if (!['http:', 'https:'].includes(url.protocol)) return null;
+      if (url.origin !== window.location.origin && url.protocol !== 'https:') return null;
+      return url.href;
+    } catch (e) {
+      return null;
+    }
   }
 
   #fail(msg) {
@@ -172,28 +254,157 @@ export class LotVueSpin extends HTMLElement {
   }
 
   /* -------------------------------------------------------------- preload */
-  #preload(urls) {
+  async #preload(urls) {
     const ring = this.$('.ring .fg'), pct = this.$('.pct'), C = 163.4;
-    let done = 0;
-    const bump = () => {
-      done++;
-      const f = done / urls.length;
-      ring.style.strokeDashoffset = C * (1 - f);
-      pct.textContent = Math.round(f * 100) + '%';
-    };
-    return Promise.all(urls.map((u, k) => new Promise(res => {
-      const im = new Image();
-      im.decoding = 'async';
-      im.onload = () => { this.state.imgs[k] = im; bump(); res(); };
-      im.onerror = () => { bump(); res(); };
-      im.src = u;
-    })));
+    pct.textContent = 'Loading';
+    // Reveal the viewer as soon as one frame is decoded. Adjacent frames are
+    // filled by the bounded rolling cache while the buyer interacts.
+    const firstCandidates = [...Array(Math.min(urls.length, 4)).keys()];
+    for (const index of firstCandidates) {
+      if (!urls[index]) continue;
+      const image = await this.#loadFrame(index, true);
+      if (image) {
+        ring.style.strokeDashoffset = '0';
+        pct.textContent = '100%';
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  #loadFrame(index, priority = false) {
+    const s = this.state;
+    if (index < 0 || index >= s.n || !s.urls[index] || this._failedFrames.has(index)) {
+      return Promise.resolve(null);
+    }
+    if (s.imgs[index]) return Promise.resolve(s.imgs[index]);
+    const existing = this._loadPromises.get(index);
+    if (existing) return existing.promise;
+
+    let resolveTask;
+    const promise = new Promise(resolve => { resolveTask = resolve; });
+    const task = { index, generation: this._generation, resolve: resolveTask, started: false };
+    this._loadPromises.set(index, { promise, task });
+    if (priority) this._loadQueue.unshift(task);
+    else this._loadQueue.push(task);
+    this.#pumpFrameLoads();
+    return promise;
+  }
+
+  #pumpFrameLoads() {
+    const maxConcurrent = 4;
+    while (this._connected && this._activeLoads < maxConcurrent && this._loadQueue.length) {
+      const task = this._loadQueue.shift();
+      const current = this._loadPromises.get(task.index);
+      if (task.generation !== this._generation || !current || current.task !== task) {
+        task.resolve(null);
+        continue;
+      }
+      task.started = true;
+      this._activeLoads++;
+      const image = new Image();
+      image.decoding = 'async';
+      image.crossOrigin = 'anonymous';
+      let settled = false;
+      const finish = async loadedImage => {
+        if (settled) return;
+        settled = true;
+        if (task.generation !== this._generation) {
+          task.resolve(null);
+          return;
+        }
+        this._activeLoads = Math.max(0, this._activeLoads - 1);
+        if (loadedImage && loadedImage.decode) {
+          try { await loadedImage.decode(); } catch (e) {}
+        }
+        const pending = this._loadPromises.get(task.index);
+        if (pending?.task === task) this._loadPromises.delete(task.index);
+        const distance = Math.min(
+          (task.index - this.state.i + this.state.n) % this.state.n,
+          (this.state.i - task.index + this.state.n) % this.state.n,
+        );
+        const useful = task.index === this.state.i || distance <= 2;
+        if (loadedImage && useful) this.state.imgs[task.index] = loadedImage;
+        else if (!loadedImage) this._failedFrames.add(task.index);
+        const result = loadedImage && useful ? loadedImage : null;
+        task.resolve(result);
+        if (result && task.index === this.state.i) this.#applyFrame(task.index, result);
+        else if (!result && task.index === this.state.i) this.#fallbackToNearest(task.index);
+        this.#preloadWindow(this.state.i);
+        this.#pumpFrameLoads();
+      };
+      image.onload = () => finish(image);
+      image.onerror = () => finish(null);
+      image.src = this.state.urls[task.index];
+    }
+  }
+
+  #preloadWindow(center) {
+    const s = this.state;
+    if (!s.n || !this._connected) return;
+    this.#trimFrameCache(center);
+    if (!s.imgs[center] && !this._failedFrames.has(center)) this.#loadFrame(center, true);
+    for (const offset of [1, -1, 2, -2]) {
+      const index = (center + offset + s.n) % s.n;
+      if (!s.imgs[index] && !this._failedFrames.has(index)) this.#loadFrame(index);
+    }
+  }
+
+  #trimFrameCache(center) {
+    const s = this.state;
+    for (let index = 0; index < s.imgs.length; index++) {
+      if (!s.imgs[index] || index === center) continue;
+      const distance = Math.min(
+        (index - center + s.n) % s.n,
+        (center - index + s.n) % s.n,
+      );
+      if (distance > 2) s.imgs[index] = null;
+    }
+    this._loadQueue = this._loadQueue.filter(task => {
+      const distance = Math.min(
+        (task.index - center + s.n) % s.n,
+        (center - task.index + s.n) % s.n,
+      );
+      if (distance <= 2 || task.index === center) return true;
+      const pending = this._loadPromises.get(task.index);
+      if (pending?.task === task) this._loadPromises.delete(task.index);
+      task.resolve(null);
+      return false;
+    });
+  }
+
+  #fallbackToNearest(index) {
+    const s = this.state;
+    for (let distance = 1; distance < s.n; distance++) {
+      for (const candidate of [(index + distance) % s.n, (index - distance + s.n) % s.n]) {
+        if (s.imgs[candidate]) {
+          s.i = candidate;
+          this.#applyFrame(candidate, s.imgs[candidate]);
+          return;
+        }
+      }
+    }
+  }
+
+  #applyFrame(index, image) {
+    const s = this.state;
+    s.i = index;
+    this._tex.image = image;
+    this._tex.needsUpdate = true;
+    this._fit();
+    const dots = this._dotEls;
+    if (dots) {
+      const dotIndex = Math.round((index / s.n) * (dots.length - 1));
+      dots.forEach((dot, i) => dot.classList.toggle('on', i === dotIndex));
+    }
+    this.#hotspots();
+    this._requestRender();
   }
 
   /* ----------------------------------------------------------- three.js */
   #three() {
-    const r = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    r.setPixelRatio(Math.min(devicePixelRatio, 2));
+    const r = new THREE.WebGLRenderer({ antialias: false, alpha: true, powerPreference: 'low-power' });
+    r.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
     this.shadowRoot.appendChild(r.domElement);
     const scene = new THREE.Scene();
     const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 10);
@@ -210,26 +421,33 @@ export class LotVueSpin extends HTMLElement {
     Object.assign(this, { _renderer: r, _scene: scene, _cam: cam, _tex: tex, _mesh: mesh });
 
     const fit = () => {
+      if (!this._connected || !this._renderer) return;
       const w = this.clientWidth || 640, h = this.clientHeight || 400;
-      r.setSize(w, h);
-      const im = this.state.imgs[this.state.i];
+      if (w !== this._rendererWidth || h !== this._rendererHeight) {
+        r.setSize(w, h, false);
+        this._rendererWidth = w;
+        this._rendererHeight = h;
+      }
+      const im = this.state.imgs[this.state.i] || this._tex.image;
       const ar = im ? im.width / im.height : 1.5;
       const va = w / h;
-      // contain-fit the photo inside the viewport
       let pw, ph;
       if (ar > va) { pw = 2; ph = 2 * va / ar; } else { ph = 2; pw = 2 * ar / va; }
       mesh.scale.set(pw, ph, 1);
       cam.left = -1; cam.right = 1; cam.top = 1; cam.bottom = -1;
       cam.updateProjectionMatrix();
+      this._renderDirty = true;
     };
     this._fit = fit;
-    new ResizeObserver(fit).observe(this);
+    this._resizeObserver = new ResizeObserver(fit);
+    this._resizeObserver.observe(this);
     fit();
 
-    const loop = () => {
-      this._raf = requestAnimationFrame(loop);
+    this._renderLoop = () => {
+      this._raf = null;
+      if (!this._connected || !this._renderer) return;
+      this._insideRender = true;
       const s = this.state;
-      // inertial spin decay
       if (!s.dragging && Math.abs(s.vel) > 0.02) {
         s.acc = (s.acc || 0) + s.vel;
         while (Math.abs(s.acc) >= 1) {
@@ -242,12 +460,26 @@ export class LotVueSpin extends HTMLElement {
         s.acc = (s.acc || 0) + 0.35;
         if (s.acc >= 1) { this.#show(s.i + 1); s.acc = 0; }
       }
-      cam.zoom = s.zoom;
-      cam.position.x = s.px; cam.position.y = s.py;
-      cam.updateProjectionMatrix();
-      r.render(scene, cam);
+      const moving = s.dragging || s.auto || Math.abs(s.vel) > 0.02;
+      if (this._renderDirty || moving) {
+        cam.zoom = s.zoom;
+        cam.position.x = s.px; cam.position.y = s.py;
+        cam.updateProjectionMatrix();
+        r.render(scene, cam);
+        this._renderDirty = false;
+      }
+      this._insideRender = false;
+      if (moving || this._renderDirty) this._raf = requestAnimationFrame(this._renderLoop);
     };
-    loop();
+    this._renderDirty = true;
+    this._requestRender();
+  }
+
+  _requestRender() {
+    this._renderDirty = true;
+    if (this._connected && !this._insideRender && this._raf == null && this._renderLoop) {
+      this._raf = requestAnimationFrame(this._renderLoop);
+    }
   }
 
   /* ------------------------------------------------------------ frame swap */
@@ -255,18 +487,13 @@ export class LotVueSpin extends HTMLElement {
     const s = this.state;
     if (!s.n) return;
     k = ((k % s.n) + s.n) % s.n;
-    const im = s.imgs[k];
-    if (!im) { s.i = k; return; }          // skip missing, keep index moving
     s.i = k;
-    this._tex.image = im;
-    this._tex.needsUpdate = true;
-    this._fit();
-    const dots = this._dotEls;
-    if (dots) {
-      const idx = Math.round((k / s.n) * (dots.length - 1));
-      dots.forEach((d, j) => d.classList.toggle('on', j === idx));
+    const image = s.imgs[k];
+    if (image) this.#applyFrame(k, image);
+    else {
+      this.#preloadWindow(k);
+      if (this._failedFrames.has(k)) this.#fallbackToNearest(k);
     }
-    this.#hotspots();
   }
 
   #dots() {
@@ -281,10 +508,15 @@ export class LotVueSpin extends HTMLElement {
     const s = this.state;
     s.auto = true;
     this.$('.play').style.opacity = .55;
-    const stop = () => { s.auto = false; this.$('.play').style.opacity = 1; };
+    const stop = () => {
+      s.auto = false;
+      this.$('.play').style.opacity = 1;
+      this._requestRender();
+    };
     this._stopAuto = stop;
+    this._requestRender();
     // one slow revolution then settle
-    setTimeout(() => { if (s.auto) stop(); }, (s.n / 0.35) * 16.7 + 400);
+    this._introTimer = setTimeout(() => { if (s.auto) stop(); }, (s.n / 0.35) * 16.7 + 400);
   }
 
   /* ------------------------------------------------------------------ input */
@@ -301,6 +533,7 @@ export class LotVueSpin extends HTMLElement {
       zt.textContent = s.zoom.toFixed(1) + '×';
       zt.classList.toggle('on', s.zoom > 1.001);
       cv.classList.toggle('zoomed', s.zoom > 1.001);
+      this._requestRender();
     };
     this._setZoom = setZoom;
 
@@ -339,20 +572,23 @@ export class LotVueSpin extends HTMLElement {
         s.vel = step * 0.55;
       }
       last = { x, y };
+      this._requestRender();
       e.preventDefault();
     };
     const up = () => {
       if (!s.dragging) { pinch = null; return; }
       s.dragging = false; pinch = null; last = null;
       cv.classList.remove('grabbing');
+      this._requestRender();
     };
 
     cv.addEventListener('mousedown', down);
     cv.addEventListener('touchstart', down, { passive: false });
-    addEventListener('mousemove', move);
-    addEventListener('touchmove', move, { passive: false });
-    addEventListener('mouseup', up);
-    addEventListener('touchend', up);
+    window.addEventListener('mousemove', move);
+    window.addEventListener('touchmove', move, { passive: false });
+    window.addEventListener('mouseup', up);
+    window.addEventListener('touchend', up);
+    this._globalListeners = { move, up };
 
     cv.addEventListener('wheel', e => {
       e.preventDefault(); killAuto();
@@ -362,13 +598,14 @@ export class LotVueSpin extends HTMLElement {
     cv.addEventListener('dblclick', () => { killAuto(); setZoom(s.zoom > 1.5 ? 1 : 2.4); });
 
     this.tabIndex = 0;
-    this.addEventListener('keydown', e => {
+    this._hostKeydown = e => {
       if (e.key === 'ArrowLeft') { killAuto(); this.#show(s.i - 1); }
       if (e.key === 'ArrowRight') { killAuto(); this.#show(s.i + 1); }
       if (e.key === '+' || e.key === '=') setZoom(s.zoom * 1.2);
       if (e.key === '-') setZoom(s.zoom / 1.2);
       if (e.key === '0') setZoom(1);
-    });
+    };
+    this.addEventListener('keydown', this._hostKeydown);
 
     this.$('.zin').onclick = () => { killAuto(); setZoom(s.zoom * 1.35); };
     this.$('.zout').onclick = () => setZoom(s.zoom / 1.35);
@@ -376,6 +613,7 @@ export class LotVueSpin extends HTMLElement {
       hint.classList.add('gone');
       s.auto = !s.auto;
       this.$('.play').style.opacity = s.auto ? .55 : 1;
+      this._requestRender();
     };
     const fullBtn = this.$('.full');
     fullBtn.onclick = () => {
@@ -384,7 +622,7 @@ export class LotVueSpin extends HTMLElement {
     };
     if (!this.requestFullscreen) fullBtn.classList.add('hide');
 
-    setTimeout(() => hint.classList.add('gone'), 6000);
+    this._hintTimer = setTimeout(() => hint.classList.add('gone'), 6000);
   }
 
   /* --------------------------------------------------------------- hotspots */

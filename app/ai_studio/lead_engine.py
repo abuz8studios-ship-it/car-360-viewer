@@ -6,23 +6,19 @@ auto-response via text/email/chat — cloning best of 360autoai + Flai + BDC.ai.
 All AI responses powered by Ollama LOCAL models (LOCAL > CLOUD > PAID).
 Zero cloud cost — all local generation.
 """
-import os
 import json
-import sqlite3
-import re
+import os
 import smtplib
-import urllib.request
+import sqlite3
 import urllib.parse
-from email.mime.text import MIMEText
+import urllib.request
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Optional
+from email.mime.text import MIMEText
+
+from app_paths import DB_PATH
 
 OLLAMA_URL = os.getenv("LOTVUE_OLLAMA_URL", "http://localhost:11434")
-# Canonical app DB is vehicles.db (same file main.py / a2_extensions / g_glo3d use).
-# (Was pointed at a stray lotvue.db, orphaning follow_ups/appointments from the
-# real leads table — fixed so the queue actually joins live leads.)
-DB_PATH = Path(__file__).resolve().parents[1] / "vehicles.db"
+# Canonical app DB is shared with vehicle, lead, and extension routes.
 
 
 # =============================================================================
@@ -336,22 +332,30 @@ def _ai_text_ok(t: str) -> bool:
 # =============================================================================
 # APPOINTMENT SCHEDULING
 # =============================================================================
-def get_available_slots(dealer_hours: dict = None, days_ahead: int = 7) -> list:
+_DEFAULT_DEALER_HOURS = {
+    0: (9, 19),   # Monday
+    1: (9, 19),   # Tuesday
+    2: (9, 19),   # Wednesday
+    3: (9, 19),   # Thursday
+    4: (9, 19),   # Friday
+    5: (9, 18),   # Saturday
+    6: (11, 17),  # Sunday
+}
+
+
+def get_available_slots(dealer_hours: dict = None, days_ahead: int = 7,
+                        user_email: str | None = None) -> list:
     """
     Generate available appointment slots for the next N days.
     Default: Mon-Sat 9am-7pm, Sun 11am-5pm.
     """
     if not dealer_hours:
-        dealer_hours = {
-            0: (9, 19),   # Monday
-            1: (9, 19),   # Tuesday
-            2: (9, 19),   # Wednesday
-            3: (9, 19),   # Thursday
-            4: (9, 19),   # Friday
-            5: (9, 18),   # Saturday
-            6: (11, 17),  # Sunday
-        }
+        dealer_hours = _DEFAULT_DEALER_HOURS
 
+    try:
+        days_ahead = max(1, min(int(days_ahead), 30))
+    except (TypeError, ValueError):
+        days_ahead = 7
     slots = []
     today = datetime.now().replace(minute=0, second=0, microsecond=0)
     if today.minute > 30:
@@ -377,51 +381,124 @@ def get_available_slots(dealer_hours: dict = None, days_ahead: int = 7) -> list:
                         "day_of_week": slot_time.strftime("%A"),
                     })
 
+    email = (user_email or "").strip().lower()
+    conn = sqlite3.connect(str(DB_PATH))
+    now_iso = datetime.now().isoformat(timespec="minutes")
+    end_iso = (datetime.now() + timedelta(days=days_ahead + 1)).isoformat(timespec="minutes")
+    try:
+        if email:
+            rows = conn.execute(
+                "SELECT a.scheduled_at FROM appointments a "
+                "JOIN leads l ON l.id=a.lead_id "
+                "JOIN vehicles v ON v.vin=l.vin "
+                "WHERE a.status='confirmed' AND a.scheduled_at>=? AND a.scheduled_at<? "
+                "AND LOWER(v.user_email)=?",
+                (now_iso, end_iso, email),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT scheduled_at FROM appointments "
+                "WHERE status='confirmed' AND scheduled_at>=? AND scheduled_at<?",
+                (now_iso, end_iso),
+            ).fetchall()
+        booked = set()
+        for row in rows:
+            try:
+                booked.add(datetime.fromisoformat(row[0]).isoformat(timespec="minutes"))
+            except (TypeError, ValueError):
+                continue
+        slots = [slot for slot in slots if slot["datetime"][:16] not in booked]
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
     return slots
 
 
 def book_appointment(lead_id: int, slot_datetime: str,
                      appointment_type: str = "test_drive",
-                     notes: str = "") -> dict:
-    """
-    Book an appointment for a lead.
-    appointment_type: 'test_drive', 'viewing', 'trade_eval', 'financing'
-    """
-    conn = sqlite3.connect(str(DB_PATH))
+                     notes: str = "",
+                     user_email: str | None = None) -> dict:
+    """Book a future, unreserved appointment slot for an existing lead."""
+    if appointment_type not in {"test_drive", "viewing", "trade_eval", "financing"}:
+        return {"error": "Unsupported appointment type"}
+    if len(notes or "") > 500:
+        return {"error": "Appointment notes are too long"}
+    try:
+        slot = datetime.fromisoformat(str(slot_datetime).replace("Z", "+00:00"))
+        if slot.tzinfo is not None:
+            slot = slot.astimezone().replace(tzinfo=None)
+        now = datetime.now()
+        if slot <= now or slot > now + timedelta(days=30):
+            return {"error": "Choose a future slot within the next 30 days"}
+        if slot.minute not in {0, 30} or slot.second or slot.microsecond:
+            return {"error": "Appointments must start on the hour or half hour"}
+        hours = _DEFAULT_DEALER_HOURS.get(slot.weekday())
+        if not hours or not hours[0] <= slot.hour < hours[1]:
+            return {"error": "Choose a time during the dealership's appointment hours"}
+        slot_datetime = slot.isoformat(timespec="minutes")
+    except (TypeError, ValueError):
+        return {"error": "Invalid appointment date and time"}
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=5)
     conn.row_factory = sqlite3.Row
-
-    # Create appointments table if not exists
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS appointments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lead_id INTEGER NOT NULL,
-            vin TEXT,
-            appointment_type TEXT DEFAULT 'test_drive',
-            scheduled_at TEXT NOT NULL,
-            status TEXT DEFAULT 'confirmed',
-            notes TEXT,
-            reminder_sent INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (lead_id) REFERENCES leads(id)
-        )
-    """)
-
-    # Get lead info
-    lead = dict(conn.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone() or {})
-    if not lead:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS appointments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER NOT NULL,
+                vin TEXT,
+                appointment_type TEXT DEFAULT 'test_drive',
+                scheduled_at TEXT NOT NULL,
+                status TEXT DEFAULT 'confirmed',
+                notes TEXT,
+                reminder_sent INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (lead_id) REFERENCES leads(id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_appointments_status_time "
+                     "ON appointments(status, scheduled_at)")
+        lead_row = conn.execute(
+            "SELECT l.*, v.user_email AS vehicle_email, v.status AS vehicle_status "
+            "FROM leads l LEFT JOIN vehicles v ON v.vin=l.vin WHERE l.id=?", (lead_id,)
+        ).fetchone()
+        if not lead_row:
+            conn.rollback()
+            return {"error": "Lead not found"}
+        lead = dict(lead_row)
+        tenant_email = str(lead.get("vehicle_email") or "").strip().lower()
+        if not tenant_email or lead.get("vehicle_status") != "active":
+            conn.rollback()
+            return {"error": "The lead is not linked to an active dealership vehicle"}
+        actor_email = (user_email or "").strip().lower()
+        owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
+        if actor_email and actor_email not in {tenant_email, owner_email}:
+            conn.rollback()
+            return {"error": "Lead not found"}
+        occupied = conn.execute(
+            "SELECT 1 FROM appointments a "
+            "JOIN leads l ON l.id=a.lead_id "
+            "JOIN vehicles v ON v.vin=l.vin "
+            "WHERE a.scheduled_at=? AND a.status='confirmed' "
+            "AND LOWER(v.user_email)=? LIMIT 1",
+            (slot_datetime, tenant_email),
+        ).fetchone()
+        if occupied:
+            conn.rollback()
+            return {"error": "That time slot is already booked"}
+        conn.execute("""
+            INSERT INTO appointments (lead_id, vin, appointment_type, scheduled_at, notes)
+            VALUES (?, ?, ?, ?, ?)
+        """, (lead_id, lead.get("vin", ""), appointment_type, slot_datetime, notes or ""))
+        conn.execute("UPDATE leads SET status='appointment_set' WHERE id=?", (lead_id,))
+        conn.commit()
+    except sqlite3.Error as exc:
+        conn.rollback()
+        return {"error": "Unable to reserve appointment slot"}
+    finally:
         conn.close()
-        return {"error": "Lead not found"}
-
-    # Insert appointment
-    conn.execute("""
-        INSERT INTO appointments (lead_id, vin, appointment_type, scheduled_at, notes)
-        VALUES (?, ?, ?, ?, ?)
-    """, (lead_id, lead.get("vin", ""), appointment_type, slot_datetime, notes))
-
-    # Update lead status
-    conn.execute("UPDATE leads SET status='appointment_set' WHERE id=?", (lead_id,))
-    conn.commit()
-    conn.close()
 
     return {
         "status": "confirmed",
@@ -436,11 +513,8 @@ def book_appointment(lead_id: int, slot_datetime: str,
 # =============================================================================
 # FOLLOW-UP QUEUE — track what to send and when
 # =============================================================================
-def get_follow_up_queue() -> list:
-    """
-    Get all pending follow-ups that need to go out.
-    Returns leads with their next scheduled action.
-    """
+def get_follow_up_queue(user_email: str | None = None) -> list:
+    """Get pending follow-ups for one tenant (None is reserved for internal dispatch)."""
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
 
@@ -461,15 +535,22 @@ def get_follow_up_queue() -> list:
     """)
 
     now = datetime.now().isoformat()
+    email = (user_email or "").strip().lower()
+    tenant_filter = (
+        " AND EXISTS (SELECT 1 FROM vehicles v WHERE v.vin=l.vin "
+        "AND LOWER(v.user_email)=?)"
+        if email else ""
+    )
+    params = (now, email) if email else (now,)
     try:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT f.*, l.name, l.email, l.phone, l.vin
             FROM follow_ups f
             JOIN leads l ON f.lead_id = l.id
-            WHERE f.status = 'pending' AND f.scheduled_for <= ?
+            WHERE f.status = 'pending' AND f.scheduled_for <= ?{tenant_filter}
             ORDER BY f.scheduled_for ASC
             LIMIT 50
-        """, (now,)).fetchall()
+        """, params).fetchall()
     except Exception:
         conn.close()
         return []
@@ -596,59 +677,67 @@ def build_digital_dossier(lead: dict, vehicle: dict,
 # =============================================================================
 # LEAD ANALYTICS — dashboard data
 # =============================================================================
-def get_lead_analytics() -> dict:
-    """
-    Get lead funnel analytics for the dashboard.
-    """
+def get_lead_analytics(user_email: str | None = None) -> dict:
+    """Get funnel metrics for one tenant; None retains the internal all-tenant view."""
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-
-    # Ensure tables exist
+    email = (user_email or "").strip().lower()
+    predicate = (
+        "EXISTS (SELECT 1 FROM vehicles v WHERE v.vin=l.vin "
+        "AND LOWER(v.user_email)=?)"
+        if email else "1=1"
+    )
+    args = (email,) if email else ()
     try:
-        conn.execute("SELECT 1 FROM leads LIMIT 1")
-    except Exception:
-        conn.close()
+        total = conn.execute(
+            f"SELECT COUNT(*) AS c FROM leads l WHERE {predicate}", args
+        ).fetchone()["c"]
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_count = conn.execute(
+            f"SELECT COUNT(*) AS c FROM leads l WHERE {predicate} AND l.created_at LIKE ?",
+            (*args, f"{today}%"),
+        ).fetchone()["c"]
+        by_status = {
+            row["status"]: row["c"]
+            for row in conn.execute(
+                f"SELECT l.status, COUNT(*) AS c FROM leads l WHERE {predicate} GROUP BY l.status", args
+            )
+        }
+        by_source = {
+            row["source"]: row["c"]
+            for row in conn.execute(
+                f"SELECT l.source, COUNT(*) AS c FROM leads l WHERE {predicate} "
+                "GROUP BY l.source ORDER BY c DESC LIMIT 10", args
+            )
+        }
+        appt_count = 0
+        queue_size = 0
+        try:
+            appt_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM appointments a JOIN leads l ON l.id=a.lead_id "
+                f"WHERE a.status='confirmed' AND {predicate}", args
+            ).fetchone()["c"]
+        except sqlite3.Error:
+            pass
+        try:
+            queue_size = conn.execute(
+                "SELECT COUNT(*) AS c FROM follow_ups f JOIN leads l ON l.id=f.lead_id "
+                f"WHERE f.status='pending' AND {predicate}", args
+            ).fetchone()["c"]
+        except sqlite3.Error:
+            pass
+    except sqlite3.Error:
         return {
             "total_leads": 0, "today_leads": 0, "by_status": {}, "by_source": {},
             "appointments_pending": 0, "follow_up_queue": 0, "conversion_rate": 0,
         }
-
-    total = conn.execute("SELECT COUNT(*) as c FROM leads").fetchone()["c"]
-    today = datetime.now().strftime("%Y-%m-%d")
-    today_count = conn.execute(
-        "SELECT COUNT(*) as c FROM leads WHERE created_at LIKE ?",
-        (f"{today}%",)
-    ).fetchone()["c"]
-
-    by_status = {}
-    for row in conn.execute("SELECT status, COUNT(*) as c FROM leads GROUP BY status"):
-        by_status[row["status"]] = row["c"]
-
-    by_source = {}
-    for row in conn.execute("SELECT source, COUNT(*) as c FROM leads GROUP BY source ORDER BY c DESC LIMIT 10"):
-        by_source[row["source"]] = row["c"]
-
-    # Appointment count
-    appt_count = 0
-    try:
-        appt_count = conn.execute("SELECT COUNT(*) as c FROM appointments WHERE status='confirmed'").fetchone()["c"]
-    except:
-        pass
-
-    # Follow-up queue size
-    queue_size = 0
-    try:
-        queue_size = conn.execute("SELECT COUNT(*) as c FROM follow_ups WHERE status='pending'").fetchone()["c"]
-    except:
-        pass
-
-    conn.close()
+    finally:
+        conn.close()
 
     conversion_rate = 0
     if total > 0:
         converted = by_status.get("appointment_set", 0) + by_status.get("sold", 0)
         conversion_rate = round((converted / total) * 100, 1)
-
     return {
         "total_leads": total,
         "today_leads": today_count,

@@ -1,48 +1,46 @@
-; Inno Setup script — builds a distributable LotVue360-Setup.exe.
-; Compile with: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" LotVue360.iss
-; (Install Inno Setup 6 first: winget install JRSoftware.InnoSetup)
-;
-; This packages the PyInstaller output (dist\LotVue360) into a one-click installer
-; with Start-Menu + Desktop shortcuts, Add/Remove Programs entry, and optional
-; launch-on-startup. Per-user install — no admin required.
-
+; Native per-user, one-click Windows installer compiled by the Desktop releases workflow.
+; The installer payload is the verified frozen package under build\\desktop\\dist\\LotVue360.
 #define MyAppName "LotVue360"
-#define MyAppVersion "2.0.0"
-#define MyAppPublisher "ABUZ8 LLC"
+#define MyAppVersion "2.1.0"
+#define MyAppPublisher "LotVue360"
 #define MyAppExeName "LotVue360.exe"
 
 [Setup]
-AppId={{B7A3F2E1-360C-4A55-9E2F-LOTVUE360CAR}}
+; Keep this stable between updates so Windows recognizes the same application.
+AppId={{A4B981C2-2A8C-4E63-9E3B-360054D9AD80}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+AppVerName={#MyAppName}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\Programs\LotVue360
+DefaultGroupName=LotVue360
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
-OutputDir=installer
-OutputBaseFilename=LotVue360-Setup-{#MyAppVersion}
-SetupIconFile=dist\LotVue360\static\desktop\lotvue.ico
+ArchitecturesAllowed=x64
+ArchitecturesInstallIn64BitMode=x64
+OutputDir=dist\desktop-release
+OutputBaseFilename=LotVue360-OneClick-windows-x64
+SetupIconFile=build\desktop\dist\LotVue360\app\static\desktop\lotvue.ico
+UninstallDisplayIcon={app}\LotVue360.exe
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+CloseApplications=yes
+CloseApplicationsFilter=LotVue360.exe
+Uninstallable=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
-Name: "startupicon"; Description: "Launch LotVue360 when I sign in"; GroupDescription: "Startup:"; Flags: unchecked
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "dist\LotVue360\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "build\desktop\dist\LotVue360\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\LotVue360"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\LotVue360"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-
-[Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; \
-  ValueName: "LotVue360"; ValueData: """{app}\{#MyAppExeName}"""; Tasks: startupicon; Flags: uninsdeletevalue
+Name: "{autoprograms}\LotVue360"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
+Name: "{autodesktop}\LotVue360"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch LotVue360 now"; Flags: nowait postinstall skipifsilent

@@ -14,6 +14,8 @@ Exit code 0 even on per-photo errors (they get category "detail", the safe
 bucket — never pollutes the 360 spin, never hides a cabin shot in exteriors).
 """
 import json
+import math
+import os
 import sys
 from pathlib import Path
 
@@ -54,51 +56,101 @@ PROMPTS = {
 }
 
 
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, minimum), maximum)
+
+
 def main(photo_dir: str) -> dict:
     import torch
     from PIL import Image, ImageOps
     from transformers import CLIPModel, CLIPProcessor
 
-    photos = sorted(Path(photo_dir).glob("p_*.jpg"))
+    root = Path(photo_dir)
+    if root.is_symlink() or not root.is_dir():
+        return {"ok": False, "error": "photo_dir must be a regular directory"}
+    max_photos = _bounded_env_int("LOTVUE_MAX_IMPORT_PHOTOS", 100, 4, 500)
+    max_pixels = _bounded_env_int("LOTVUE_MAX_IMPORT_IMAGE_PIXELS", 16_000_000, 1_000_000, 40_000_000)
+    photos = sorted(
+        photo for photo in root.glob("p_*.jpg")
+        if photo.is_file() and not photo.is_symlink()
+    )
     if not photos:
-        return {"ok": False, "error": f"no p_*.jpg in {photo_dir}"}
+        return {"ok": False, "error": f"no regular p_*.jpg files in {photo_dir}"}
+    if len(photos) > max_photos:
+        return {"ok": False, "error": f"photo set exceeds {max_photos} files"}
 
-    model = CLIPModel.from_pretrained(MODEL_ID)
-    proc = CLIPProcessor.from_pretrained(MODEL_ID)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = CLIPModel.from_pretrained(MODEL_ID).to(device)
+    processor = CLIPProcessor.from_pretrained(MODEL_ID)
     model.eval()
 
     out = []
-    with torch.no_grad():
+    with torch.inference_mode():
         class_embeds = {}
-        for cls, plist in PROMPTS.items():
-            ti = proc(text=plist, return_tensors="pt", padding=True)
-            te = model.get_text_features(**ti)
-            # keep every prompt vector: class score = BEST prompt match, not the
-            # averaged embedding — multi-modal classes (gauges vs seats vs door
-            # panels) lose their specificity when averaged.
-            class_embeds[cls] = te / te.norm(dim=-1, keepdim=True)
+        for class_name, prompt_list in PROMPTS.items():
+            inputs = processor(text=prompt_list, return_tensors="pt", padding=True)
+            inputs = {key: value.to(device) for key, value in inputs.items()}
+            text_features = model.get_text_features(**inputs)
+            normalized = text_features / text_features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            class_embeds[class_name] = normalized
+            del inputs, text_features, normalized
 
-        for p in photos:
+        for photo in photos:
+            image = None
             try:
-                im = ImageOps.exif_transpose(Image.open(p)).convert("RGB")
-                ii = proc(images=im, return_tensors="pt")
-                ie = model.get_image_features(**ii)
-                ie = (ie / ie.norm(dim=-1, keepdim=True)).squeeze(0)
+                with Image.open(photo) as source:
+                    if source.width * source.height > max_pixels:
+                        raise ValueError("image exceeds the configured pixel limit")
+                    oriented = ImageOps.exif_transpose(source)
+                    try:
+                        image = oriented.convert("RGB")
+                    finally:
+                        if oriented is not source:
+                            oriented.close()
+                # CLIP will rescale to its input size; a bounded pre-resize avoids
+                # allocating tensors proportional to full-resolution upload size.
+                image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+                inputs = processor(images=image, return_tensors="pt")
+                inputs = {key: value.to(device) for key, value in inputs.items()}
+                image_features = model.get_image_features(**inputs)
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                image_features = image_features.squeeze(0)
                 per_class = {}
-                for c, e in class_embeds.items():
-                    v = e @ ie
-                    j = int(v.argmax())
-                    per_class[c] = (float(v[j]), PROMPTS[c][j])
-                sims = {c: s for c, (s, _) in per_class.items()}
-                ordered = sorted(sims.items(), key=lambda kv: -kv[1])
-                margin = ordered[0][1] - ordered[1][1]
-                out.append({"file": p.name, "category": ordered[0][0],
-                            "confidence": round(min(0.99, 0.70 + margin * 5.0), 2),
-                            "margin": round(margin, 4),
-                            "won_by": per_class[ordered[0][0]][1]})
-            except Exception as e:
-                out.append({"file": p.name, "category": "detail",
-                            "confidence": 0.30, "error": f"{type(e).__name__}: {e}"})
+                for class_name, embeds in class_embeds.items():
+                    similarities = embeds @ image_features
+                    best_index = int(similarities.argmax().item())
+                    best_score = float(similarities[best_index].item())
+                    per_class[class_name] = (best_score, PROMPTS[class_name][best_index])
+                ordered = sorted(per_class.items(), key=lambda item: -item[1][0])
+                margin = ordered[0][1][0] - ordered[1][1][0]
+                confidence = min(0.99, max(0.30, 0.70 + margin * 5.0))
+                if not math.isfinite(confidence) or not math.isfinite(margin):
+                    raise ValueError("classifier returned a non-finite score")
+                category = ordered[0][0]
+                if category not in PROMPTS:
+                    raise ValueError("classifier returned an unsupported category")
+                out.append({
+                    "file": photo.name,
+                    "category": category,
+                    "confidence": round(confidence, 2),
+                    "margin": round(margin, 4),
+                    "won_by": per_class[category][1],
+                })
+                del inputs, image_features, per_class
+            except Exception as exc:
+                out.append({
+                    "file": photo.name,
+                    "category": "detail",
+                    "confidence": 0.30,
+                    "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                })
+            finally:
+                if image is not None:
+                    image.close()
     return {"ok": True, "model": MODEL_ID, "photos": out}
 
 

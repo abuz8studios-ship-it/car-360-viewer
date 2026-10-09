@@ -5,14 +5,15 @@ glb_gen.py — LotVue AI-3D lane: 4 dealer photos -> Hunyuan3D-2mv (ComfyUI nati
 Usage: python glb_gen.py --vin 4JGFB5KB6NA764948 [--steps 8] [--octree 384]
 Requires: ComfyUI running on :8188 with hunyuan3d-dit-v2-mv-turbo_fp16.safetensors.
 """
-import argparse, json, shutil, sys, time, urllib.request
+import argparse, json, os, shutil, sys, time, urllib.request
 from pathlib import Path
 
-BASE = Path(__file__).parent
-STORAGE = BASE / "storage"
-COMFY = "http://127.0.0.1:8188"
-COMFY_INPUT = Path(r"E:\ABU\ComfyUI\input")
-COMFY_OUTPUT = Path(r"E:\ABU\ComfyUI\output")
+from app_paths import BASE_DIR as BASE, STORAGE_DIR as STORAGE, configured_path
+
+_COMFYUI_ROOT = configured_path("COMFYUI_ROOT", BASE / "ComfyUI")
+COMFY = (os.getenv("COMFYUI_URL") or "http://127.0.0.1:8188").rstrip("/")
+COMFY_INPUT = configured_path("COMFYUI_INPUT", _COMFYUI_ROOT / "input")
+COMFY_OUTPUT = configured_path("COMFYUI_OUTPUT", _COMFYUI_ROOT / "output")
 CKPT = "hunyuan3d-dit-v2-mv-turbo_fp16.safetensors"
 VIEWS = ["front", "right", "back", "left"]   # walkaround order assumption
 
@@ -43,9 +44,11 @@ def pick_views(vin: str):
 def prep(img_path: Path, out_name: str) -> str:
     """rembg -> white composite -> centered square 1024 png in ComfyUI input dir."""
     from PIL import Image
-    from rembg import remove, new_session
+    from rembg_runtime import is_enabled, remove, require_session
+    if not is_enabled():
+        raise RuntimeError("No explicitly approved background-removal model is configured")
     if not hasattr(prep, "_s"):
-        prep._s = new_session("isnet-general-use", providers=["CPUExecutionProvider"])
+        prep._s = require_session()
     im = Image.open(img_path).convert("RGB")
     cut = remove(im, session=prep._s)
     bbox = cut.getbbox()
@@ -54,6 +57,7 @@ def prep(img_path: Path, out_name: str) -> str:
     side = int(max(cut.size) * 1.15)
     canvas = Image.new("RGBA", (side, side), (255, 255, 255, 255))
     canvas.paste(cut, ((side - cut.width) // 2, (side - cut.height) // 2), cut)
+    COMFY_INPUT.mkdir(parents=True, exist_ok=True)
     out = COMFY_INPUT / out_name
     canvas.convert("RGB").resize((1024, 1024), Image.LANCZOS).save(out, "PNG")
     return out_name

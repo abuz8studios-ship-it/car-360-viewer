@@ -1,0 +1,619 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
+from PIL import Image, ImageDraw
+
+ROOT = Path(__file__).resolve().parents[1]
+APP_DIR = ROOT / "app"
+sys.path.insert(0, str(APP_DIR))
+
+import main  # noqa: E402
+import studio_agent  # noqa: E402
+from ai_studio import photo_processor  # noqa: E402
+from ai_studio.background_studio import PREMIUM_SCENES, list_scenes  # noqa: E402
+from app.auth_gate import _private_vehicle_scope  # noqa: E402
+from background_catalog import STATIC_BACKGROUND_DIR, list_background_assets  # noqa: E402
+from a2_extensions import H, W, _render_bg  # noqa: E402
+
+VIN = "1HGCM82633A004352"
+
+
+def _vehicle(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
+    storage = tmp_path / "storage"
+    vehicle_dir = storage / VIN
+    exterior = vehicle_dir / "exterior"
+    exterior.mkdir(parents=True)
+    db_path = tmp_path / "vehicles.sqlite3"
+    monkeypatch.setattr(main, "STORAGE_DIR", storage)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    main.init_db()
+    main.db_upsert_vehicle(VIN, "2022", "Test", "Vehicle", user_email="dealer@example.test")
+    return vehicle_dir, exterior
+
+
+def _make_frames(exterior: Path, count: int = 4) -> None:
+    for index in range(count):
+        image = Image.new("RGB", (96, 64), (35 + index * 8, 50, 70))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((14 + index, 25, 78 + index, 50), fill=(190, 40 + index * 8, 35))
+        image.save(exterior / f"frame_{index + 1:04d}.jpg", quality=85)
+        image.close()
+
+
+def test_procedural_background_gradient_preserves_endpoints() -> None:
+    image = _render_bg((10, 20, 30), (210, 220, 230), "plain")
+    try:
+        assert image.size == (W, H)
+        assert image.getpixel((0, 0)) == (10, 20, 30)
+        assert image.getpixel((W - 1, H - 1)) == (210, 220, 230)
+    finally:
+        image.close()
+
+
+def test_packaged_backgrounds_are_one_real_shared_catalog() -> None:
+    assets = list_background_assets()
+    disk_assets = sorted(STATIC_BACKGROUND_DIR.glob("*.jpg"))
+    assert assets
+    assert len(assets) == len(disk_assets)
+    for asset in assets:
+        assert (ROOT / "app" / "static" / asset["url"].removeprefix("/static/")).is_file()
+        assert (ROOT / "app" / "static" / asset["thumbnail_url"].removeprefix("/static/")).is_file()
+
+    scenes = list_scenes()
+    assert set(scene["id"] for scene in scenes) == set(PREMIUM_SCENES)
+    assert all(scene["renderer"] == "local_image_composite" for scene in scenes)
+    assert all(scene["ai_generated"] is False for scene in scenes)
+    assert all(scene["has_preview"] for scene in scenes)
+
+
+def test_photo_processor_never_claims_background_swap_without_a_cutout(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "input.jpg"
+    output = tmp_path / "studio.jpg"
+    Image.new("RGB", (320, 180), (120, 140, 160)).save(source)
+
+    def no_cutout(image):
+        return image.convert("RGBA"), None
+
+    monkeypatch.setattr(photo_processor, "remove_background", no_cutout)
+    monkeypatch.setattr(photo_processor, "BACKGROUNDS_DIR", tmp_path / "missing-backgrounds")
+    result = photo_processor.PhotoProcessor().process(str(source), str(output))
+
+    assert result["status"] == "degraded"
+    assert "bg_removal:unavailable_or_no_alpha" in result["steps"]
+    assert "bg_swap:skipped_without_cutout" in result["steps"]
+    assert output.is_file()
+    with Image.open(output) as processed:
+        assert processed.size == (320, 180)
+
+
+def test_photo_processor_honors_keep_background_selection_without_cutout(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "input.jpg"
+    output = tmp_path / "studio.jpg"
+    Image.new("RGB", (320, 180), (120, 140, 160)).save(source)
+
+    def should_not_remove(_image):
+        raise AssertionError("keep-background selection must not call cut-out")
+
+    monkeypatch.setattr(photo_processor, "remove_background", should_not_remove)
+    result = photo_processor.PhotoProcessor(background_name="none").process(
+        str(source), str(output)
+    )
+
+    assert output.is_file()
+    assert result["steps"][:2] == [
+        "bg_removal:skipped_keep_background", "bg_swap:skipped_keep_background",
+    ]
+    assert not any(step.startswith("bg_removal:error") for step in result["steps"])
+
+
+def test_strict_photo_processing_does_not_publish_without_a_cutout(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "input.jpg"
+    output = tmp_path / "studio.jpg"
+    Image.new("RGB", (320, 180), (120, 140, 160)).save(source)
+
+    def no_cutout(image):
+        return image.convert("RGBA"), None
+
+    monkeypatch.setattr(photo_processor, "remove_background", no_cutout)
+    result = photo_processor.PhotoProcessor(
+        require_background_removal=True,
+    ).process(str(source), str(output))
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "BackgroundRemovalRequiredError"
+    assert "bg_swap:blocked_without_cutout" in result["steps"]
+    assert any("no replacement output was written" in warning for warning in result["warnings"])
+    assert not output.exists()
+
+
+def test_strict_photo_processing_requires_requested_scene_before_output(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "input.jpg"
+    output = tmp_path / "studio.jpg"
+    Image.new("RGB", (320, 180), (120, 140, 160)).save(source)
+    backgrounds = tmp_path / "backgrounds"
+    backgrounds.mkdir()
+    Image.new("RGB", (320, 180), (60, 170, 100)).save(backgrounds / "studio_white.jpg")
+    monkeypatch.setattr(photo_processor, "BACKGROUNDS_DIR", backgrounds)
+
+    def make_cutout(image):
+        cutout = image.convert("RGBA")
+        mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(mask).rectangle((30, 30, 290, 150), fill=255)
+        cutout.putalpha(mask)
+        return cutout, mask
+
+    monkeypatch.setattr(photo_processor, "remove_background", make_cutout)
+    result = photo_processor.PhotoProcessor(
+        background_name="showroom_lux",
+        require_background_removal=True,
+    ).process(str(source), str(output))
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "BackgroundReplacementRequiredError"
+    assert "bg_swap:blocked_without_replacement" in result["steps"]
+    assert not output.exists()
+
+
+def test_photo_processor_strict_mode_completes_with_cutout_and_packaged_scene(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "input.jpg"
+    output = tmp_path / "studio.jpg"
+    backgrounds = tmp_path / "backgrounds"
+    backgrounds.mkdir()
+    Image.new("RGB", (320, 180), (60, 170, 100)).save(backgrounds / "studio_white.jpg")
+    Image.new("RGB", (320, 180), (120, 140, 160)).save(source)
+    monkeypatch.setattr(photo_processor, "BACKGROUNDS_DIR", backgrounds)
+
+    def make_cutout(image):
+        cutout = image.convert("RGBA")
+        mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(mask).rectangle((30, 30, 290, 150), fill=255)
+        cutout.putalpha(mask)
+        return cutout, mask
+
+    monkeypatch.setattr(photo_processor, "remove_background", make_cutout)
+    result = photo_processor.PhotoProcessor(
+        require_background_removal=True,
+    ).process(str(source), str(output))
+
+    assert result["status"] in {"ok", "degraded"}
+    assert "bg_removal:ok" in result["steps"]
+    assert "bg_swap:ok" in result["steps"]
+    assert output.is_file()
+
+
+def test_background_swap_rejects_empty_and_opaque_masks(monkeypatch) -> None:
+    from ai_studio import background_swap
+    import rembg_runtime
+
+    monkeypatch.setattr(rembg_runtime, "is_enabled", lambda: True)
+    source = Image.new("RGB", (16, 12), (90, 110, 130))
+
+    for alpha_value in (0, 255):
+        def fake_remove(_image, value=alpha_value):
+            result = Image.new("RGBA", (16, 12), (200, 40, 30, value))
+            return result
+
+        monkeypatch.setattr(rembg_runtime, "remove", fake_remove)
+        cutout, mask = background_swap.remove_background(source)
+        alpha = cutout.getchannel("A")
+        try:
+            assert mask is None
+            assert alpha.getextrema() == (255, 255)
+        finally:
+            alpha.close()
+            cutout.close()
+    source.close()
+
+
+def test_360_render_uses_truthful_natural_fallback_and_commits_36_frames(tmp_path, monkeypatch) -> None:
+    vehicle_dir, exterior = _vehicle(tmp_path, monkeypatch)
+    _make_frames(exterior)
+    monkeypatch.setattr(main, "REMBG_AVAILABLE", False)
+    monkeypatch.setenv("LOTVUE_RENDER_MODE", "studio")
+
+    main._run_vehicle_spin_job(VIN)
+
+    spin_dir = vehicle_dir / "spin"
+    spin_frames = sorted(spin_dir.glob("spin_*.jpg"))
+    assert len(spin_frames) == 36
+    manifest = json.loads((spin_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["render_mode"] == "natural"
+    assert manifest["render_status"] == "degraded"
+    assert manifest["background_removed"] is False
+    assert (vehicle_dir / "thumbnail.jpg").is_file()
+    job = next(item for item in main._read_pipeline_jobs(VIN) if item["kind"] == "spin")
+    assert job["status"] == "degraded"
+    assert "photographed backgrounds were retained" in job["message"]
+    assert not list(vehicle_dir.glob(".spin-stage-*"))
+
+
+def test_failed_360_rebuild_preserves_previous_viewer_output(tmp_path, monkeypatch) -> None:
+    vehicle_dir, exterior = _vehicle(tmp_path, monkeypatch)
+    _make_frames(exterior)
+    spin_dir = vehicle_dir / "spin"
+    spin_dir.mkdir()
+    old_frame = spin_dir / "spin_0001.jpg"
+    old_frame.write_bytes(b"previous-good-frame")
+    monkeypatch.setattr(main, "interpolate_frames", lambda *args, **kwargs: 0)
+
+    main._run_vehicle_spin_job(VIN)
+
+    assert old_frame.read_bytes() == b"previous-good-frame"
+    job = next(item for item in main._read_pipeline_jobs(VIN) if item["kind"] == "spin")
+    assert job["status"] == "error"
+    assert "viewer output" in job["message"].lower()
+
+
+def test_strict_background_replacement_fails_closed_when_rembg_is_missing(tmp_path, monkeypatch) -> None:
+    _vehicle(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "REMBG_AVAILABLE", False)
+
+    try:
+        main._queue_photo_studio_job(
+            VIN, background="studio_white", kind="background_studio",
+            max_photos=20, require_rembg=True,
+        )
+    except HTTPException as exc:
+        assert exc.status_code == 503
+        assert "no photos were changed" in exc.detail
+    else:
+        raise AssertionError("strict scene replacement must not report success without rembg")
+
+
+def test_background_studio_queue_forwards_required_removal_policy(tmp_path, monkeypatch) -> None:
+    _, exterior = _vehicle(tmp_path, monkeypatch)
+    _make_frames(exterior, count=1)
+    monkeypatch.setattr(main, "REMBG_AVAILABLE", True)
+    submitted = []
+
+    def capture_submission(key, target, *args):
+        submitted.append((key, target, args))
+        return "started"
+
+    monkeypatch.setattr(main, "_submit_background_job", capture_submission)
+    result = main._queue_photo_studio_job(
+        VIN, background="studio_white", kind="background_studio",
+        max_photos=20, require_rembg=True,
+    )
+
+    assert result["status"] == "started"
+    assert submitted[0][0] == f"background_studio:{VIN}"
+    assert submitted[0][1] is main._run_photo_studio_job
+    assert submitted[0][2][-1] is True
+
+
+def test_background_studio_worker_preserves_previous_outputs_when_cutout_fails(
+    tmp_path, monkeypatch,
+) -> None:
+    vehicle_dir, exterior = _vehicle(tmp_path, monkeypatch)
+    _make_frames(exterior, count=1)
+    studio_dir = vehicle_dir / "studio"
+    studio_dir.mkdir()
+    previous = studio_dir / "studio_previous.jpg"
+    previous.write_bytes(b"previous approved output")
+
+    def no_cutout(image):
+        return image.convert("RGBA"), None
+
+    monkeypatch.setattr(photo_processor, "remove_background", no_cutout)
+    monkeypatch.setattr(photo_processor, "BACKGROUNDS_DIR", tmp_path / "backgrounds")
+
+    main._run_photo_studio_job(
+        VIN, "studio_white", False, "background_studio", 20,
+        require_background_removal=True,
+    )
+
+    assert previous.read_bytes() == b"previous approved output"
+    assert not list(studio_dir.glob("studio_frame_*.jpg"))
+    assert not list(vehicle_dir.glob(".studio-stage-*"))
+    job = next(item for item in main._read_pipeline_jobs(VIN) if item["kind"] == "background_studio")
+    assert job["status"] == "error"
+    assert job["succeeded"] == 0
+    assert job["failed"] == 1
+
+
+def test_public_viewer_page_returns_at_most_120_frames(tmp_path, monkeypatch) -> None:
+    vehicle_dir, _ = _vehicle(tmp_path, monkeypatch)
+    spin_dir = vehicle_dir / "spin"
+    spin_dir.mkdir()
+    job_id = "viewer-frame-cap-test"
+    main.db_upsert_vehicle(
+        VIN, "2022", "Test", "Vehicle", user_email="dealer@example.test", job_id=job_id
+    )
+    for index in range(1, 131):
+        (spin_dir / f"spin_{index:04d}.jpg").write_bytes(b"frame")
+
+    response = TestClient(main.app).get(f"/viewer/{job_id}")
+
+    assert response.status_code == 200
+    encoded_urls = response.text.split("const FRAME_URLS = ", 1)[1].split(";", 1)[0]
+    urls = json.loads(encoded_urls)
+    assert len(urls) == 120
+    assert urls[0].endswith("spin_0001.jpg")
+    assert urls[-1].endswith("spin_0120.jpg")
+
+
+def test_authenticated_studio_page_and_vehicle_plan_enforce_tenancy(tmp_path, monkeypatch) -> None:
+    import a2_extensions
+    from ai_studio import video_walkaround
+
+    storage = tmp_path / "storage"
+    exterior = storage / VIN / "exterior"
+    exterior.mkdir(parents=True)
+    source_photo = Image.new("RGBA", (8, 8), (190, 40, 35, 255))
+    source_photo.save(exterior / "frame_0001.png")
+    source_photo.close()
+    db_path = tmp_path / "studio-auth.sqlite3"
+    monkeypatch.setattr(main, "STORAGE_DIR", storage)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    monkeypatch.setattr(a2_extensions, "STORAGE_DIR", storage)
+    monkeypatch.setattr(a2_extensions, "DB_PATH", db_path)
+    monkeypatch.setenv("LOTVUE_JWT_SECRET", "dealer-studio-test-secret-" + "x" * 40)
+    monkeypatch.delenv("LOTVUE_OWNER_EMAIL", raising=False)
+    main.init_db()
+    main.db_create_user("dealer@example.test")
+    main.db_create_user("other@example.test")
+    main.db_upsert_vehicle(
+        VIN, "2022", "Test", "Vehicle", user_email="dealer@example.test"
+    )
+    client = TestClient(main.app)
+    owner_token = a2_extensions._make_tokens("dealer@example.test")["access_token"]
+    other_token = a2_extensions._make_tokens("other@example.test")["access_token"]
+
+    assert client.get(f"/api/studio/vehicles/{VIN}/plan").status_code == 401
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    other_headers = {"Authorization": f"Bearer {other_token}"}
+    studio_page = client.get("/studio", headers=owner_headers)
+    assert studio_page.status_code == 200
+    assert 'id="sceneImage"' in studio_page.text
+    assert 'id="sceneEngine"' in studio_page.text
+    assert "scene-preview" in studio_page.text
+    assert "'/api/photo/composite'" in studio_page.text
+    assert 'id="videoScriptBtn"' in studio_page.text
+    assert "'/api/vehicle/'+encodeURIComponent(vin)+'/video-ad'" in studio_page.text
+    assert 'id="walkaroundBtn"' in studio_page.text
+    assert "'/api/vehicle/'+encodeURIComponent(vin)+'/walkaround'" in studio_page.text
+    assert "/walkaround-status" in studio_page.text
+    assert "walkaround source cap" in studio_page.text
+    assert "angles rendered / job" in studio_page.text
+    assert "entries / source folder" in studio_page.text
+    assert client.get(f"/api/studio/vehicles/{VIN}/plan", headers=owner_headers).status_code == 200
+    scene_inputs = client.get(f"/api/studio/vehicles/{VIN}/scene-inputs", headers=owner_headers)
+    assert scene_inputs.status_code == 200
+    assert scene_inputs.json()["images"][0]["path"] == f"/storage/{VIN}/exterior/frame_0001.png"
+    assert scene_inputs.json()["limit"] == 72
+    assert scene_inputs.json()["scan_limit"] == 4096
+    assert scene_inputs.json()["validation_bytes_limit"] == 200 * 1024 * 1024
+    assert client.post(f"/api/vehicle/{VIN}/video-ad", json={"type": "listing"}).status_code == 401
+    video_script = client.post(
+        f"/api/vehicle/{VIN}/video-ad", headers=owner_headers, json={"type": "social"}
+    )
+    assert video_script.status_code == 200
+    assert video_script.json()["script"]["ad_type"] == "social"
+    assert video_script.json()["script"]["total_duration"] == 15
+    assert len(video_script.json()["script"]["scenes"]) == 4
+    assert client.post(
+        f"/api/vehicle/{VIN}/video-ad", headers=owner_headers, json={"type": "unknown"}
+    ).status_code == 422
+    assert client.post(
+        f"/api/vehicle/{VIN}/video-ad", headers=other_headers, json={"type": "listing"}
+    ).status_code == 404
+    video_walkaround._walkaround_status.pop(VIN, None)
+    previous_video = storage / VIN / "walkaround" / "walkaround.mp4"
+    previous_video.parent.mkdir(parents=True)
+    previous_video.write_bytes(b"previous public walkaround")
+    for route in main.app.routes:
+        if getattr(route, "path", None) == "/storage":
+            monkeypatch.setattr(route.app, "directory", str(storage))
+            monkeypatch.setattr(route.app, "all_directories", [str(storage)])
+    public_media = client.get(f"/storage/{VIN}/walkaround/walkaround.mp4")
+    assert public_media.status_code == 200
+    assert public_media.content == b"previous public walkaround"
+    hidden_work_dir = previous_video.parent / ".walkaround-work-regression"
+    hidden_work_dir.mkdir()
+    hidden_clip = hidden_work_dir / "clip_front.mp4"
+    hidden_clip.write_bytes(b"private intermediate")
+    hidden_url = f"/storage/{VIN}/walkaround/.walkaround-work-regression/clip_front.mp4"
+    assert client.get(hidden_url).status_code == 404
+    assert client.get(hidden_url, headers=owner_headers).status_code == 404
+    submitted = []
+    active_job = {"value": False}
+    monkeypatch.setattr(
+        main, "_background_job_running", lambda _key: active_job["value"]
+    )
+    monkeypatch.setattr(
+        main, "_submit_background_job",
+        lambda name, callback: (submitted.append((name, callback)), "started")[1],
+    )
+
+    def failed_walkaround(_vin, _vehicle_info, **limits):
+        assert limits["max_photo_bytes"] == main.MAX_PHOTO_MB * 1024 * 1024
+        assert limits["max_image_pixels"] == main.MAX_UPLOAD_IMAGE_PIXELS
+        assert limits["validation_bytes_limit"] == min(
+            main.MAX_PHOTO_BATCH_MB * 1024 * 1024,
+            video_walkaround.MAX_WALKAROUND_VALIDATION_BYTES,
+        )
+        raise RuntimeError("private implementation detail")
+
+    monkeypatch.setattr(video_walkaround, "generate_walkaround", failed_walkaround)
+    assert client.post(f"/api/vehicle/{VIN}/walkaround").status_code == 401
+    walkaround_start = client.post(f"/api/vehicle/{VIN}/walkaround", headers=owner_headers)
+    assert walkaround_start.status_code == 200
+    assert walkaround_start.json()["status"] == "started"
+    assert submitted[0][0] == f"walkaround:{VIN}"
+    active_job["value"] = True
+    queued_status = client.get(
+        f"/api/vehicle/{VIN}/walkaround-status", headers=owner_headers
+    ).json()
+    assert queued_status["status"] == "queued"
+    assert "url" not in queued_status
+    already_running = client.post(
+        f"/api/vehicle/{VIN}/walkaround", headers=owner_headers
+    )
+    assert already_running.status_code == 200
+    assert already_running.json()["status"] == "already_running"
+    try:
+        submitted[0][1]()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Expected the stubbed walkaround engine to fail")
+    failed_status = client.get(
+        f"/api/vehicle/{VIN}/walkaround-status", headers=owner_headers
+    ).json()
+    assert failed_status["status"] == "error"
+    assert failed_status["error"] == "Walkaround generation stopped unexpectedly"
+    assert client.get(
+        f"/api/vehicle/{VIN}/walkaround-status", headers=other_headers
+    ).status_code == 404
+    assert client.post(
+        f"/api/vehicle/{VIN}/walkaround", headers=other_headers
+    ).status_code == 404
+    assert client.get(f"/api/studio/vehicles/{VIN}/plan", headers=other_headers).status_code == 404
+    assert client.get(f"/api/studio/vehicles/{VIN}/scene-inputs", headers=other_headers).status_code == 404
+
+
+def test_scene_input_enumeration_skips_symlinks_and_caps_results(tmp_path, monkeypatch) -> None:
+    storage = tmp_path / "storage"
+    vehicle = storage / VIN
+    exterior = vehicle / "exterior"
+    raw = vehicle / "raw"
+    exterior.mkdir(parents=True)
+    raw.mkdir(parents=True)
+    monkeypatch.setattr(main, "STORAGE_DIR", storage)
+
+    jpg_template = tmp_path / "valid.jpg"
+    jpg_sample = Image.new("RGB", (8, 8), (180, 35, 25))
+    jpg_sample.save(jpg_template, format="JPEG")
+    jpg_sample.close()
+    jpg_bytes = jpg_template.read_bytes()
+    jpg_template.unlink()
+    png_template = tmp_path / "valid.png"
+    png_sample = Image.new("RGBA", (8, 8), (180, 35, 25, 255))
+    png_sample.save(png_template, format="PNG")
+    png_sample.close()
+    png_bytes = png_template.read_bytes()
+    png_template.unlink()
+    for index in range(60):
+        (exterior / f"ext_{index:03d}.jpg").write_bytes(jpg_bytes)
+    for index in range(30):
+        (raw / f"raw_{index:03d}.png").write_bytes(png_bytes)
+    (exterior / "notes.txt").write_text("not an image", encoding="utf-8")
+    (exterior / ".hidden.png").write_bytes(png_bytes)
+    (exterior / "broken.jpg").write_bytes(b"not actually an image")
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(png_bytes)
+    (exterior / "aaa_link.png").symlink_to(outside)
+
+    images = studio_agent._list_vehicle_scene_inputs(main, VIN)
+
+    assert len(images) == 72
+    assert images[0]["path"] == f"/storage/{VIN}/exterior/ext_000.jpg"
+    assert all(image["path"].startswith(f"/storage/{VIN}/") for image in images)
+    assert not any("aaa_link" in image["filename"] for image in images)
+    assert not any(image["filename"].startswith(".") for image in images)
+    assert not any(image["filename"] == "broken.jpg" for image in images)
+
+    monkeypatch.setattr(studio_agent, "_SCENE_INPUT_SCAN_LIMIT", 5)
+    assert len(studio_agent._list_vehicle_scene_inputs(main, VIN)) <= 5
+    monkeypatch.setattr(studio_agent, "_SCENE_INPUT_SCAN_LIMIT", 4096)
+    monkeypatch.setattr(studio_agent, "_SCENE_INPUT_VALIDATION_BYTES", 10)
+    assert studio_agent._list_vehicle_scene_inputs(main, VIN) == []
+
+
+def test_google_feed_readiness_matches_static_route_requirements(monkeypatch) -> None:
+    required = {
+        "LOTVUE_GOOGLE_FEED_TOKEN": "feed-secret-" + "x" * 40,
+        "LOTVUE_GOOGLE_FEED_USER_EMAIL": "dealer@example.test",
+        "LOTVUE_GOOGLE_STORE_CODE": "store-1",
+        "LOTVUE_DEALER_NAME": "Example Motors",
+        "LOTVUE_DEALER_ADDR1": "1 Main Street",
+        "LOTVUE_DEALER_CITY": "Dayton",
+        "LOTVUE_DEALER_REGION": "OH",
+        "LOTVUE_DEALER_POSTAL": "45402",
+        "LOTVUE_PUBLIC_URL": "https://dealer.example",
+    }
+    for key in required:
+        monkeypatch.delenv(key, raising=False)
+    assert studio_agent._google_feed_configuration_ready() is False
+
+    for key, value in required.items():
+        monkeypatch.setenv(key, value)
+    assert studio_agent._google_feed_configuration_ready() is True
+    monkeypatch.setenv("LOTVUE_PUBLIC_URL", "https://localhost")
+    assert studio_agent._google_feed_configuration_ready() is False
+    monkeypatch.setenv("LOTVUE_PUBLIC_URL", "https://dealer.example")
+    monkeypatch.setenv("LOTVUE_GOOGLE_FEED_TOKEN", "x" * 513)
+    assert studio_agent._google_feed_configuration_ready() is False
+
+
+def test_studio_vehicle_routes_are_tenant_scoped_and_health_is_non_probing(tmp_path, monkeypatch) -> None:
+    import rembg_runtime
+    from ai_studio import video_walkaround
+
+    monkeypatch.setattr(main, "GPU_INFO", {**main.GPU_INFO, "cuda": False})
+    monkeypatch.delenv("COMFYUI_URL", raising=False)
+    monkeypatch.setattr(video_walkaround, "FACTORY_DIR", tmp_path / "no-factory")
+    monkeypatch.setattr(main, "REMBG_AVAILABLE", False)
+    monkeypatch.setattr(rembg_runtime, "package_available", lambda: True)
+    monkeypatch.delenv("LOTVUE_REMBG_MODEL", raising=False)
+    monkeypatch.delenv("LOTVUE_REMBG_LICENSE_ACCEPTED", raising=False)
+    monkeypatch.delenv("LOTVUE_COMFYUI_SCENE_WORKFLOW", raising=False)
+    for suffix in ("plan", "jobs", "run"):
+        path = f"/api/studio/vehicles/{VIN}/{suffix}"
+        assert _private_vehicle_scope(path) == VIN
+
+    payload = studio_agent.build_system_health(main)
+    assert payload["external_services_contacted"] is False
+    assert payload["probe_mode"] == "local_configuration_only"
+    assert payload["limits"]["spin_frames"] == 36
+    assert payload["limits"]["viewer_frames"] == 120
+    assert payload["limits"]["vehicle_media_entries"] == 300
+    assert payload["limits"]["comfyui_scene_generation_jobs"] == 1
+    assert payload["subsystems"]["billing"]["status"] == "owner_action_required"
+    assert payload["subsystems"]["background_removal"]["status"] == "setup_required"
+    assert "no model is selected" in payload["subsystems"]["background_removal"]["detail"]
+    assert payload["subsystems"]["comfyui_scene_generation"]["status"] == "setup_required"
+    assert payload["runtime"]["comfyui_scene_workflow_configured"] is False
+    assert payload["subsystems"]["video_walkaround"]["status"] == "setup_required"
+    assert payload["runtime"]["video_walkaround_ready"] is False
+    assert "pricing_approved" in payload["runtime"]
+
+
+def test_video_walkaround_readiness_is_static_and_requires_local_prerequisites(tmp_path, monkeypatch) -> None:
+    from ai_studio import video_walkaround
+
+    monkeypatch.setattr(main, "GPU_INFO", {**main.GPU_INFO, "cuda": True})
+    monkeypatch.setenv("COMFYUI_URL", "http://comfy.example.test:8188")
+    monkeypatch.setattr(studio_agent, "_binary_available", lambda _value: True)
+    factory_dir = tmp_path / "factory"
+    factory_dir.mkdir()
+    factory = factory_dir / "factory.py"
+    factory.write_text("# owner-provided factory stub for readiness only\n", encoding="utf-8")
+    monkeypatch.setattr(video_walkaround, "FACTORY_DIR", factory_dir)
+
+    ready = studio_agent.build_system_health(main)
+
+    assert ready["external_services_contacted"] is False
+    assert ready["subsystems"]["video_walkaround"]["status"] == "configured"
+    assert ready["runtime"]["video_walkaround_factory_configured"] is True
+    assert ready["runtime"]["video_walkaround_ready"] is True
+    assert ready["limits"]["walkaround_frames"] == video_walkaround.MAX_WALKAROUND_FRAMES == 72
+    assert ready["limits"]["walkaround_angles"] == video_walkaround.MAX_WALKAROUND_ANGLES == 4
+    assert ready["limits"]["walkaround_scan_entries"] == video_walkaround.MAX_WALKAROUND_SCAN_ENTRIES == 4096
+    assert ready["limits"]["walkaround_validation_mb"] == 200
+    monkeypatch.setattr(main, "MAX_PHOTO_BATCH_MB", 150)
+    reduced_batch = studio_agent.build_system_health(main)
+    assert reduced_batch["limits"]["walkaround_validation_mb"] == 150
+
+    factory.unlink()
+    not_ready = studio_agent.build_system_health(main)
+    assert not_ready["external_services_contacted"] is False
+    assert not_ready["subsystems"]["video_walkaround"]["status"] == "setup_required"
+    assert not_ready["runtime"]["video_walkaround_ready"] is False

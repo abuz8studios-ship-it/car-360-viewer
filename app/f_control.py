@@ -6,14 +6,16 @@ category, clear-and-reshoot, re-finalize, plus a /manage/{vin} management page.
 Wired from main.py:  from f_control import register_control; register_control(app)
 """
 
+import os
+import re
 import shutil
+import sqlite3
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-BASE_DIR = Path(__file__).resolve().parent
-STORAGE_DIR = BASE_DIR / "storage"
+from app_paths import DB_PATH, STORAGE_DIR
 
 router = APIRouter()
 
@@ -28,8 +30,25 @@ _CATEGORIES = {
 _EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 
+def _db():
+    """Open the canonical vehicle database with named-row access."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _authorized_vin(request: Request, vin: str) -> str:
+    from main import _require_vehicle_owner, validate_vehicle_id
+    normalized = validate_vehicle_id(vin)
+    _require_vehicle_owner(request, normalized)
+    return normalized
+
+
 def _vehicle_dir(vin: str) -> Path:
-    d = STORAGE_DIR / vin.upper()
+    vin = (vin or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{1,32}", vin):
+        raise HTTPException(404, "Vehicle not found")
+    d = STORAGE_DIR / vin
     if not d.exists():
         raise HTTPException(404, "Vehicle not found")
     return d
@@ -52,15 +71,17 @@ def _list_photos(vin: str):
 
 
 @router.get("/api/vehicle/{vin}/photos")
-async def list_photos(vin: str):
+def list_photos(vin: str, request: Request):
+    vin = _authorized_vin(request, vin)
     photos = _list_photos(vin)
     return {"vin": vin.upper(), "photos": photos,
             "counts": {k: len(v) for k, v in photos.items()}}
 
 
 @router.delete("/api/vehicle/{vin}/photo")
-async def delete_photo(vin: str, category: str, filename: str):
+def delete_photo(vin: str, category: str, filename: str, request: Request):
     """Delete ONE photo. category in {exterior,spin,gallery,interior,panoramas}."""
+    vin = _authorized_vin(request, vin)
     sub = _CATEGORIES.get(category)
     if not sub:
         raise HTTPException(400, f"category must be one of {list(_CATEGORIES)}")
@@ -75,8 +96,9 @@ async def delete_photo(vin: str, category: str, filename: str):
 
 
 @router.post("/api/vehicle/{vin}/photos/clear")
-async def clear_category(vin: str, category: str):
+def clear_category(vin: str, category: str, request: Request):
     """Clear a whole category (e.g. wipe exterior to re-shoot the 360)."""
+    vin = _authorized_vin(request, vin)
     sub = _CATEGORIES.get(category)
     if not sub:
         raise HTTPException(400, f"category must be one of {list(_CATEGORIES)}")
@@ -90,32 +112,58 @@ async def clear_category(vin: str, category: str):
 
 
 @router.delete("/api/vehicles/clear-all")
-async def clear_all_vehicles():
-    """Wipe the ENTIRE board — every vehicle record + all its photos. Start fresh."""
+def clear_all_vehicles(request: Request):
+    """Clear this tenant's inventory; only the configured owner can clear all."""
+    from main import _authenticated_user_email
+    email = _authenticated_user_email(request)
+    owner_email = os.getenv("LOTVUE_OWNER_EMAIL", "").strip().lower()
     conn = _db()
-    vins = [r["vin"] for r in conn.execute("SELECT vin FROM vehicles").fetchall()]
-    conn.close()
-    removed = 0
-    for vin in vins:
-        d = STORAGE_DIR / str(vin).upper()
-        if d.exists():
-            shutil.rmtree(d, ignore_errors=True)
-        c = _db()
-        c.execute("DELETE FROM vehicles WHERE vin=?", (vin,))
-        for t in ("hotspots", "gallery_photos", "interior_panoramas", "leads"):
-            try:
-                c.execute(f"DELETE FROM {t} WHERE vin=?", (vin,))
-            except Exception:
-                pass
-        c.commit()
-        c.close()
-        removed += 1
-    return {"status": "ok", "vehicles_removed": removed}
+    try:
+        if owner_email and email == owner_email:
+            vins = [r["vin"] for r in conn.execute("SELECT vin FROM vehicles").fetchall()]
+        else:
+            vins = [r["vin"] for r in conn.execute(
+                "SELECT vin FROM vehicles WHERE LOWER(COALESCE(user_email,''))=?", (email,)
+            ).fetchall()]
+        removed_vins = []
+        for vin in vins:
+            normalized_vin = str(vin or "").strip().upper()
+            if not re.fullmatch(r"[A-Z0-9_-]{1,32}", normalized_vin):
+                continue
+            conn.execute("DELETE FROM vehicles WHERE vin=?", (vin,))
+            for table in ("hotspots", "gallery_photos", "interior_panoramas", "leads"):
+                try:
+                    conn.execute(f"DELETE FROM {table} WHERE vin=?", (vin,))
+                except sqlite3.OperationalError:
+                    # Older per-install databases may not yet have optional tables.
+                    continue
+            removed_vins.append(normalized_vin)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    storage_root = STORAGE_DIR.resolve()
+    for vin in removed_vins:
+        directory = STORAGE_DIR / vin
+        try:
+            if directory.is_symlink():
+                # Remove only the link itself; never follow it outside storage.
+                directory.unlink(missing_ok=True)
+                continue
+            resolved = directory.resolve()
+            if resolved.parent == storage_root and resolved.is_dir():
+                shutil.rmtree(resolved, ignore_errors=True)
+        except OSError:
+            continue
+    return {"status": "ok", "vehicles_removed": len(removed_vins)}
 
 
 @router.get("/manage/{vin}", response_class=HTMLResponse)
-async def manage_page(vin: str, request: Request):
-    vin = vin.upper()
+def manage_page(vin: str, request: Request):
+    vin = _authorized_vin(request, vin)
     _vehicle_dir(vin)  # 404 if missing
     return HTMLResponse(_MANAGE_HTML.replace("__VIN__", vin))
 
