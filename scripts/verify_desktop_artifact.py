@@ -23,6 +23,12 @@ LICENSE_FILES = {
     "LGPL-2.1-or-later": "LGPL-2.1.txt",
     "LGPL-3.0-or-later": "LGPL-3.0.txt",
 }
+LINUX_FFMPEG_COMMIT = "140fd653aed8cad774f991ba083e2d01e86420c7"
+LINUX_X264_COMMIT = "c24e06c2e184345ceb33eb20a15d1024d9fd3497"
+LINUX_FFMPEG_SOURCE_ARCHIVES = {
+    "ffmpeg-8.0.tar.gz",
+    f"x264-{LINUX_X264_COMMIT}.tar.gz",
+}
 MODEL_SUFFIXES = {
     ".bin", ".ckpt", ".engine", ".ggml", ".gguf", ".h5", ".keras", ".onnx",
     ".pb", ".pt", ".pth", ".safetensors", ".tflite", ".weights",
@@ -215,11 +221,17 @@ def verify_desktop_artifact(
             if not isinstance(manifest, dict):
                 raise ArtifactVerificationError("Build manifest must be a JSON object")
 
+            expected_installer = {
+                "windows": "LotVue360-OneClick-windows-x64.exe",
+                "macos": f"LotVue360-OneClick-macOS-{architecture}.dmg",
+                "linux": f"LotVue360-OneClick-linux-{architecture}.run",
+            }[platform_name]
             expected_manifest = {
                 "product": "LotVue360",
                 "platform": platform_name,
                 "architecture": architecture,
                 "build_id": expected_build_id,
+                "one_click_installer": expected_installer,
                 "python_constraints_file": "PYTHON-BUILD-CONSTRAINTS.txt",
             }
             for key, expected in expected_manifest.items():
@@ -257,12 +269,47 @@ def verify_desktop_artifact(
                 if bundled_hash.lower() != recorded_hash.lower():
                     raise ArtifactVerificationError(f"Bundled {key} hash disagrees with the build manifest")
 
+            source_archive_hashes: dict[str, str] = {}
+            if platform_name == "linux":
+                raw_sources = ffmpeg_files.get("source_archives")
+                if not isinstance(raw_sources, dict) or set(raw_sources) != LINUX_FFMPEG_SOURCE_ARCHIVES:
+                    raise ArtifactVerificationError("Linux manifest must list the exact pinned FFmpeg/x264 source archives")
+                for name in sorted(LINUX_FFMPEG_SOURCE_ARCHIVES):
+                    expected_hash = raw_sources.get(name)
+                    if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
+                        raise ArtifactVerificationError(f"Linux source archive has no valid SHA-256: {name}")
+                    source_path = f"{app_prefix}/bin/source/{name}"
+                    _require(file_entries, source_path)
+                    with archive.open(source_path) as stream:
+                        bundled_hash = _sha256_stream(stream)
+                    if bundled_hash.lower() != expected_hash.lower():
+                        raise ArtifactVerificationError(f"Linux source archive hash disagrees with the build manifest: {name}")
+                    source_archive_hashes[name] = bundled_hash
+
+                source_build_path = f"{app_prefix}/bin/FFMPEG-SOURCE-BUILD-INFO.json"
+                _require(file_entries, source_build_path)
+                try:
+                    source_build = json.loads(_text(archive, source_build_path))
+                except json.JSONDecodeError as exc:
+                    raise ArtifactVerificationError("Linux FFmpeg source build metadata is not valid JSON") from exc
+                if not isinstance(source_build, dict):
+                    raise ArtifactVerificationError("Linux FFmpeg source build metadata must be a JSON object")
+                if (
+                    source_build.get("ffmpeg_commit") != LINUX_FFMPEG_COMMIT
+                    or source_build.get("x264_commit") != LINUX_X264_COMMIT
+                    or not str(source_build.get("license", "")).startswith("GPL-2.0-or-later")
+                    or source_build.get("source_archives") != raw_sources
+                ):
+                    raise ArtifactVerificationError("Linux FFmpeg source build metadata does not match pinned sources/license")
+
             license_id = ffmpeg_files.get("license")
             if not isinstance(license_id, str):
                 raise ArtifactVerificationError("Build manifest has no FFmpeg license identifier")
             license_filename = LICENSE_FILES.get(license_id)
             if license_filename is None:
                 raise ArtifactVerificationError(f"Build manifest has an unsupported FFmpeg license: {license_id!r}")
+            if platform_name == "linux" and license_id != "GPL-2.0-or-later":
+                raise ArtifactVerificationError("Pinned Linux FFmpeg/x264 release must be marked GPL-2.0-or-later")
             required_files = [
                 f"{package_root}/README-INSTALL.txt",
                 f"{package_root}/INSTALLATION.md",
@@ -273,6 +320,7 @@ def verify_desktop_artifact(
                 f"{app_prefix}/bin/FFMPEG-LICENSE.txt",
                 f"{app_prefix}/bin/FFMPEG-BUILD-INFO.txt",
                 f"{app_prefix}/bin/LICENSE-FFMPEG-{license_filename}",
+                f"{app_prefix}/bin/LICENSE-PYTHON-PSF-2.0.txt",
                 launcher,
                 *installer_paths,
             ]
@@ -329,6 +377,7 @@ def verify_desktop_artifact(
         "platform": platform_name,
         "architecture": architecture,
         "ffmpeg_license": license_id,
+        "ffmpeg_source_archives": source_archive_hashes,
     }
 
 

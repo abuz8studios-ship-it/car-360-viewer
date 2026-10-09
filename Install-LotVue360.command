@@ -1,7 +1,10 @@
 #!/bin/bash
-cd "$(dirname "$0")"
-bash ./install-lotvue.sh
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+bash ./install-lotvue.sh "$@"
 status=$?
-printf '\nPress Return to close this window.'
-read -r _
+if [ "${LOTVUE_INSTALLER_NO_PAUSE:-0}" != "1" ]; then
+    printf '\nPress Return to close this window.'
+    read -r _
+fi
 exit "$status"
