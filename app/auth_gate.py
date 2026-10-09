@@ -16,10 +16,13 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 # Exact-match public paths
+# NOTE: "/" is NOT public — it is the dealer dashboard (lists inventory), so an
+# anonymous visitor is redirected to /login, which links to free sign-up.
+# /api/stripe/webhook is public but billing.py rejects anything not signed by Stripe.
 PUBLIC_EXACT = {
-    "/", "/login", "/register", "/pricing", "/api/health",
+    "/login", "/register", "/pricing", "/api/health",
     "/api/register", "/api/login", "/api/plans", "/api/stripe/config",
-    "/api/stripe/webhook", "/api/create-checkout-session",
+    "/api/stripe/webhook",
     "/api/auth/token", "/api/auth/refresh", "/api/auth/logout",
     "/mobile", "/mobile/manifest.json", "/mobile/sw.js",
     "/favicon.ico", "/api/analytics/event", "/api/leads/submit",
@@ -118,7 +121,9 @@ def install_auth_gate(app):
         # HTML navigation → login redirect; API → 401 JSON
         accept = request.headers.get("accept", "")
         if "text/html" in accept and method == "GET":
-            return RedirectResponse(f"/login?next={path}", status_code=302)
+            nxt = path + (f"?{request.url.query}" if request.url.query else "")
+            from urllib.parse import quote
+            return RedirectResponse(f"/login?next={quote(nxt, safe='/')}", status_code=302)
         return JSONResponse(
             {"detail": "Sign in required. POST /api/auth/token for a JWT, "
                        "or sign in at /login."},
