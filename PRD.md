@@ -16,9 +16,9 @@ A dealer who has never seen the product, unaided, end to end:
 4. [x] Gets back a rendered 360 spin with the background replaced, in minutes not hours
 5. [x] Sees the vehicle live on a public VDP URL they can share
 6. [x] Sees it appear as a valid entry in the Google Vehicle Listings feed
-7. [ ] **Pays** — enters a card, is charged, gets a receipt
+7. [~] **Pays** — enters a card, is charged, gets a receipt. *Code complete + automated test passing (2026-10-09); never run against a live Stripe key — owner gate.*
 
-Steps 2–6, plus account creation and dashboard (step 1), were run and passed end to end on 2026-08-12 (fresh account `dealer60@`: register + login 200 → dashboard 200 with capture links → real walkaround upload, gate PASS, 36 frames → 360 render → public VDP 200 with viewer, screenshot-verified → priced → Google feed validator 156/156). That specific test account's session is the evidence for step 1, not a standing guarantee — re-verify before quoting. Step 7 has never been attempted against a live Stripe key.
+Steps 2–6, plus account creation and dashboard (step 1), were run and passed end to end on 2026-08-12 (fresh account `dealer60@`: register + login 200 → dashboard 200 with capture links → real walkaround upload, gate PASS, 36 frames → 360 render → public VDP 200 with viewer, screenshot-verified → priced → Google feed validator 156/156). That specific test account's session is the evidence for step 1, not a standing guarantee — re-verify before quoting. Step 7 is now built (`app/billing.py`: Stripe Checkout subscription → signed webhook → plan activated → receipt on `/billing`) and exercised end to end by `tests/test_stranger_dealer.py` with Stripe faked and webhooks HMAC-signed exactly like Stripe's. It has still never been run against a live Stripe key, so it isn't checked yet.
 
 **"Done" is not code-complete or builds-clean.** It's: a real independent dealer, with zero help from Ahmad or any agent, uploads a real car and pays. That has not happened. Revenue to date: **$0**.
 
@@ -41,6 +41,9 @@ Steps 2–6, plus account creation and dashboard (step 1), were run and passed e
 | Facebook Marketplace | Researched, not built as automation — Meta discontinued the dealer feed API in 2023; shipped an assisted-posting pack instead (`/api/marketplace/facebook/{vin}/pack`), which is the real ceiling, not a gap |
 | Universal gallery→spin lane ("Spyne-clone" mode) | `app/studio_spin.py` — turns *any* dealer's existing gallery photos into a spin with zero manual curation; proven clean across 3 vehicles of different bodies/colors (Navigator, Accord, Outback) |
 | Stranger-dealer 60-second test | PASSED 2026-08-12 for every step except payment (see Definition of Done above) |
+| Billing / step 7 (code) | 2026-10-09: `app/billing.py`. Price set in one place (`LOTVUE_PRICE_MONTHLY_CENTS`, default $99/mo), Checkout in subscription mode, signed and idempotent webhook, `/billing` with receipts + Customer Portal, 402 paywall after `LOTVUE_FREE_VEHICLES`. Covered by `tests/` (21 passing). Not yet live-verified |
+| Account security | 2026-10-09: salted PBKDF2 passwords (legacy sha256 upgraded on login), signup validation and duplicate check, the unsigned-webhook forgery hole and self-service `/api/set-plan` upgrade closed, `/` (inventory dashboard) no longer public, login open-redirect fixed |
+| License-plate blur | 2026-10-09: `ai_studio/plate_blur.py` rewritten (old detector found 0/2 real plates; new one found 2/2 with 0 false positives across 8 real car photos plus the Select Auto studio sample). `POST /api/vehicle/{vin}/blur-plates`, with `LOTVUE_AUTO_PLATE_BLUR=1` to run after every finalize. Small sample: inspect one real dealer VIN before turning auto-blur on |
 | Real-world dealer run | 2026-09-02: pulled 42 real listing photos from a named live dealer (Select Auto, Dayton OH) and produced a 7-angle studio spin; 4 of 7 angles judged clean on inspection |
 
 ## Explicitly out of scope — do not resume
@@ -49,8 +52,12 @@ Steps 2–6, plus account creation and dashboard (step 1), were run and passed e
 
 ## Blocking revenue — fix these before anything else
 
-1. **Stripe checkout is dead.** The secret key in `app/.env` returns `401 Expired API Key` on a live test. No payment can be collected until the key is rolled. *(Owner action: roll the key in the Stripe dashboard.)*
-2. **Pricing is undecided — three different numbers exist on disk right now:**
+1. **Stripe key is dead.** The checkout code is done (see above), but the secret key in `app/.env` returned `401 Expired API Key` on 2026-09-02. *(Owner actions, in order:)*
+   1. Roll the key and put it in `STRIPE_SECRET_KEY` / `STRIPE_PUBLISHABLE_KEY`.
+   2. Add a webhook endpoint `https://lotvue.abuz8ai.com/api/stripe/webhook` for `checkout.session.completed`, `invoice.paid`, `invoice.payment_failed`, `customer.subscription.updated`, `customer.subscription.deleted`, then put its signing secret in `STRIPE_WEBHOOK_SECRET`. **Without it, the webhook refuses every event by design.**
+   3. Stripe → Settings → Customer emails: turn on "Successful payments" (that's the emailed receipt). Settings → Billing → Customer portal: activate it.
+   4. Set `LOTVUE_FEATURE_PAYMENTS=1`, restart, then run one real $99 charge on a test account and refund it. Only then check step 7.
+2. **Pricing is undecided.** The *code* now has one source of truth (`LOTVUE_PRICE_MONTHLY_CENTS`, defaulting to the $99/mo in BRAIN.md and LOTVUE_GOAL_ARTIFACT.md, plus `LOTVUE_FREE_VEHICLES`=5), but the *business* decision is still open. Three different numbers exist in the docs:
    - `BRAIN.md`: $99/mo/dealer SaaS
    - `SALES_FUNNEL_FIRST_DOLLAR_2026-08-28.md`: $1,000 launch + $500/mo retainer
    - `SALES_FUNNEL_LOTVUE360_2026-08-28.md`: $1,000 sprint + $1,000/mo retainer
@@ -69,14 +76,15 @@ Steps 2–6, plus account creation and dashboard (step 1), were run and passed e
 ## Smaller open items
 
 - One VIN's full studio-grade spin set still needs full-resolution visual inspection (BRAIN.md's own delivery contract has this unchecked)
-- License-plate blur is still open (the rest of the hotspot/damage layer is done; plate blur specifically is not)
+- Plate blur: before setting `LOTVUE_AUTO_PLATE_BLUR=1` in production, run `python -m ai_studio.plate_blur --vin <VIN>` on one real dealer VIN and inspect the frames at full res
+- Security: `mobile_native/android/keystore.properties` (tracked in git) contains the Android upload-keystore password, and the keystore itself is tracked too. The repo is private, but treat that password as exposed. If the app ever goes to Play, enroll in Play App Signing so the upload key can be reset
 
 ## Repo hygiene — not blocking revenue, but real debt
 
-- **No `requirements.txt` or `pyproject.toml` anywhere in the repo.** Dependencies exist only as an inline pip-install comment in `app/main.py` and in `README.md`. A from-scratch environment is not reproducible from disk alone without reverse-engineering imports.
-- **`app/` carries at least 7 parallel copies of the main entry point** (`main.py.bak`, `.bak-classifier`, `.bak-dealer-import`, `.bak-preglue`, `main_backup_20260318.py`, `main_before_op6.py`, `main_original.py`, `main_v1.py`) plus `.bak` variants of `commercial_pipeline.py`, `gaussian_3d.py`, `h_dealer_import.py`, and `mobile_app.py` — all sitting live alongside the real files.
+- ~~No `requirements.txt`~~ — fixed 2026-10-09: `requirements.txt` (core), `requirements-gpu.txt` (CLIP/WAN/Kokoro), and `requirements-dev.txt` (tests). Verified by building a fresh venv and running the full suite from it.
+- ~~Parallel copies untracked~~ 2026-10-09: the three gitignored `main_*.py` copies and all `*.bak-*` files are no longer tracked (`git rm --cached`; they're still on disk and in history). Original note: **`app/` carries at least 7 parallel copies of the main entry point** (`main.py.bak`, `.bak-classifier`, `.bak-dealer-import`, `.bak-preglue`, `main_backup_20260318.py`, `main_before_op6.py`, `main_original.py`, `main_v1.py`) plus `.bak` variants of `commercial_pipeline.py`, `gaussian_3d.py`, `h_dealer_import.py`, and `mobile_app.py` — all sitting live alongside the real files.
 - **Doc naming doesn't match the BRAIN/GOAL/LEDGER convention used elsewhere.** There is no literal `GOAL.md` (`LOTVUE_GOAL_ARTIFACT.md` and `LOTVUE_CREATION_ARTIFACT.md` split that role between them), and two differently-shaped ledgers already exist (`LEDGER.md`, a dev-log, vs. `LOTVUE_CANONICAL_LEDGER.md`, a numbered capability table). This PRD and its siblings `README.md` / `LEDGER_LOG.md` are a *second* naming convention layered on top of that, not a replacement — **Ahmad needs to decide which convention this project runs on going forward.** Nothing old has been deleted; `BRAIN.md`, `LEDGER.md`, `LOTVUE_CANONICAL_LEDGER.md`, `LOTVUE_GOAL_ARTIFACT.md`, and `LOTVUE_CREATION_ARTIFACT.md` are all still on disk, unchanged.
-- **Licensing is undecided.** A `LICENSE` file (MIT, uncommitted, added 2026-08-19) sits at the repo root and has never been reconciled with the commercial pricing above — an MIT grant would let anyone copy and resell this. Flagged here, not resolved.
+- ~~Licensing undecided~~ — `LICENSE` is now proprietary (ABUZ8 LLC, all rights reserved), committed in `b790a11`.
 - **Uncommitted work as of this pass:** `LEDGER.md` modified; `LICENSE`, two `SALES_FUNNEL_*.md` files, `docs/`, `growth/`, and `.codegraph/` untracked.
 
 ## What "finished" looks like

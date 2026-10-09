@@ -36,19 +36,34 @@ Independent used-car dealers are quoted $350+/mo (Spyne) and up for 360-degree m
 
 ## Running it
 
-There is no `requirements.txt` or `pyproject.toml` anywhere in this repo — Python dependencies are only documented as an inline pip-install list, in `app/main.py`'s own docstring and in this README:
-
 ```bash
-pip install fastapi uvicorn python-multipart Pillow opencv-python rembg pillow-heif stripe qrcode reportlab python-jose
-```
-
-```bash
+pip install -r requirements.txt          # core server (Python 3.11)
+# optional, GPU workstation only:  pip install -r requirements-gpu.txt
 cd app
-cp .env.example .env      # fill in real keys — any integration without a credential just stays dark, no fake data
-python -m uvicorn main:app
+cp .env.example .env                     # fill in real keys — an integration without a credential stays dark, no fake data
+python -m uvicorn main:app --host 0.0.0.0 --port 8360
 ```
 
 The Windows desktop build uses the `.spec` files above with PyInstaller, then Inno Setup for the installer.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+`tests/` runs the **stranger-dealer test** end to end against an isolated copy of the app (fresh DB, no network): sign-up → dashboard → capture gate reject/accept → public feed → Stripe checkout → signed webhook → plan active → receipt shown → paywall → cancellation. It also covers plate blur. CI runs it on every push (`.github/workflows/tests.yml`).
+
+## Billing (how a dealer pays)
+
+All pricing and payment logic lives in `app/billing.py`, and the price is set in exactly one place: `LOTVUE_PRICE_MONTHLY_CENTS` in `app/.env` (default `9900` = $99/mo). Dealers get `LOTVUE_FREE_VEHICLES` (default 5) free vehicles. After that, creating a new vehicle returns HTTP 402 with a link to `/pricing`.
+
+- `/pricing` → **Subscribe** → Stripe Checkout (subscription) → `/billing/success`
+- `/api/stripe/webhook` only accepts events signed with `STRIPE_WEBHOOK_SECRET` (it's idempotent)
+- `/billing` shows plan status and receipts, and links to the Stripe Customer Portal (update card, cancel, invoices)
+
+Going live checklist is in `PRD.md` → "Blocking revenue".
 
 ## Project facts (verified 2026-09-03)
 
@@ -58,4 +73,4 @@ The Windows desktop build uses the `.spec` files above with PyInstaller, then In
 
 ## License
 
-A `LICENSE` file at the repo root (added 2026-08-19, still uncommitted) is the **MIT license**. This has not been reconciled with the product's commercial pricing (see `PRD.md`) — an MIT grant would let anyone copy, modify, and resell this code. Treat this as an unresolved flag, not as the intended license, until Ahmad confirms it.
+Proprietary, all rights reserved, ABUZ8 LLC. See `LICENSE` (replaced the earlier MIT text in commit `b790a11`).
