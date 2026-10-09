@@ -149,7 +149,8 @@ def _resolve_tool(env_key, name):
                  BASE_DIR.parents[1] / "AI" / "ffmpeg" / name):
         if cand.exists():
             return str(cand)
-    return p or name  # bare name -> resolved via PATH if present
+    found = shutil.which(name) or shutil.which(name.replace(".exe", ""))
+    return p or found or name  # PATH lookup (works for ffmpeg on Linux/macOS too)
 
 FFMPEG = _resolve_tool("FFMPEG_PATH", "ffmpeg.exe")
 FFPROBE = _resolve_tool("FFPROBE_PATH", "ffprobe.exe")
@@ -3816,6 +3817,10 @@ async def finalize_vehicle(vin: str, engine: str = ""):
                         bg_path = str(Path(__file__).parent / "static" / bg_url[len("/static/"):])
 
             process_all_frames_background(spin_dir, wm_mode, bg_path, turntable_style)
+            if os.getenv("LOTVUE_AUTO_PLATE_BLUR", "0") == "1":
+                from ai_studio.plate_blur import blur_vehicle
+                rep = blur_vehicle(STORAGE_DIR, vin, dirs=("spin",))
+                print(f"[Finalize] plate blur {vin}: {rep['frames_with_plate']}/{rep['frames']} frames")
         except Exception as e:
             print(f"[Finalize] background work failed for {vin}: {e}")
         finally:
@@ -3828,6 +3833,26 @@ async def finalize_vehicle(vin: str, engine: str = ""):
 
     return {"status": "started", "original_frames": frame_count, "processing_bg": True,
             "message": "Processing in background. Poll /api/finalize-status/{vin}."}
+
+
+@app.post("/api/vehicle/{vin}/blur-plates")
+async def blur_plates(vin: str, request: Request):
+    """Detect + blur license plates on a vehicle's published frames (spin,
+    studio, exterior, gallery). Originals are kept in _orig_unblurred/ next to
+    each folder. Set LOTVUE_AUTO_PLATE_BLUR=1 to run this after every finalize."""
+    import asyncio
+    from ai_studio.plate_blur import blur_vehicle
+    vin = re.sub(r"[^A-Za-z0-9_-]", "", vin or "").upper()[:32]
+    if not (STORAGE_DIR / vin).is_dir():
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    email = _billing.session_email(request)
+    v = db_get_vehicle(vin)
+    if v and v.get("user_email") and email and v["user_email"].lower() != email \
+            and not _billing.is_admin(email):
+        raise HTTPException(status_code=403, detail="Not your vehicle")
+    rep = await asyncio.to_thread(blur_vehicle, STORAGE_DIR, vin)
+    return {"status": "ok", "vin": vin, "frames": rep["frames"],
+            "frames_with_plate": rep["frames_with_plate"], "boxes": rep["boxes"]}
 
 
 @app.get("/api/finalize-status/{vin}")

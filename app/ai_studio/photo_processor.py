@@ -21,8 +21,8 @@ from .background_swap import remove_background, composite_on_showroom
 from .enhance import auto_enhance, add_floor_shadow
 from .plate_blur import blur_license_plate
 
-STORAGE_DIR = Path(r"E:\ABU\360Car\app\storage")
-BACKGROUNDS_DIR = Path(r"E:\ABU\360Car\app\ai_studio\backgrounds")
+STORAGE_DIR = Path(__file__).resolve().parents[1] / "storage"
+BACKGROUNDS_DIR = Path(__file__).resolve().parent / "backgrounds"
 
 
 class PhotoProcessor:
