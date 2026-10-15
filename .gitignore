@@ -26,6 +26,7 @@ app/lotvue.db
 # --- Uploaded media / vehicle photos / generated assets ---
 app/storage/
 storage/
+app/vehicles/
 **/app_profile/
 test_assets/
 *.mp4
