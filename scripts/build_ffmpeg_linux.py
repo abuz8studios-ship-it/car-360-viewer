@@ -232,9 +232,10 @@ def build(output: Path, jobs: int) -> Path:
             version = _run([str(ffmpeg_binary), "-version"], cwd=work, env=env)
             license_text = _run([str(ffmpeg_binary), "-L"], cwd=work, env=env)
             build_config = _run([str(ffmpeg_binary), "-buildconf"], cwd=work, env=env)
-            # A tagless fetch of the pinned commit reports "8.0" (RELEASE file)
-            # instead of git-describe's "n8.0"; the commit itself is pinned above.
-            if not version.startswith(("ffmpeg version n8.0", "ffmpeg version 8.0")):
+            # A tagless fetch of the pinned commit reports its short hash (or the
+            # RELEASE file's "8.0") instead of git-describe's "n8.0".
+            accepted = ("ffmpeg version n8.0", "ffmpeg version 8.0", f"ffmpeg version {FFMPEG_COMMIT[:7]}")
+            if not version.startswith(accepted):
                 raise RuntimeError(f"Built FFmpeg did not report the pinned n8.0 release: {version.splitlines()[0]!r}")
             normalized_license = license_text.lower()
             if (
