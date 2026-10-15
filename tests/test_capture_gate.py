@@ -73,3 +73,13 @@ def test_gate_runs_subject_checks_when_model_enabled(tmp_path, monkeypatch) -> N
     assert "subject_checks" not in result["checks"]
     assert result["checks"]["present_ratio"] == 1.0
     assert "bg_motion" in result["checks"]
+
+
+def test_gate_summary_never_returns_server_paths(tmp_path, monkeypatch) -> None:
+    _no_model(monkeypatch)
+    _write_frames(tmp_path, 6, luma=128)
+
+    summary = validate_video.gate_summary(validate_video.validate_dir(tmp_path))
+
+    assert "source" not in summary
+    assert str(tmp_path) not in str(summary)

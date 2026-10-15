@@ -7,5 +7,3 @@
 - **Owner step:** roll the Stripe keys, register the webhook, then one live $99 charge + refund before checking PRD step 7.
 - **Owner decision:** `.github/workflows/tests.yml` (from PR #2) runs the same pytest suite as `ci.yml`, doubling Actions minutes per push.
 - Extend the packaged `--self-test` from "model loads and cuts out an image" to a full upload → spin round trip.
-- Align the `/api/health` version (`2.0.0`) with the installer version (`2.1.0`).
-- Drop the server filesystem path (`source`) from the capture-gate summary returned by `/api/upload`.

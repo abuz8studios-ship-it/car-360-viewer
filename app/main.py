@@ -2197,7 +2197,7 @@ def health_check():
     return {
         "status": "ok",
         "app": "LotVue Pro",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "heic_available": HEIC_SUPPORTED,
     }
 

@@ -315,9 +315,9 @@ def validate_video_file(video_path, sample=SAMPLE):
 
 
 def gate_summary(res):
-    """Slim JSON-safe dict for HTTP responses (drops per_frame detail)."""
+    """Slim JSON-safe dict for HTTP responses (no per_frame detail, no server paths)."""
     return {k: res.get(k) for k in
-            ("verdict", "reasons", "frames", "checks", "splat_eligible", "source")}
+            ("verdict", "reasons", "frames", "checks", "splat_eligible")}
 
 
 if __name__ == "__main__":
