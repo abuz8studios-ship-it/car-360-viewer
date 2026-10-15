@@ -17,6 +17,11 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
+try:
+    from .rembg_models import BUNDLED_REMBG_MODELS, MODEL_DIR
+except ImportError:  # Direct execution: python scripts/verify_desktop_artifact.py
+    from rembg_models import BUNDLED_REMBG_MODELS, MODEL_DIR
+
 LICENSE_FILES = {
     "GPL-2.0-or-later": "GPL-2.0.txt",
     "GPL-3.0-or-later": "GPL-3.0.txt",
@@ -247,9 +252,26 @@ def verify_desktop_artifact(
             if not isinstance(raw_not_bundled, list) or not all(isinstance(item, str) for item in raw_not_bundled):
                 raise ArtifactVerificationError("Build manifest has an invalid not_bundled list")
             not_bundled = [item.lower() for item in raw_not_bundled]
-            required_not_bundled = ("rembg pretrained model weights", "provider credentials")
-            if not all(any(required in item for item in not_bundled) for required in required_not_bundled):
-                raise ArtifactVerificationError("Build manifest does not list model weights and provider credentials as excluded")
+            if not any("provider credentials" in item for item in not_bundled):
+                raise ArtifactVerificationError("Build manifest does not list provider credentials as excluded")
+
+            # Exactly the owner-approved background-removal models, at the pinned hashes.
+            raw_models = manifest.get("bundled_models")
+            if not isinstance(raw_models, list) or not all(isinstance(item, dict) for item in raw_models):
+                raise ArtifactVerificationError("Build manifest has an invalid bundled_models list")
+            recorded_models = {str(item.get("name")): item for item in raw_models}
+            if set(recorded_models) != set(BUNDLED_REMBG_MODELS) or len(raw_models) != len(BUNDLED_REMBG_MODELS):
+                raise ArtifactVerificationError("Build manifest must list exactly the approved rembg models")
+            allowed_model_paths = set()
+            for name, pin in BUNDLED_REMBG_MODELS.items():
+                if str(recorded_models[name].get("sha256", "")).lower() != pin["sha256"]:
+                    raise ArtifactVerificationError(f"Build manifest hash for {name} is not the pinned SHA-256")
+                model_path = f"{app_prefix}/{MODEL_DIR}/{name}"
+                _require(file_entries, model_path)
+                with archive.open(model_path) as stream:
+                    if _sha256_stream(stream) != pin["sha256"]:
+                        raise ArtifactVerificationError(f"Bundled {name} does not match its pinned SHA-256")
+                allowed_model_paths.add(model_path)
 
             ffmpeg_files = manifest.get("ffmpeg_files")
             if not isinstance(ffmpeg_files, dict):
@@ -347,7 +369,7 @@ def verify_desktop_artifact(
                     )
                     if private_name or _pem_contains_private_key(archive, name):
                         raise ArtifactVerificationError(f"Private key material must not be bundled: {name}")
-                if path.suffix.lower() in MODEL_SUFFIXES:
+                if path.suffix.lower() in MODEL_SUFFIXES and name not in allowed_model_paths:
                     raise ArtifactVerificationError(f"Model weights must not be bundled: {name}")
                 if any(part.lower() == "storage" for part in path.parts):
                     raise ArtifactVerificationError(f"Writable user storage must not be bundled: {name}")
@@ -362,8 +384,8 @@ def verify_desktop_artifact(
             if license_id not in license_notice or "ffmpeg -version" not in build_info.lower():
                 raise ArtifactVerificationError("FFmpeg license/build notices are incomplete")
             readme = _text(archive, f"{package_root}/README-INSTALL.txt")
-            if "not notarized" not in readme.lower() or "no rembg model" not in readme.lower():
-                raise ArtifactVerificationError("Installer README is missing model-gate or signing status")
+            if "not notarized" not in readme.lower() or "isnet-general-use" not in readme.lower():
+                raise ArtifactVerificationError("Installer README is missing bundled-model or signing status")
 
     except zipfile.BadZipFile as exc:
         raise ArtifactVerificationError(f"Artifact is not a readable ZIP: {archive_path.name}") from exc

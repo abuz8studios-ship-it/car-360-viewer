@@ -344,9 +344,23 @@ def _smoke_test() -> int:
         expected_rembg = "configured" if app_module.REMBG_AVAILABLE else "setup_required"
         if health["subsystems"]["background_removal"]["status"] != expected_rembg:
             raise RuntimeError("background-removal readiness disagrees with the explicit model gate")
+        rembg_detail = ""
+        if app_module.REMBG_AVAILABLE:
+            # Prove the bundled weights load offline and cut out an image, so a
+            # build missing its models fails here instead of shipping degraded.
+            import rembg_runtime
+            from PIL import Image
+            if FROZEN:  # never let rembg quietly download what the bundle should carry
+                wanted = (rembg_runtime.configured_model(), rembg_runtime.fallback_model())
+                missing = [name for name in wanted if name and not
+                           (rembg_runtime.BUNDLED_MODEL_DIR / f"{name}.onnx").is_file()]
+                if missing:
+                    raise RuntimeError(f"bundled background-removal model(s) missing: {', '.join(missing)}")
+            rembg_runtime.remove(Image.new("RGB", (64, 64), (128, 128, 128)))
+            rembg_detail = f", background removal via {rembg_runtime.active_model()}"
         _log(
             f"packaged self-test passed: {len(backgrounds)} backgrounds, 8 scenes, "
-            "local configuration snapshot, no external probes"
+            f"local configuration snapshot, no external probes{rembg_detail}"
         )
         return 0
     except Exception as exc:

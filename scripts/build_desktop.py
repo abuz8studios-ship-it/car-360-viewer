@@ -3,7 +3,8 @@
 
 Run on the same OS/architecture as the intended artifact after installing
 requirements-desktop.txt. The build stages clean app source, generates the shared
-background catalog, stages licensed FFmpeg/FFprobe, freezes Python dependencies,
+background catalog, stages licensed FFmpeg/FFprobe, bundles the owner-approved
+background-removal models (verified by SHA-256), freezes Python dependencies,
 and writes a checksummed portable ZIP. Linux builds also create a self-extracting
 one-click installer; Windows/macOS native installers are assembled in CI.
 """
@@ -18,13 +19,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 import zipfile
 from pathlib import Path
 
 try:
     from .package_desktop import create_linux_one_click_installer
+    from .rembg_models import BUNDLED_REMBG_MODELS, MODEL_DIR
 except ImportError:  # Direct execution: python scripts/build_desktop.py
     from package_desktop import create_linux_one_click_installer
+    from rembg_models import BUNDLED_REMBG_MODELS, MODEL_DIR
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_SOURCE = ROOT / "app"
@@ -124,6 +128,42 @@ def _stage_application(stage_app: Path, build_id: str) -> None:
         "print('packaged backgrounds:', len(assets))"
     )
     _run([sys.executable, "-c", script, str(stage_app)], cwd=stage_app, env=env)
+
+
+def _model_cache_dir() -> Path:
+    """Downloaded models are reused across builds (or pre-seeded for offline builds)."""
+    return Path(os.getenv("LOTVUE_REMBG_MODEL_CACHE") or ROOT / "build" / "rembg-models")
+
+
+def _fetch_rembg_models(cache: Path) -> list[dict[str, object]]:
+    """Download each pinned model once and refuse any file whose SHA-256 differs."""
+    cache.mkdir(parents=True, exist_ok=True)
+    records = []
+    for name, pin in BUNDLED_REMBG_MODELS.items():
+        target = cache / name
+        if not target.is_file() or _checksum(target) != pin["sha256"]:
+            partial = target.with_name(target.name + ".part")
+            print(f"downloading {name} from {pin['url']}", flush=True)
+            with urllib.request.urlopen(pin["url"], timeout=120) as response, partial.open("wb") as out:
+                shutil.copyfileobj(response, out, 1024 * 1024)
+            os.replace(partial, target)
+        digest = _checksum(target)
+        if digest != pin["sha256"]:
+            raise RuntimeError(f"{name} SHA-256 {digest} does not match the pinned {pin['sha256']}")
+        records.append({
+            "name": name, "path": f"app/{MODEL_DIR}/{name}", "sha256": digest,
+            "bytes": target.stat().st_size, "role": pin["role"],
+            "source": pin["url"], "license": pin["license"],
+        })
+    return records
+
+
+def _stage_rembg_models(app_dir: Path, cache: Path) -> None:
+    """Copy the verified models into the packaged app (after _ignore_app filtering)."""
+    destination = app_dir / MODEL_DIR
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in BUNDLED_REMBG_MODELS:
+        shutil.copy2(cache / name, destination / name)
 
 
 def _identify_ffmpeg_license(license_text: str, build_config: str) -> tuple[str, str]:
@@ -337,6 +377,8 @@ def build(platform_name: str, output: Path, build_id: str) -> Path:
         stage_app = Path(temp) / "app"
         _stage_application(stage_app, safe_build_id)
         binaries = _stage_ffmpeg(stage_app)
+        model_cache = _model_cache_dir()
+        bundled_models = _fetch_rembg_models(model_cache)
 
         _run([
             sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
@@ -351,6 +393,7 @@ def build(platform_name: str, output: Path, build_id: str) -> Path:
             resource_app = app_bundle / "Contents" / "Resources" / "app"
             resource_app.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(stage_app, resource_app, ignore=_ignore_app)
+            _stage_rembg_models(resource_app, model_cache)
             package_root = dist_root / f"LotVue360-macOS-{arch}"
             package_root.mkdir(parents=True, exist_ok=True)
             shutil.move(str(app_bundle), str(package_root / "LotVue360.app"))
@@ -360,6 +403,7 @@ def build(platform_name: str, output: Path, build_id: str) -> Path:
             if not package_root.is_dir():
                 raise RuntimeError(f"PyInstaller did not create its onedir output: {package_root}")
             shutil.copytree(stage_app, package_root / "app", ignore=_ignore_app)
+            _stage_rembg_models(package_root / "app", model_cache)
             package_prefix = f"LotVue360-{platform_name}-{arch}"
 
         readme = package_root / "README-INSTALL.txt" if package_root.is_dir() else None
@@ -368,9 +412,10 @@ def build(platform_name: str, output: Path, build_id: str) -> Path:
                 "LotVue360 desktop release\n"
                 "=========================\n\n"
                 "This artifact contains the Python runtime, core app dependencies, CPU rembg/ONNX runtime,\n"
-                "FFmpeg/FFprobe, app source, and the packaged local backdrop catalog. No rembg model is selected\n"
-                "or enabled by default. Verify a checkpoint's commercial terms before configuring it; approved\n"
-                "weights download on first inference and may require Internet access.\n\n"
+                "FFmpeg/FFprobe, app source, the packaged local backdrop catalog, and the owner-approved\n"
+                "background-removal models: isnet-general-use (primary) and u2net (fallback), bundled under\n"
+                "app/models/rembg so background replacement works offline on first launch. Model sources,\n"
+                "SHA-256 hashes and license notes are in BUILD-MANIFEST.json and THIRD_PARTY_NOTICES.md.\n\n"
                 "First launch creates a private per-user data directory and copies app/.env.example to .env.\n"
                 "Open Dealer Studio and sign in or register. External services require your own approved accounts\n"
                 "and credentials; they are never embedded in this installer.\n\n"
@@ -419,8 +464,8 @@ def build(platform_name: str, output: Path, build_id: str) -> Path:
             "python_constraints_file": "PYTHON-BUILD-CONSTRAINTS.txt",
             "bundled_engines": ["CPU background removal runtime", "FFmpeg", "FFprobe"],
             "ffmpeg_files": binaries,
+            "bundled_models": bundled_models,
             "not_bundled": [
-                "RemBG pretrained model weights (not selected by default; operator must verify and acknowledge license)",
                 "ComfyUI/WAN model weights and GPU runtime",
                 "CUDA/COLMAP/Brush Gaussian reconstruction toolchain",
                 "provider credentials, dealership accounts, and service approval",

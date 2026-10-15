@@ -12,9 +12,20 @@ Windows and macOS use the platform binaries resolved through the desktop build's
 
 The bundled CPython interpreter and standard library are licensed under the Python Software Foundation License Version 2; a copy is included as `app/bin/LICENSE-PYTHON-PSF-2.0.txt`. The frozen Python application also includes third-party packages declared by `requirements.txt` and `requirements-desktop.txt` (including FastAPI, Uvicorn, NumPy, OpenCV, Pillow, python-jose, Stripe SDK, ReportLab, qrcode, RemBG/ONNX Runtime and transitive dependencies). Their packaged `.dist-info/licenses` and notices should be reviewed against the manifest. The build manifest records the Python version. The release owner must review a version-specific dependency-license/SBOM report and applicable codec/patent/redistribution terms before publishing a customer-facing binary.
 
+## Bundled background-removal models
+
+Desktop releases bundle two rembg checkpoints under `app/models/rembg/` (owner-approved 2026-10-15), each downloaded from rembg's GitHub release and accepted only at its pinned SHA-256 (`scripts/rembg_models.py`):
+
+| File | Role | SHA-256 | Upstream license |
+|---|---|---|---|
+| `isnet-general-use.onnx` | primary | `60920e99c45464f2ba57bee2ad08c919a52bbf852739e96947fbb4358c0d964a` | Apache-2.0 ([xuebinqin/DIS](https://github.com/xuebinqin/DIS)) |
+| `u2net.onnx` | fallback | `8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491` | Apache-2.0 ([xuebinqin/U-2-Net](https://github.com/xuebinqin/U-2-Net)) |
+
+**Provenance note for the owner:** IS-Net (`isnet-general-use`) was trained on the DIS5K dataset. The DIS5K Terms of Use (`DIS5K-Dataset-Terms-of-Use.pdf` in the DIS repository) describe the dataset as for non-commercial research or educational use and say commercial use "is prohibited even after copying, editing, processing or any operations of this database" without the authors' permission. Whether that reaches trained weights is a legal question this build does not answer; `u2net` carries no such dataset note in its repository. Switching the primary model is one setting (`LOTVUE_REMBG_MODEL=u2net`).
+
 ## Optional model and service terms
 
-No RemBG model checkpoint is redistributed or selected by default. For example, BRIA RMBG-2.0's [official model card](https://huggingface.co/briaai/RMBG-2.0) lists a non-commercial model license; do not enable it for paid dealer work without a separate commercial agreement. Other checkpoints have separate license/provenance terms too. The local `LOTVUE_REMBG_LICENSE_ACCEPTED=1` setting is only an operator acknowledgment, not an automatic license check.
+No other RemBG model checkpoint is redistributed. For example, BRIA RMBG-2.0's [official model card](https://huggingface.co/briaai/RMBG-2.0) lists a non-commercial model license; do not enable it for paid dealer work without a separate commercial agreement. Other checkpoints have separate license/provenance terms too. The local `LOTVUE_REMBG_LICENSE_ACCEPTED=1` setting is only an operator acknowledgment, not an automatic license check.
 
 Optional ComfyUI, WAN, COLMAP/Brush, CUDA, provider SDKs, other model weights, and credentials are not redistributed by this desktop build. Their own terms still apply if an operator chooses to install and connect them.
 

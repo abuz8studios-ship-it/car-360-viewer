@@ -112,8 +112,33 @@ def test_stages_pinned_linux_ffmpeg_binaries_and_matching_sources(tmp_path: Path
     assert (stage_app / "bin" / "FFMPEG-SOURCE-BUILD-INFO.json").is_file()
 
 
+def _synthetic_model_pins(cache: Path) -> dict:
+    """Small stand-ins for the pinned rembg models, pre-seeded in a build cache."""
+    cache.mkdir(parents=True, exist_ok=True)
+    pins = {}
+    for name, role in (("isnet-general-use.onnx", "primary"), ("u2net.onnx", "fallback")):
+        content = f"synthetic {name}".encode()
+        (cache / name).write_bytes(content)
+        pins[name] = {"url": f"https://example.invalid/{name}", "role": role, "license": "test",
+                      "sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)}
+    return pins
+
+
+def test_rembg_model_fetch_refuses_a_download_with_the_wrong_hash(tmp_path: Path, monkeypatch) -> None:
+    import io
+
+    pins = {"isnet-general-use.onnx": {"url": "https://example.invalid/isnet", "role": "primary",
+                                       "license": "test", "sha256": "0" * 64, "bytes": 1}}
+    monkeypatch.setattr(build_desktop, "BUNDLED_REMBG_MODELS", pins)
+    monkeypatch.setattr(build_desktop.urllib.request, "urlopen",
+                        lambda _url, timeout: io.BytesIO(b"tampered weights"))
+    with pytest.raises(RuntimeError, match="does not match the pinned"):
+        build_desktop._fetch_rembg_models(tmp_path / "cache")
+
+
 def test_linux_build_emits_single_file_installer(tmp_path: Path, monkeypatch) -> None:
     import subprocess
+    import zipfile
 
     project = tmp_path / "project"
     app_source = project / "app"
@@ -130,6 +155,10 @@ def test_linux_build_emits_single_file_installer(tmp_path: Path, monkeypatch) ->
 
     monkeypatch.setattr(build_desktop, "ROOT", project)
     monkeypatch.setattr(build_desktop, "APP_SOURCE", app_source)
+    cache = tmp_path / "model cache"
+    pins = _synthetic_model_pins(cache)
+    monkeypatch.setattr(build_desktop, "BUNDLED_REMBG_MODELS", pins)
+    monkeypatch.setenv("LOTVUE_REMBG_MODEL_CACHE", str(cache))
 
     def stage_application(stage_app: Path, _build_id: str) -> None:
         stage_app.mkdir(parents=True)
@@ -166,3 +195,13 @@ def test_linux_build_emits_single_file_installer(tmp_path: Path, monkeypatch) ->
     )
     assert result.returncode == 0, result.stderr
     assert "Usage: Install-LotVue360.sh" in result.stdout
+
+    with zipfile.ZipFile(archive) as bundle:
+        names = set(bundle.namelist())
+        manifest = json.loads(bundle.read("LotVue360/BUILD-MANIFEST.json"))
+        readme = bundle.read("LotVue360/README-INSTALL.txt").decode()
+    for name, pin in pins.items():
+        assert f"LotVue360/app/models/rembg/{name}" in names
+    assert {m["name"]: m["sha256"] for m in manifest["bundled_models"]} == {
+        name: pin["sha256"] for name, pin in pins.items()}
+    assert "isnet-general-use" in readme

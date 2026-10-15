@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import scripts.verify_desktop_artifact as verifier
 from scripts.verify_desktop_artifact import (
     ArtifactVerificationError,
     verify_desktop_artifact,
@@ -16,6 +17,15 @@ from scripts.verify_desktop_artifact import (
 BUILD_ID = "a" * 40
 LICENSE_ID = "LGPL-2.1-or-later"
 LICENSE_FILENAME = "LGPL-2.1.txt"
+# Small stand-ins for the pinned rembg models (the real files are ~175 MB each).
+MODELS = {"isnet-general-use.onnx": b"synthetic isnet weights", "u2net.onnx": b"synthetic u2net weights"}
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_model_pins(monkeypatch) -> None:
+    monkeypatch.setattr(verifier, "BUNDLED_REMBG_MODELS", {
+        name: {"sha256": hashlib.sha256(content).hexdigest()} for name, content in MODELS.items()
+    })
 
 
 def _make_archive(
@@ -27,7 +37,11 @@ def _make_archive(
     non_executable_paths: set[str] | None = None,
     installer_name_override: str | None = None,
     corrupt_source_archive_hash: bool = False,
+    models: dict[str, bytes] | None = None,
+    manifest_models: dict[str, bytes] | None = None,
 ) -> Path:
+    models = MODELS if models is None else models
+    manifest_models = models if manifest_models is None else manifest_models
     if platform_name == "windows":
         package_root = "LotVue360"
         app_prefix = f"{package_root}/app"
@@ -102,8 +116,11 @@ def _make_archive(
         "python_constraints_file": "PYTHON-BUILD-CONSTRAINTS.txt",
         "bundled_engines": ["CPU background removal runtime", "FFmpeg", "FFprobe"],
         "ffmpeg_files": ffmpeg_files,
+        "bundled_models": [
+            {"name": name, "sha256": hashlib.sha256(content).hexdigest()}
+            for name, content in manifest_models.items()
+        ],
         "not_bundled": [
-            "RemBG pretrained model weights (not selected by default)",
             "provider credentials, dealership accounts, and service approval",
         ],
         "pricing_approved": False,
@@ -112,7 +129,8 @@ def _make_archive(
     }
     files = {
         f"{package_root}/BUILD-MANIFEST.json": (json.dumps(manifest) + "\n").encode(),
-        f"{package_root}/README-INSTALL.txt": b"No rembg model is selected. This bundle is unsigned and not notarized.\n",
+        f"{package_root}/README-INSTALL.txt": (
+            b"Bundles isnet-general-use and u2net. This bundle is unsigned and not notarized.\n"),
         f"{package_root}/INSTALLATION.md": b"Install guide\n",
         f"{package_root}/THIRD_PARTY_NOTICES.md": b"Third-party notices\n",
         f"{package_root}/PYTHON-BUILD-CONSTRAINTS.txt": b"requirements\n",
@@ -126,6 +144,7 @@ def _make_archive(
         f"{app_prefix}/bin/LICENSE-PYTHON-PSF-2.0.txt": b"Python Software Foundation License\n",
         launcher: b"synthetic frozen launcher",
     }
+    files.update({f"{app_prefix}/models/rembg/{name}": content for name, content in models.items()})
     if platform_name == "linux":
         files[f"{app_prefix}/bin/FFMPEG-SOURCE-BUILD-INFO.json"] = (
             json.dumps(source_build_info) + "\n"
@@ -366,3 +385,22 @@ def test_rejects_wrong_build_identity(tmp_path: Path) -> None:
             architecture="arm64",
             expected_build_id="b" * 40,
         )
+
+
+def test_rejects_bundled_model_that_differs_from_its_pinned_hash(tmp_path: Path) -> None:
+    archive_path = _make_archive(
+        tmp_path, "windows", "x64",
+        models={**MODELS, "isnet-general-use.onnx": b"swapped weights"},
+        manifest_models=MODELS,
+    )
+    with pytest.raises(ArtifactVerificationError, match="does not match its pinned SHA-256"):
+        verify_desktop_artifact(archive_path, platform_name="windows", architecture="x64",
+                                expected_build_id=BUILD_ID)
+
+
+def test_rejects_release_missing_an_approved_model(tmp_path: Path) -> None:
+    only_primary = {"isnet-general-use.onnx": MODELS["isnet-general-use.onnx"]}
+    archive_path = _make_archive(tmp_path, "windows", "x64", models=only_primary)
+    with pytest.raises(ArtifactVerificationError, match="exactly the approved rembg models"):
+        verify_desktop_artifact(archive_path, platform_name="windows", architecture="x64",
+                                expected_build_id=BUILD_ID)
