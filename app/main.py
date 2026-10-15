@@ -3621,6 +3621,75 @@ def process_all_frames_background(frames_dir: Path, watermark_mode: str = "previ
             "warning": "Some frame cut-outs or composites failed." if failed else ""}
 
 
+def build_studio_spin(source_dir: Path, output_dir: Path, target_frames: int,
+                      manifest: dict | None, background_path: str | None,
+                      watermark_mode: str = "preview", turntable_style: str = "studio_shadow",
+                      bg_color: tuple = (26, 26, 26)) -> dict:
+    """Cut-out-first studio spin from the real source frames (see spin_compose)."""
+    import spin_compose
+    from PIL import ImageOps
+
+    sources = sorted(source_dir.glob("frame_*.jpg"))
+    if not sources:
+        return {"status": "error", "mode": "studio", "processed": 0, "failed": 0,
+                "warning": "No source frames were available to render."}
+    cutouts, failed = [], 0
+    for path in sources:
+        try:
+            rgba = spin_compose.cut_out(path, remove_bg)
+        except Exception as exc:
+            print(f"[Studio spin] cut-out failed for {path.name}: {type(exc).__name__}: {exc}")
+            rgba = None
+        if rgba is None:
+            failed += 1
+        else:
+            cutouts.append(rgba)
+    if len(cutouts) < 2:
+        return {"status": "error", "mode": "studio", "processed": 0, "failed": failed,
+                "warning": "The car could not be separated from the background in enough photos."}
+    car_height = spin_compose.target_height([spin_compose.tight_bbox(c) for c in cutouts])
+    aligned = [spin_compose.normalize(c, car_height) for c in cutouts]
+    del cutouts
+
+    background = None
+    if background_path and Path(background_path).exists():
+        try:
+            with Image.open(background_path) as source:
+                background = ImageOps.fit(source.convert("RGB"),
+                                          (spin_compose.CANVAS_W, spin_compose.CANVAS_H), Image.LANCZOS)
+        except Exception as exc:
+            print(f"[Studio spin] could not load background: {exc}")
+    if background is None:
+        background = Image.new("RGB", (spin_compose.CANVAS_W, spin_compose.CANVAS_H), bg_color)
+    watermark_on = (watermark_mode == "preview") and FEATURES_ENABLED.get("watermark", False)
+
+    def shadow(bg, car, x, y):
+        return composite_turntable(bg, car, x, y, turntable_style)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for old in output_dir.glob("spin_*.jpg"):
+        old.unlink()
+    frames_for_report, written = [], 0
+    for index, frame in enumerate(spin_compose.spin_frames(aligned, target_frames, manifest), 1):
+        final = spin_compose.composite(frame, background, shadow)
+        if watermark_on:
+            marked = apply_diagonal_watermark(final, "LOTVUE PRO PREVIEW", 60)
+            final.close()
+            final = marked
+        final.save(output_dir / f"spin_{index:04d}.jpg", "JPEG", quality=92)
+        final.close()
+        frames_for_report.append(cv2.resize(frame, (spin_compose.CANVAS_W // 4, spin_compose.CANVAS_H // 4),
+                                            interpolation=cv2.INTER_NEAREST))
+        written += 1
+    background.close()
+    report = spin_compose.jitter_report(frames_for_report)
+    report = {k: (v * 4 if k.endswith("_px") and v is not None else v) for k, v in report.items()}
+    status = "completed" if written == target_frames and not failed else ("degraded" if written else "error")
+    return {"status": status, "mode": "studio", "requested_mode": "studio", "processed": written,
+            "failed": failed, "stability": report,
+            "warning": f"{failed} photo(s) could not be cut out and were skipped." if failed else ""}
+
+
 def _optical_flow_context(img_a: np.ndarray, img_b: np.ndarray):
     """Compute pair-level flow/grid once; reuse it for every intermediate t."""
     gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
@@ -3936,17 +4005,6 @@ def _run_vehicle_spin_job(vin: str, manifest: dict | None = None) -> None:
             total=NUM_EXTERIOR_FRAMES,
         )
         stage_dir = Path(tempfile.mkdtemp(prefix=".spin-stage-", dir=vehicle_dir))
-        interpolated = interpolate_frames(
-            exterior_dir, stage_dir, target_frames=NUM_EXTERIOR_FRAMES,
-            manifest=manifest, use_optical_flow=True,
-        )
-        if interpolated <= 0:
-            raise ValueError("No valid exterior frames could be interpolated")
-        _write_pipeline_job(
-            vin, "spin", "running", step="render", progress=65,
-            total=NUM_EXTERIOR_FRAMES,
-        )
-
         vehicle = db_get_vehicle(vin) or {}
         watermark_mode = vehicle.get("watermark_mode", "preview") or "preview"
         turntable_style = vehicle.get("turntable_style", "studio_shadow") or "studio_shadow"
@@ -3954,13 +4012,34 @@ def _run_vehicle_spin_job(vin: str, manifest: dict | None = None) -> None:
         selected_render_mode = os.environ.get("LOTVUE_RENDER_MODE", "studio").lower()
         if background_slug == "none":
             selected_render_mode = "natural"
-        render = process_all_frames_background(
-            stage_dir,
-            watermark_mode,
-            _vehicle_background_path(background_slug),
-            turntable_style,
-            render_mode=selected_render_mode,
-        )
+        if selected_render_mode == "studio" and REMBG_AVAILABLE:
+            # Cut out the real photos first, align them, then build in-betweens.
+            _write_pipeline_job(
+                vin, "spin", "running", step="render", progress=20,
+                total=NUM_EXTERIOR_FRAMES,
+            )
+            render = build_studio_spin(
+                exterior_dir, stage_dir, NUM_EXTERIOR_FRAMES, manifest,
+                _vehicle_background_path(background_slug), watermark_mode, turntable_style,
+            )
+        else:
+            interpolated = interpolate_frames(
+                exterior_dir, stage_dir, target_frames=NUM_EXTERIOR_FRAMES,
+                manifest=manifest, use_optical_flow=True,
+            )
+            if interpolated <= 0:
+                raise ValueError("No valid exterior frames could be interpolated")
+            _write_pipeline_job(
+                vin, "spin", "running", step="render", progress=65,
+                total=NUM_EXTERIOR_FRAMES,
+            )
+            render = process_all_frames_background(
+                stage_dir,
+                watermark_mode,
+                _vehicle_background_path(background_slug),
+                turntable_style,
+                render_mode=selected_render_mode,
+            )
         if not isinstance(render, dict) or render.get("status") == "error":
             raise RuntimeError("360 frame rendering failed")
         spin_count = _bounded_frame_count(stage_dir, "spin_", 120)
@@ -3987,6 +4066,8 @@ def _run_vehicle_spin_job(vin: str, manifest: dict | None = None) -> None:
             "render_status": render.get("status", "unknown"),
             "background_removed": bool(render.get("mode") == "studio"),
         }
+        if render.get("stability"):
+            spin_manifest["stability"] = render["stability"]
         if plate_report is not None:
             spin_manifest["plate_blur"] = plate_report
         (stage_dir / "manifest.json").write_text(
