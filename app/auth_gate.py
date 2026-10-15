@@ -348,20 +348,24 @@ def install_auth_gate(app):
     def _db_path() -> str:
         return str(a2_extensions.DB_PATH)
 
-    def _valid(token: str) -> bool:
+    def _verified_email(token: str) -> str | None:
+        """Return the account email behind a valid access token, else None."""
         if not token:
-            return False
+            return None
         try:
             payload = jwt.decode(token, _jwt_secret(), algorithms=[JWT_ALG])
             if not isinstance(payload, dict):
-                return False
+                return None
             email = str(payload.get("sub", "")).strip().lower()
             if payload.get("type") != "access" or not email:
-                return False
+                return None
             with sqlite3.connect(_db_path(), timeout=2) as conn:
-                return bool(conn.execute("SELECT 1 FROM users WHERE LOWER(email)=?", (email,)).fetchone())
+                found = conn.execute(
+                    "SELECT 1 FROM users WHERE LOWER(email)=?", (email,)
+                ).fetchone()
+            return email if found else None
         except (JWTError, sqlite3.Error):
-            return False
+            return None
 
     def _no_cache(resp):
         # force fresh HTML so app-mode/browsers never show a stale "old style"
@@ -389,8 +393,13 @@ def install_auth_gate(app):
         if is_public:
             return _no_cache(await call_next(request))
         token = _bearer_or_cookie(request)
+        # Verify the token once per request and publish the result, so route
+        # handlers can reuse it instead of re-opening the database.
+        verified_email = await run_in_threadpool(_verified_email, token)
+        if verified_email:
+            request.state.lotvue_user_email = verified_email
         if method == "GET" and re.fullmatch(r"/api/vin/[A-Za-z0-9]{11,17}/decode", path):
-            if not await run_in_threadpool(_valid, token):
+            if not verified_email:
                 return JSONResponse({"detail": "Sign in required"}, status_code=401)
             vin = path.split("/")[3].upper()
             if not await run_in_threadpool(_existing_vin_owned, token, vin, _db_path(), jwt, _jwt_secret(), JWT_ALG):
@@ -398,25 +407,25 @@ def install_auth_gate(app):
             return _no_cache(await call_next(request))
         job_id = _private_job_scope(path)
         if job_id:
-            if not await run_in_threadpool(_valid, token):
+            if not verified_email:
                 return JSONResponse({"detail": "Sign in required"}, status_code=401)
             if not await run_in_threadpool(_owns_job, token, job_id, _db_path(), jwt, _jwt_secret(), JWT_ALG):
                 return JSONResponse({"detail": "Job not found"}, status_code=404)
             return _no_cache(await call_next(request))
         vehicle_id = _private_vehicle_scope(path)
         if vehicle_id:
-            if not await run_in_threadpool(_valid, token):
+            if not verified_email:
                 return JSONResponse({"detail": "Sign in required"}, status_code=401)
             if not await run_in_threadpool(_owns_vehicle, token, vehicle_id, _db_path(), jwt, _jwt_secret(), JWT_ALG):
                 return JSONResponse({"detail": "Vehicle not found"}, status_code=404)
             return _no_cache(await call_next(request))
         if path.startswith("/storage/"):
-            if not await run_in_threadpool(_valid, token):
+            if not verified_email:
                 return JSONResponse({"detail": "Sign in required"}, status_code=401)
             if not await run_in_threadpool(_owns_private_storage, path, token, _db_path(), jwt, _jwt_secret(), JWT_ALG):
                 return JSONResponse({"detail": "File not found"}, status_code=404)
             return _no_cache(await call_next(request))
-        if await run_in_threadpool(_valid, token):
+        if verified_email:
             return _no_cache(await call_next(request))
         # HTML navigation → login redirect; API → 401 JSON
         accept = request.headers.get("accept", "")

@@ -2325,7 +2325,13 @@ def _authenticated_user_email(request: Request) -> str:
     except JWTError as exc:
         raise HTTPException(status_code=401, detail="Sign in required") from exc
     email = str(payload.get("sub", "")).strip().lower()
-    if payload.get("type") != "access" or not email or not db_get_user(email):
+    if payload.get("type") != "access" or not email:
+        raise HTTPException(status_code=401, detail="Sign in required")
+    # The auth gate already proved this account exists for this request; reuse
+    # that verdict instead of re-opening the database on every call.
+    if getattr(request.state, "lotvue_user_email", None) == email:
+        return email
+    if not db_get_user(email):
         raise HTTPException(status_code=401, detail="Sign in required")
     return email
 
@@ -10223,6 +10229,10 @@ def available_appointment_slots(request: Request, days: int = 7):
     return {"status": "ok", "slots": slots, "count": len(slots)}
 
 
+# C0 control characters (keeping TAB/LF/CR) plus DEL; stripped from free-text notes.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
 @app.post("/api/appointments/book")
 async def book_appointment_endpoint(request: Request):
     """Book an appointment only for a lead owned by the signed-in dealer."""
@@ -10240,7 +10250,7 @@ async def book_appointment_endpoint(request: Request):
         raise HTTPException(status_code=400, detail="Valid lead_id required") from exc
     slot = str(body.get("datetime", ""))[:64]
     apt_type = str(body.get("type", "test_drive"))
-    notes = re.sub(r"[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]", "", str(body.get("notes", "")))[:500]
+    notes = _CONTROL_CHARS_RE.sub("", str(body.get("notes", "")))[:500]
     if lead_id <= 0 or not slot:
         raise HTTPException(status_code=400, detail="lead_id and datetime required")
     if apt_type not in {"test_drive", "viewing", "trade_eval", "financing"}:
