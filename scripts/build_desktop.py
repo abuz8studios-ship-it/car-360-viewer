@@ -275,9 +275,12 @@ def _stage_ffmpeg(stage_app: Path) -> dict[str, object]:
     build_config = capture(ffmpeg_target, "-buildconf")
     license_id, license_file = _identify_ffmpeg_license(license_text, build_config)
     if source_archives:
-        if not version_text.startswith("ffmpeg version n8.0"):
-            raise RuntimeError("Pinned Linux FFmpeg bundle does not report the n8.0 release")
-        if not probe_version.startswith("ffprobe version n8.0"):
+        # A tagless fetch of the pinned commit reports its short hash (or "8.0").
+        versions = ("n8.0", "8.0", LINUX_FFMPEG_COMMIT[:7])
+        if not version_text.startswith(tuple(f"ffmpeg version {v}" for v in versions)):
+            raise RuntimeError(f"Pinned Linux FFmpeg bundle does not report the n8.0 release: "
+                               f"{version_text.splitlines()[0]!r}")
+        if not probe_version.startswith(tuple(f"ffprobe version {v}" for v in versions)):
             raise RuntimeError("Pinned Linux FFprobe bundle does not report the n8.0 release")
         if "--enable-gpl" not in build_config or "--enable-libx264" not in build_config:
             raise RuntimeError("Pinned Linux FFmpeg build lacks the GPL x264 encoder configuration")
