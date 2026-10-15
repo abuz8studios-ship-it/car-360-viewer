@@ -137,17 +137,28 @@ def continuity_check(pair_list):
             "weak_ratio": round(ratio, 2), "ok": ratio <= WEAK_PAIR_RATIO_MAX}
 
 
-def _frame_facts(path):
-    """One frame -> (facts dict, small grayscale, small subject mask)."""
-    from studio import cut_car  # lazy: pulls in the matting model once
+def _segmentation_enabled():
+    """Subject checks need an operator-approved matting model. Fresh installs
+    ship without one, so the gate must still answer (model-free) instead of
+    crashing the upload."""
+    from rembg_runtime import is_enabled
+    return is_enabled()
+
+
+def _frame_facts(path, segment=True):
+    """One frame -> (facts dict, small grayscale, small subject mask or None)."""
     img = Image.open(path).convert("RGB")
+    f = {"file": Path(path).name}
+    g = np.asarray(img.convert("L").resize((64, 64)), dtype=np.float32) / 255.0
+    f["luma"] = round(float(np.asarray(img.convert("L")).mean()), 1)
+    if not segment:
+        f.update(area=None, present=None, cropped=[], aspect=None)
+        return f, g, None
+    from studio import cut_car  # lazy: pulls in the matting model once
     m = np.array(cut_car(img).getchannel("A")) > 24
     h, w = m.shape
-    f = {"file": Path(path).name}
     f["area"] = round(float(m.mean()), 4)
-    g = np.asarray(img.convert("L").resize((64, 64)), dtype=np.float32) / 255.0
     ms = np.asarray(Image.fromarray((m * 255).astype(np.uint8)).resize((64, 64))) > 64
-    f["luma"] = round(float(np.asarray(img.convert("L")).mean()), 1)
     if not m.any():
         f.update(present=False, cropped=[], aspect=None)
         return f, g, ms
@@ -183,36 +194,44 @@ def analyze_set(files, sample=SAMPLE, pair_list=None):
             pidx = sorted(set(min(n - 2, int(i * n / 8)) for i in range(8)))
             pair_list = [(files[i], files[i + 1]) for i in pidx]
         cont = continuity_check(pair_list)
+    segment = _segmentation_enabled()
     idx = sorted(set(min(n - 1, int(i * n / min(sample, n))) for i in range(min(sample, n))))
     per, grays, masks = [], [], []
     for i in idx:
-        f, g, ms = _frame_facts(files[i])
+        f, g, ms = _frame_facts(files[i], segment)
         per.append(f); grays.append(g); masks.append(ms)
 
     k = len(per)
-    present_ratio = sum(1 for p in per if p.get("present")) / k
-    crop_ratio = sum(1 for p in per if p["cropped"]) / k
     expo_bad = sum(1 for p in per if not (LUMA_LO <= p["luma"] <= LUMA_HI)) / k
-    aspects = [p["aspect"] for p in per if p["aspect"]]
-    a_range = round(max(aspects) - min(aspects), 3) if len(aspects) > 1 else 0.0
-    mid = (max(aspects) + min(aspects)) / 2 if aspects else 0
-    states = ["w" if a > mid else "n" for a in aspects]
-    transitions = sum(1 for a, b in zip(states, states[1:]) if a != b)
-
-    # background parallax: mean-abs-diff of non-subject pixels, consecutive pairs
-    diffs = []
-    for j in range(len(grays) - 1):
-        bg = ~(masks[j] | masks[j + 1])
-        if bg.mean() < 0.05:
-            continue  # subject fills frame; no background to compare
-        diffs.append(float(np.abs(grays[j] - grays[j + 1])[bg].mean()))
-    bg_motion = round(float(np.median(diffs)), 4) if diffs else 0.0
-
-    checks = {"present_ratio": round(present_ratio, 2), "crop_ratio": round(crop_ratio, 2),
-              "exposure_bad_ratio": round(expo_bad, 2), "aspect_range": a_range,
-              "coverage_transitions": transitions, "bg_motion": bg_motion,
+    checks = {"exposure_bad_ratio": round(expo_bad, 2),
               "pair_inliers": cont["pair_inliers"], "weak_pair_ratio": cont["weak_ratio"],
               "sampled": k}
+    present_ratio, crop_ratio, bg_motion, aspects = 1.0, 0.0, None, []
+    if segment:
+        present_ratio = sum(1 for p in per if p.get("present")) / k
+        crop_ratio = sum(1 for p in per if p["cropped"]) / k
+        aspects = [p["aspect"] for p in per if p["aspect"]]
+        a_range = round(max(aspects) - min(aspects), 3) if len(aspects) > 1 else 0.0
+        mid = (max(aspects) + min(aspects)) / 2 if aspects else 0
+        states = ["w" if a > mid else "n" for a in aspects]
+        transitions = sum(1 for a, b in zip(states, states[1:]) if a != b)
+
+        # background parallax: mean-abs-diff of non-subject pixels, consecutive pairs
+        diffs = []
+        for j in range(len(grays) - 1):
+            bg = ~(masks[j] | masks[j + 1])
+            if bg.mean() < 0.05:
+                continue  # subject fills frame; no background to compare
+            diffs.append(float(np.abs(grays[j] - grays[j + 1])[bg].mean()))
+        bg_motion = round(float(np.median(diffs)), 4) if diffs else 0.0
+        checks.update(present_ratio=round(present_ratio, 2), crop_ratio=round(crop_ratio, 2),
+                      aspect_range=a_range, coverage_transitions=transitions,
+                      bg_motion=bg_motion)
+    else:
+        # Without a matte the car cannot be told from the background, so the
+        # car-present, cropping, coverage and turntable checks are not run.
+        checks["subject_checks"] = "skipped: no background-removal model configured"
+
     reasons = []
     if present_ratio < PRESENT_RATIO_MIN:
         reasons.append(f"car not clearly visible in {int((1-present_ratio)*k)}/{k} "
@@ -225,7 +244,7 @@ def analyze_set(files, sample=SAMPLE, pair_list=None):
     if aspects and (a_range < ASPECT_RANGE_MIN or transitions < COVERAGE_TRANSITIONS_MIN):
         reasons.append("missing angle coverage — walk a full circle: front, both "
                        "sides and rear must all appear")
-    if bg_motion < BG_MOTION_MIN:
+    if bg_motion is not None and bg_motion < BG_MOTION_MIN:
         reasons.append("static camera / turntable signature: the background does not "
                        "move across the capture. Walk around the car with your phone "
                        "instead of rotating the car in front of a fixed camera.")
@@ -240,7 +259,8 @@ def analyze_set(files, sample=SAMPLE, pair_list=None):
         checks["continuity"] = cont["skipped"]
     return {"verdict": "PASS" if not reasons else "FAIL", "reasons": reasons,
             "frames": n, "checks": checks,
-            "splat_eligible": (not reasons) and bg_motion >= BG_MOTION_MIN
+            "splat_eligible": (not reasons) and bg_motion is not None
+                              and bg_motion >= BG_MOTION_MIN
                               and cont["ok"] and not guided_photo_set,
             "per_frame": per}
 
