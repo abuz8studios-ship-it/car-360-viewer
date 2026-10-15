@@ -78,6 +78,14 @@ python -m ruff check app tests scripts
 python -m compileall -q app tests scripts
 ```
 
+## Ship an update
+
+1. Merge the reviewed change to `main` and confirm the **CI** workflow is green on that commit.
+2. Bump `MyAppVersion` in `LotVue360.iss` (and the `/api/health` version in `app/main.py`) to the new version.
+3. Tag and push: `git tag -a v2.1.0 -m "LotVue360 v2.1.0" && git push origin v2.1.0`.
+
+A `v*` tag runs **Desktop releases**: tests, the four native builds with installer smoke tests, then a GitHub Release with every installer, ZIP, and `.sha256` sidecar, using `.github/RELEASE_NOTES.md` as the notes. Running the same workflow manually (`workflow_dispatch`) builds 30-day artifacts without publishing. Both need GitHub Actions minutes on the owner's account.
+
 ## User data and connector security
 
 The desktop app keeps its database, configuration, private JWT key, uploads, and logs in a per-user data directory separate from program files: `%LOCALAPPDATA%\LotVue360` on Windows and `~/Library/Application Support/LotVue360` on macOS. The first launch copies a blank template from `app/.env.example`. Use the installed system to create an account; choose a unique password and keep the data directory private.
