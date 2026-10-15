@@ -82,6 +82,8 @@ python -m compileall -q app tests scripts
 
 ## Build the Windows installer (owner's PC)
 
+**Easiest:** double-click `Build-Windows-Installer.cmd` in the repository folder. It installs Python 3.11 and Inno Setup with winget if they are missing, then runs the steps below.
+
 The acceptance target is a Windows EXE built locally; these are the same steps the Windows CI job ran. Needs 64-bit Python 3.11, [Inno Setup 6](https://jrsoftware.org/isinfo.php), and network access the first time (FFmpeg and the two background-removal models, about 355 MB, are downloaded and hash-checked).
 
 ```powershell
