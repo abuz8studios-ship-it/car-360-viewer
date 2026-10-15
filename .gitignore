@@ -67,6 +67,7 @@ desktop*.log
 # --- Backups & old source variants ---
 app/backups/
 *.bak
+*.bak-*
 main*.py.bak
 *_backup_*.py
 app/main_before_op6.py
@@ -86,6 +87,9 @@ LOTVUE360_DEMO.md
 SESSION_AUDIT_*.md
 NEXT_SESSION*.md
 *HANDOFF*.md
+
+# --- Test / QA scratch ---
+.pytest_cache/
 
 # --- OS / editor ---
 .DS_Store

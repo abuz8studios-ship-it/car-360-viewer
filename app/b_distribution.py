@@ -135,6 +135,8 @@ def _import_rows(rows: list, source: str = "csv", user_email: str = ""):
     if not user_email:
         raise HTTPException(401, "Sign in required")
     owner = _is_owner(user_email)
+    import billing
+    free_left = billing.free_slots_left(user_email)  # None = no free-tier limit applies
     conn = _db()
     imported, updated, errors = 0, 0, []
     try:
@@ -173,6 +175,12 @@ def _import_rows(rows: list, source: str = "csv", user_email: str = ""):
                         conn.execute(f"UPDATE vehicles SET {sets} WHERE vin=? AND status='active'", (*fields.values(), vin))
                     updated += 1
                 else:
+                    if free_left is not None and not billing._owns_vehicle(user_email, vin):
+                        if free_left <= 0:
+                            errors.append({"row": i, "vin": vin, "error": "free vehicle limit reached",
+                                           "upgrade_url": "/pricing"})
+                            continue
+                        free_left -= 1
                     cols = ["vin", "created_at", "user_email"] + list(fields.keys())
                     vals = [vin, datetime.now().isoformat(), user_email] + list(fields.values())
                     ph = ",".join("?" for _ in cols)

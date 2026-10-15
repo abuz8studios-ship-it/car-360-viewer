@@ -22,9 +22,9 @@ A dealer who has never seen the product, unaided, end to end:
 4. [x] Gets back a rendered 360 spin with the background replaced, in minutes not hours
 5. [x] Sees the vehicle live on a public VDP URL they can share
 6. [x] Sees it appear as a valid entry in the Google Vehicle Listings feed
-7. [ ] **Pays** — enters a card, is charged, gets a receipt
+7. [~] **Pays** — enters a card, is charged, gets a receipt. *Code complete + automated test passing (2026-10-09); never run against a live Stripe key — owner gate.*
 
-Steps 2–6, plus account creation and dashboard (step 1), were run and passed end to end on 2026-08-12 (fresh account `dealer60@`: register + login 200 → dashboard 200 with capture links → real walkaround upload, gate PASS, 36 frames → 360 render → public VDP 200 with viewer, screenshot-verified → priced → Google feed validator 156/156). That specific test account's session is the evidence for step 1, not a standing guarantee — re-verify before quoting. Step 7 has never been attempted against a live Stripe key.
+Steps 2–6, plus account creation and dashboard (step 1), were run and passed end to end on 2026-08-12 (fresh account `dealer60@`: register + login 200 → dashboard 200 with capture links → real walkaround upload, gate PASS, 36 frames → 360 render → public VDP 200 with viewer, screenshot-verified → priced → Google feed validator 156/156). That specific test account's session is the evidence for step 1, not a standing guarantee — re-verify before quoting. Step 7 is now built (`app/billing.py`: Stripe Checkout subscription → signed webhook → plan activated → receipt on `/billing`) and exercised end to end by `tests/test_stranger_dealer.py` with Stripe faked and webhooks HMAC-signed exactly like Stripe's. It has still never been run against a live Stripe key, so it isn't checked yet.
 
 **"Done" is not code-complete or builds-clean.** It's: a real independent dealer, with zero help from Ahmad or any agent, uploads a real car and pays. The last recorded result is no completed paid stranger-dealer run and **$0 revenue reported**; this audit did not access billing/accounting data to refresh that number.
 
@@ -49,6 +49,9 @@ The checks below are retained with their original dates; this audit did not re-r
 | Facebook Marketplace | Researched, not built as automation — Meta discontinued the dealer feed API in 2023; shipped an assisted-posting pack instead (`/api/marketplace/facebook/{vin}/pack`), which is the real ceiling, not a gap |
 | Universal gallery→spin lane ("Spyne-clone" mode) | `app/studio_spin.py` — turns *any* dealer's existing gallery photos into a spin with zero manual curation; proven clean across 3 vehicles of different bodies/colors (Navigator, Accord, Outback) |
 | Stranger-dealer 60-second test | PASSED 2026-08-12 for every step except payment (see Definition of Done above) |
+| Billing / step 7 (code) | 2026-10-09: `app/billing.py`. Price set in one place (`LOTVUE_PRICE_MONTHLY_CENTS`, default $99/mo), Checkout in subscription mode, signed and idempotent webhook, `/billing` with receipts + Customer Portal, 402 paywall after `LOTVUE_FREE_VEHICLES`. Covered by `tests/` (21 passing). Not yet live-verified |
+| Account security | 2026-10-09: salted PBKDF2 passwords (legacy sha256 upgraded on login), signup validation and duplicate check, the unsigned-webhook forgery hole and self-service `/api/set-plan` upgrade closed, `/` (inventory dashboard) no longer public, login open-redirect fixed |
+| License-plate blur | 2026-10-09: `ai_studio/plate_blur.py` rewritten (old detector found 0/2 real plates; new one found 2/2 with 0 false positives across 8 real car photos plus the Select Auto studio sample). `POST /api/vehicle/{vin}/blur-plates`, with `LOTVUE_AUTO_PLATE_BLUR=1` to run after every finalize. Small sample: inspect one real dealer VIN before turning auto-blur on |
 | Real-world dealer run | 2026-09-02: pulled 42 real listing photos from a named live dealer (Select Auto, Dayton OH) and produced a 7-angle studio spin; 4 of 7 angles judged clean on inspection |
 
 ## Historical Windows/macOS desktop-release snapshot — 2026-10-03 (superseded by current status above)
@@ -63,14 +66,18 @@ The verified older artifacts include local Python/runtime libraries and FFmpeg/F
 
 ## Blocking revenue — fix these before anything else
 
-1. **Stripe checkout has not been verified live in this audit.** The last recorded test returned `401 Expired API Key`; this checkout has no `app/.env`, and no secret was accessed or changed. No payment can be confirmed until Ahmad rolls the key and runs a live test. *(Owner action.)*
-2. **Pricing is undecided and several incompatible catalogs are present:**
+1. **Stripe has not been verified live.** The checkout code is done (`app/billing.py` + the signed webhook in `app/main.py`), but the last recorded secret-key test returned `401 Expired API Key` (2026-09-02). *(Owner actions, in order:)*
+   1. Roll the key and put it in `STRIPE_SECRET_KEY` / `STRIPE_PUBLISHABLE_KEY`.
+   2. Add a webhook endpoint `<LOTVUE_PUBLIC_URL>/api/stripe/webhook` for `checkout.session.completed`, `invoice.paid`, `invoice.payment_failed`, `customer.subscription.updated`, `customer.subscription.deleted`, then put its signing secret in `STRIPE_WEBHOOK_SECRET`. Without it the webhook refuses every event (by design).
+   3. Stripe → Settings → Customer emails: turn on "Successful payments" (the emailed receipt). Settings → Billing → Customer portal: activate it.
+   4. Set `LOTVUE_FEATURE_PAYMENTS=1` and `LOTVUE_PRICING_APPROVED=1`, restart, then run one real $99 charge on a test account and refund it. Only then check step 7.
+2. **Pricing — decided 2026-10-15 (owner): 5 free vehicles per account, lifetime (no reset), then $99/month Dealership plan.** The code has one source of truth (`LOTVUE_PRICE_MONTHLY_CENTS`=9900 and `LOTVUE_FREE_VEHICLES`=5, read by `app/billing.py`); the legacy plan tables in `app/main.py` read their dealership amount from it, and the legacy one-time credit packs stay off (`LOTVUE_CREDIT_PACKS=0`). The older documents below still carry superseded numbers:
    - `BRAIN.md`: $99/mo/dealer SaaS
    - `SALES_FUNNEL_FIRST_DOLLAR_2026-08-28.md`: $1,000 launch + $500/mo retainer
    - `SALES_FUNNEL_LOTVUE360_2026-08-28.md`: $1,000 sprint + $1,000/mo retainer
-   - `app/main.py`: plan tables/page include $2.99, $19.99, $75/mo, $99.99/mo, and $299.99/mo values.
+   - `app/main.py` (before 2026-10-15): legacy plan tables carried $2.99, $19.99, $75/mo, $99.99/mo, and $299.99/mo values. The dealership entries now read the one price from `app/billing.py`; the $2.99/$19.99 credit packs remain in code behind `LOTVUE_CREDIT_PACKS=0`, and the $299.99 enterprise row is not sold.
 
-   The local code now defaults `LOTVUE_PRICING_APPROVED=0`: `/pricing` hides the price cards, `/api/plans` returns an empty catalog, and checkout/subscription/unlock/webhook paths stay disabled unless both pricing approval and the payment feature are enabled. A second fail-closed check also requires the checkout and subscription amounts to agree for single-render, starter, and dealership tiers; subscription checkout is restricted to the public dealership tier, and one-time unlocks use the checkout catalog amount rather than a separate literal. The legacy dealership values still conflict, so setting the approval flag alone cannot publish prices or create charges. This is a safe default, **not** a price decision. Ahmad must approve one canonical offer, reconcile the tables, and only then enable it.
+   Fail-closed defaults stay: with `LOTVUE_PRICING_APPROVED=0`, `/pricing` shows "Pricing is being finalized" with no amounts, `/api/plans` returns an empty catalog, the paywall is off, and checkout and the webhook refuse to run. Setting `LOTVUE_FEATURE_PAYMENTS=1` and `LOTVUE_PRICING_APPROVED=1` publishes the $99 plan and enables checkout; a live charge-and-refund is still required before step 7 is checked.
 3. **No sample has been sent to any prospect in the last recorded evidence.** The Select Auto sample was marked "FREE SAMPLE PRODUCED. NOT SENT" on 2026-09-02. Sending is Ahmad's gate (it's an outbound message on his behalf); the output is not present in this checkout.
 4. **Lead-alert email has not been live-verified in this audit.** The last recorded Gmail SMTP app-password test returned `535 BadCredentials`; this checkout has no `app/.env`. *(Owner action: rotate/test the SMTP app password.)*
 5. **Production uptime is unverified.** The last recorded note says the production server had roughly 3 weeks of 502 downtime through 2026-09-02 and was manually restarted. Whether `LOTVUE\\StartApp` is enabled and survives reboot needs a fresh owner-side check. *(Owner action; persistent system-config change.)*
@@ -85,8 +92,11 @@ The verified older artifacts include local Python/runtime libraries and FFmpeg/F
 ## Smaller open items
 
 - **One VIN's full studio-grade spin set still needs full-resolution visual inspection.** The repository checkout has no generated VIN output under `app/storage/`; synthetic tests and source review cannot substitute for a visual review of a real spin set.
-- **License-plate privacy remains OPEN.** The optional AI PhotoProcessor already calls the blur stage, and a synthetic 640×480 plate smoke test passes. The detector is a lower/center ROI heuristic with a regional Haar cascade and contour fallback; there are no representative real-dealer recall/false-negative measurements, and it is not proven to cover every standard capture/render path. Do not market this as reliable plate anonymization until measured on a labeled dataset and visually reviewed.
+- **Plate blur: before setting `LOTVUE_AUTO_PLATE_BLUR=1` in production, run `python -m ai_studio.plate_blur --vin <VIN>` on one real dealer VIN and inspect the frames at full res.** PR #2's rewritten detector (black-hat character verification) found 2/2 readable plates with 0 false positives on 8 real car photos plus the Select Auto sample (recorded 2026-10-09); unblurred originals are kept in a dot-prefixed `.orig_unblurred/` folder that `/storage` never serves.
+- **License-plate privacy remains OPEN (historical note follows).** The optional AI PhotoProcessor already calls the blur stage, and a synthetic 640×480 plate smoke test passes. The detector is a lower/center ROI heuristic with a regional Haar cascade and contour fallback; there are no representative real-dealer recall/false-negative measurements, and it is not proven to cover every standard capture/render path. Do not market this as reliable plate anonymization until measured on a labeled dataset and visually reviewed.
 - **Background-removal model licensing remains OPEN.** The rembg package is only a Python runtime; no checkpoint is selected or included. Inference is gated on an operator-selected model plus explicit acknowledgment. The owner must verify commercial rights and weights provenance for the exact checkpoint; the acknowledgment is not legal approval. Until then, 360 output keeps photographed backgrounds and strict cut-out endpoints return a setup response.
+
+- **Security: `mobile_native/android/keystore.properties` (tracked in git) contains the Android upload-keystore store and key passwords, and `mobile_native/lotvue-upload.keystore` is tracked too.** The repo is private, but treat that password as exposed. Owner decision: move both out of git and, if the app goes to Play, enroll in Play App Signing so the upload key can be reset.
 
 ## Repo hygiene — not blocking revenue, but real debt
 

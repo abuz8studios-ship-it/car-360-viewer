@@ -1,4 +1,4 @@
-"""
+r"""
 validate_video.py — P0 UPLOAD QUALITY GATE (Spyne validate-video parity).
 
 Runs at the FRONT DOOR of /api/upload, before any expensive processing.
@@ -69,7 +69,7 @@ def _resolve_tool(env_key, name):
                  str(BASE.parents[1] / "AI" / "ffmpeg" / name)):
         if cand and os.path.exists(cand):
             return cand
-    return name  # PATH fallback
+    return shutil.which(name) or shutil.which(name.replace(".exe", "")) or name  # PATH fallback
 
 FFMPEG = _resolve_tool("FFMPEG_PATH", "ffmpeg.exe")
 FFPROBE = _resolve_tool("FFPROBE_PATH", "ffprobe.exe")

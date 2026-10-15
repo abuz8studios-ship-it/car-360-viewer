@@ -3,15 +3,17 @@ Full dealer-journey QA against the PUBLIC URL. Prints PASS/FAIL per step.
 Run:  E:\\Miniconda3\\envs\\lotvue\\python.exe journey_qa.py [base_url]
 """
 import io
+import os
 import sys
 import json
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
 from pathlib import Path
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "https://lotvue.abuz8ai.com").rstrip("/")
-ASSETS = Path(r"E:\ABU\360Car\test_assets")
+ASSETS = Path(os.environ.get("LOTVUE_TEST_ASSETS", r"E:\ABU\360Car\test_assets"))
 VIN = "2HGFC2F69KH500111"  # valid-format test VIN (2019 Honda Civic)
 EMAIL = "journey.dealer@lotvue.test"
 PASSWORD = "Journey1234!"
@@ -81,7 +83,14 @@ def post_file(path, fields, file_field, file_path):
 
 
 # 1. Register
-step("register", lambda: post_form("/api/register", {"email": EMAIL, "name": "Journey Dealer", "password": PASSWORD}))
+def _register():
+    try:
+        return post_form("/api/register", {"email": EMAIL, "name": "Journey Dealer", "password": PASSWORD})
+    except urllib.error.HTTPError as e:
+        if e.code == 409:  # QA account already exists from an earlier run
+            return "already registered"
+        raise
+step("register", _register)
 
 # 2. Login
 step("login", lambda: post_form("/api/login", {"email": EMAIL, "password": PASSWORD}))
@@ -142,9 +151,11 @@ step("export_qr", lambda: f"{len(get(f'/api/vehicle/{VIN}/export/qr.png', raw=Tr
 step("export_zip", lambda: f"{len(get(f'/api/vehicle/{VIN}/export/frames.zip', raw=True))} bytes")
 step("export_gif", lambda: f"{len(get(f'/api/vehicle/{VIN}/export/spin.gif', raw=True))} bytes")
 
-# 11. Checkout session (live mode — session only, no charge)
-step("stripe_checkout", lambda: post_form("/api/create-checkout-session",
-     {"plan_id": "starter", "user_email": EMAIL})["session_url"].split("?")[0][:40])
+# 11. Checkout session (creates a Stripe Checkout session only — no charge until a card is entered)
+step("pricing_page", lambda: "price shown" if "/mo" in get("/pricing", raw=True).decode("utf-8", "replace")
+     else (_ for _ in ()).throw(AssertionError("no monthly price on /pricing")))
+step("stripe_checkout", lambda: post_form("/api/billing/checkout", {})["url"].split("?")[0][:40])
+step("billing_status", lambda: get("/api/billing/status"))
 
 # 12. Syndication surfaces include the new car
 def check_feeds():

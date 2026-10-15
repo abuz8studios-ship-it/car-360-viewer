@@ -12,73 +12,58 @@ sys.path.insert(0, str(ROOT / "app"))
 
 import main  # noqa: E402
 
+billing = main._billing
+
 
 def test_unapproved_price_catalog_is_not_published(monkeypatch) -> None:
-    monkeypatch.setattr(main, "PRICING_APPROVED", False)
-    page = main.pricing_page()
-
-    assert main.get_plans() == {"status": "pending_approval", "plans": []}
-    assert page.status_code == 200
-    assert "Pricing is being finalized" in page.body.decode()
-    assert "$2.99" not in page.body.decode()
-    assert "$19.99" not in page.body.decode()
-    assert "$75" not in page.body.decode()
-
-
-def test_public_pricing_routes_hide_unapproved_prices(monkeypatch) -> None:
     monkeypatch.setattr(main, "PRICING_APPROVED", False)
     client = TestClient(main.app)
 
     page = client.get("/pricing")
     plans = client.get("/api/plans")
 
-    assert page.status_code == 200
-    assert "$2.99" not in page.text and "$75" not in page.text
+    assert main.get_plans() == {"status": "pending_approval", "plans": []}
     assert plans.status_code == 200
     assert plans.json() == {"status": "pending_approval", "plans": []}
+    assert page.status_code == 200
+    assert "Pricing is being finalized" in page.text
+    for amount in ("$99", "$2.99", "$19.99", "$75"):
+        assert amount not in page.text
 
 
-def test_accidental_approval_cannot_publish_conflicting_plan_amounts(monkeypatch) -> None:
+def test_approved_offer_is_the_single_billing_price(monkeypatch) -> None:
+    monkeypatch.setattr(main, "PRICING_APPROVED", True)
+    client = TestClient(main.app)
+
+    plans = main.get_plans()
+    page = client.get("/pricing").text
+
+    assert plans["status"] == "ok"
+    assert plans["plans"]["dealership"]["amount_cents"] == billing.plan()["amount_cents"] == 9900
+    assert plans["plans"]["free"]["vehicles"] == billing.free_vehicle_limit() == 5
+    assert main.PLANS["dealership"]["price"] == main.PRICING_PLANS["dealership"]["price"] == 99.0
+    assert "$99" in page
+    assert "$2.99" not in page and "$19.99" not in page
+
+
+def test_credit_packs_stay_off_when_the_subscription_is_live(monkeypatch) -> None:
     monkeypatch.setattr(main, "FEATURES_ENABLED", {**main.FEATURES_ENABLED, "payments": True})
     monkeypatch.setattr(main, "PRICING_APPROVED", True)
-
+    monkeypatch.setattr(main, "CREDIT_PACKS_ENABLED", False)
     monkeypatch.setattr(main, "_authenticated_user_email", lambda _request: "dealer@example.test")
     monkeypatch.setattr(main, "_require_vehicle_owner", lambda *_args, **_kwargs: {"vin": "1HGCM82633A004352"})
 
-    assert not main._pricing_catalog_consistent()
-    assert not main._payments_available()
-    assert main.get_plans() == {"status": "pending_approval", "plans": []}
-    assert "Pricing is being finalized" in main.pricing_page().body.decode()
+    assert main._payments_available()
+    assert not main._credit_packs_available()
     assert main.create_checkout_session(object(), "single", "dealer@example.test")["status"] == "disabled"
     assert main.create_subscription(object(), "dealer@example.test", "dealership")["status"] == "disabled"
     assert main.unlock_render(object(), "1HGCM82633A004352")["status"] == "disabled"
-    assert asyncio.run(main.stripe_webhook(object())).status_code == 503
 
 
-def test_approved_consistent_catalog_drives_public_amounts(monkeypatch) -> None:
-    checkout_plans = {key: dict(value) for key, value in main.PLANS.items()}
-    subscription_plans = {key: dict(value) for key, value in main.PRICING_PLANS.items()}
-    subscription_plans["dealership"]["price"] = checkout_plans["dealership"]["price"]
-    monkeypatch.setattr(main, "PLANS", checkout_plans)
-    monkeypatch.setattr(main, "PRICING_PLANS", subscription_plans)
-    monkeypatch.setattr(main, "PRICING_APPROVED", True)
-
-    page = main.pricing_page().body.decode()
-
-    assert main.get_plans()["status"] == "ok"
-    assert "$2.99" in page
-    assert "$19.99" in page
-    assert "$75.00<span>/mo</span>" in page
-
-
-def test_subscription_amount_comes_from_the_aligned_catalog(monkeypatch) -> None:
-    checkout_plans = {key: dict(value) for key, value in main.PLANS.items()}
-    subscription_plans = {key: dict(value) for key, value in main.PRICING_PLANS.items()}
-    subscription_plans["dealership"]["price"] = checkout_plans["dealership"]["price"]
-    monkeypatch.setattr(main, "PLANS", checkout_plans)
-    monkeypatch.setattr(main, "PRICING_PLANS", subscription_plans)
+def test_legacy_subscription_amount_comes_from_the_billing_price(monkeypatch) -> None:
     monkeypatch.setattr(main, "FEATURES_ENABLED", {**main.FEATURES_ENABLED, "payments": True})
     monkeypatch.setattr(main, "PRICING_APPROVED", True)
+    monkeypatch.setattr(main, "CREDIT_PACKS_ENABLED", True)
     monkeypatch.setattr(main, "STRIPE_KEY", "sk_test_placeholder")
     monkeypatch.setattr(main, "_authenticated_user_email", lambda _request: "dealer@example.test")
     monkeypatch.setattr(main, "db_get_user", lambda _email: None)
@@ -100,16 +85,14 @@ def test_subscription_amount_comes_from_the_aligned_catalog(monkeypatch) -> None
 
     assert result["status"] == "ok"
     price_data = captured["items"][0]["price_data"]
-    assert price_data["unit_amount"] == 7500
+    assert price_data["unit_amount"] == billing.plan()["amount_cents"] == 9900
     assert price_data["recurring"] == {"interval": "month"}
 
 
 def test_subscription_rejects_unpublished_legacy_plan(monkeypatch) -> None:
-    subscription_plans = {key: dict(value) for key, value in main.PRICING_PLANS.items()}
-    subscription_plans["dealership"]["price"] = main.PLANS["dealership"]["price"]
-    monkeypatch.setattr(main, "PRICING_PLANS", subscription_plans)
     monkeypatch.setattr(main, "FEATURES_ENABLED", {**main.FEATURES_ENABLED, "payments": True})
     monkeypatch.setattr(main, "PRICING_APPROVED", True)
+    monkeypatch.setattr(main, "CREDIT_PACKS_ENABLED", True)
     monkeypatch.setattr(main, "STRIPE_KEY", "sk_test_placeholder")
     monkeypatch.setattr(main, "_authenticated_user_email", lambda _request: "dealer@example.test")
 
@@ -123,6 +106,7 @@ def test_payment_routes_remain_disabled_even_if_feature_flag_is_accidentally_ena
 ) -> None:
     monkeypatch.setattr(main, "FEATURES_ENABLED", {**main.FEATURES_ENABLED, "payments": True})
     monkeypatch.setattr(main, "PRICING_APPROVED", False)
+    monkeypatch.setattr(main, "CREDIT_PACKS_ENABLED", True)
     monkeypatch.setattr(main, "_authenticated_user_email", lambda _request: "dealer@example.test")
 
     checkout = main.create_checkout_session(object(), "single", "dealer@example.test")
@@ -133,6 +117,8 @@ def test_payment_routes_remain_disabled_even_if_feature_flag_is_accidentally_ena
     assert subscription["status"] == "disabled"
     assert webhook.status_code == 503
     assert not main._payments_available()
+    assert not billing.payments_enabled()
+    assert billing.free_slots_left("dealer@example.test") is None  # no paywall
     assert main.check_user_can_render("dealer@example.test")["reason"] == (
         "Payments disabled or pricing unapproved"
     )

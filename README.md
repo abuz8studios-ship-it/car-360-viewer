@@ -88,13 +88,24 @@ python -m compileall -q app tests scripts
 
 A `v*` tag runs **Desktop releases**: tests, the four native builds with installer smoke tests, then a GitHub Release with every installer, ZIP, and `.sha256` sidecar, using `.github/RELEASE_NOTES.md` as the notes. Running the same workflow manually (`workflow_dispatch`) builds 30-day artifacts without publishing. Both need GitHub Actions minutes on the owner's account.
 
+## Billing (how a dealer pays)
+
+The offer is owner-approved (2026-10-15): **5 free vehicles per account for the life of the account (no monthly reset), then the $99/month Dealership plan** for unlimited vehicles. Re-shooting a vehicle a dealer already has never counts against the free five. Pricing and payment logic live in `app/billing.py`; the price exists in one place, `LOTVUE_PRICE_MONTHLY_CENTS` (default `9900`), and the allowance in `LOTVUE_FREE_VEHICLES` (default `5`).
+
+- `/pricing` → **Subscribe** → Stripe Checkout (subscription) → `/billing/success`, which re-checks the session with Stripe server-side.
+- `/api/stripe/webhook` accepts only events signed with `STRIPE_WEBHOOK_SECRET`, records each event id once, and applies subscription, receipt (`invoice.paid`), past-due and cancellation events in the same transaction.
+- `/billing` shows plan status and receipts and opens the Stripe Customer Portal (update card, cancel, invoices).
+- After the free five, creating a new vehicle returns HTTP 402 with a link to `/pricing`; the upload pages show that message.
+
+Nothing is charged or published until the owner sets `LOTVUE_FEATURE_PAYMENTS=1` **and** `LOTVUE_PRICING_APPROVED=1` and supplies Stripe keys; until then the paywall is off and `/pricing` says pricing is being finalized. The legacy one-time credit packs stay off unless `LOTVUE_CREDIT_PACKS=1`. The going-live checklist is in `PRD.md` → "Blocking revenue". `tests/test_stranger_dealer.py` runs sign-up → dashboard → capture gate → public feed → checkout → signed webhook → receipt → paywall → cancellation against an isolated app copy with Stripe faked.
+
 ## User data and connector security
 
 The desktop app keeps its database, configuration, private JWT key, uploads, and logs in a per-user data directory separate from program files: `%LOCALAPPDATA%\LotVue360` on Windows and `~/Library/Application Support/LotVue360` on macOS. The first launch copies a blank template from `app/.env.example`. Use the installed system to create an account; choose a unique password and keep the data directory private.
 
 Optional Google, social, marketplace, DMS, data-provider, email/SMS, local-model, and media-service connectors require the dealership owner's approved accounts, real credentials, service reachability, and appropriate legal rights. The blank template contains no live credentials. The local health panel does not probe external services. Configure secrets only in the local per-user `.env`; do not commit them, attach them to logs, or send them in chat/support tickets. This product does not provision third-party approvals or paid access.
 
-Stripe remains disabled, public prices remain hidden, and no tier or amount is approved. The owner must select one canonical offer and separately verify any future live billing before enabling payments. The public Google feed likewise requires a real HTTPS dealership URL, complete dealer configuration, a secret token, and Google registration; a desktop-only URL is not a valid production feed.
+Stripe stays disabled in the desktop template (`LOTVUE_FEATURE_PAYMENTS=0`, `LOTVUE_PRICING_APPROVED=0`); see **Billing** above for the approved offer and how to turn payments on after a live test. The public Google feed likewise requires a real HTTPS dealership URL, complete dealer configuration, a secret token, and Google registration; a desktop-only URL is not a valid production feed.
 
 ## Resource defaults (from the current code audit)
 
@@ -109,4 +120,4 @@ See the dated audit for measurement boundaries and details. The caps do not repl
 
 ## Historical documents and commercial status
 
-Old workstation build sizes, historical account counts, former price sheets, production-outage notes, and prior capability checklists are not automatically current. Treat them as dated evidence and use the audit above for current verification. Pricing remains undecided. The tracked root `LICENSE` declares proprietary ABUZ8 LLC ownership and All Rights Reserved; the product owner should confirm customer-use and third-party redistribution terms before any public release.
+Old workstation build sizes, historical account counts, former price sheets, production-outage notes, and prior capability checklists are not automatically current. Treat them as dated evidence and use the audit above for current verification. The tracked root `LICENSE` declares proprietary ABUZ8 LLC ownership and All Rights Reserved; the product owner should confirm customer-use and third-party redistribution terms before any public release.

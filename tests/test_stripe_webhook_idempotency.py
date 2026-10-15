@@ -196,7 +196,7 @@ def test_unlock_webhook_retries_if_clean_frame_queue_is_full(tmp_path: Path, mon
 
     retried = client.post("/api/stripe/webhook", content=b"{}", headers={"stripe-signature": "signed"})
     assert retried.status_code == 200
-    assert retried.json() == {"status": "received"}
+    assert retried.json()["status"] == "received"
     assert len(queue_attempts) == 2
     assert queue_attempts[0][0] == queue_attempts[1][0] == "clean-frames:1HGCM82633A004352"
     with sqlite3.connect(db_path) as conn:

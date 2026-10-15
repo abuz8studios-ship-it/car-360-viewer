@@ -1025,6 +1025,12 @@ def _import_vehicle_work(dealer: str, vin: str, actor_email: str):
                 {"error": "VIN belongs to a different tenant; import was not allowed"},
                 status_code=409,
             )
+        if not current_owner:
+            import billing
+            left = billing.free_slots_left(actor_email)
+            if left is not None and left <= 0 and not billing._owns_vehicle(actor_email, vin):
+                return JSONResponse({"detail": billing.payment_required_detail(actor_email)},
+                                    status_code=402)
         entry = _get_inventory(dealer)
         rec = entry["by_vin"].get(vin)
         if not rec:

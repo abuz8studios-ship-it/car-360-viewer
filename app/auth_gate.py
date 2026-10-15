@@ -22,9 +22,10 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from jose import JWTError
 
 # Exact-match public paths
+# NOTE: "/" is NOT public — it is the dealer dashboard (lists inventory), so an
+# anonymous visitor is redirected to /login, which links to free sign-up.
+# /api/stripe/webhook is public but main.py's webhook rejects anything not signed by Stripe.
 PUBLIC_EXACT = {
-    # The root route is the inventory dashboard, not a public marketing page.
-    # Require a session there; login and registration remain public.
     "/login", "/register", "/pricing", "/api/health",
     "/api/register", "/api/login", "/api/plans", "/api/stripe/config",
     "/api/stripe/webhook",
@@ -430,7 +431,9 @@ def install_auth_gate(app):
         # HTML navigation → login redirect; API → 401 JSON
         accept = request.headers.get("accept", "")
         if "text/html" in accept and method == "GET":
-            return RedirectResponse(f"/login?next={path}", status_code=302)
+            nxt = path + (f"?{request.url.query}" if request.url.query else "")
+            from urllib.parse import quote
+            return RedirectResponse(f"/login?next={quote(nxt, safe='/')}", status_code=302)
         return JSONResponse(
             {"detail": "Sign in required. POST /api/auth/token for a JWT, "
                        "or sign in at /login."},
