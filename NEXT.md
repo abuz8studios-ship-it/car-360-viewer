@@ -1,6 +1,6 @@
 # NEXT (one line each; owner decisions marked)
 
-- **Acceptance (blocked on the CarCutter reference video):** run 4 photos → 360° MP4 against it. The 2026-10-15 studio spin (11 dealer photos → 36 frames) showed ghosted in-between frames (translucent wheels, smeared glass), car size/position jumping between angles, and the contact shadow floating below the tyres — all in the existing optical-flow interpolation/render stage, which will be weaker still with only 4 photos.
+- **Acceptance (blocked on the CarCutter reference video):** run 4 photos → 360° MP4 against it. Since 6207c4e spins are built cut-out first (constant size, tyres on one ground line, no double exposures); 4 views far apart turn by width tween, not true new angles — matching CarCutter there would need view synthesis (3D).
 - **Owner decision:** `isnet-general-use` was trained on DIS5K, whose dataset terms restrict commercial use without the authors' permission; keep it as primary, get permission, or set `LOTVUE_REMBG_MODEL=u2net` (Apache-2.0).
 - **Owner decision:** move `mobile_native/lotvue-upload.keystore` and `mobile_native/android/keystore.properties` (which holds the store and key passwords) out of git after backing them up; consider a new upload key.
 - **Owner decision:** purge the removed personal photos (`app/vehicles/764948/photos/`, added in `f1c416d`) from git history (rewrites `main`, needs a force push).

@@ -44,3 +44,20 @@ CORRECTION: the earlier entry's "password not in repo" was wrong. mobile_native/
 BLOCKERS: CarCutter reference video; owner decisions in NEXT.md (DIS5K terms, keystore, history purge, tests.yml); live Stripe test.
 NEXT:     Run the CarCutter acceptance test as soon as the reference video arrives.
 ```
+
+## 2026-10-15 (evening) — installed appliance proven on this machine
+
+```
+✅ LotVue360 v2.1.0 — APPLIANCE WORKING ON THIS MACHINE (Linux x64); WINDOWS EXE = OWNER BUILD
+WHAT:     The real one-click installer, installed into a clean home folder and run headless, does the whole dealer job offline.
+USE IT:   dist/desktop-release/LotVue360-OneClick-linux-x64.run (692,906,930 bytes, sha256 86905d7a…6fcb06), built from f08c83b.
+PROOF:    [live-probed, installed] build → artifact verifier (pinned model hashes) → .run install → self-test "background removal via isnet-general-use"
+          [live-probed, installed] launcher → health 200 → sign-up (signed in) → dashboard/studio 200
+          [live-probed, installed] 11 photos: gate PASS 15 s → 36-frame studio spin "completed" 27 s → /view, /vdp, /embed, manifest 200 → MP4 1920x1080 H.264, 109 frames
+          [live-probed, installed] 4 photos: gate PASS → 36-frame spin "completed" 15 s, engine cutout-first-studio-spin, background removed → MP4 1920x1080
+          [inspected] spin frames: one car per frame, constant size, tyres on one ground line (≤32 px spread at 1080p), no double exposures
+          [verified] 244 tests; installer tests pass when the appliance is not running (the installer correctly refuses to update a running app)
+          [fixed] FFmpeg build accepted only "n8.0"; a tagless pinned-commit build reports "140fd65" (build_ffmpeg_linux.py, build_desktop.py)
+LIMITS:   4 photos give a clean turn between the four views (width tween, no ghosting), not new in-between angles; CarCutter-level smoothness from 4 photos needs view synthesis. Reference video still pending.
+NEXT:     Owner builds the Windows EXE (README → "Build the Windows installer") and runs the CarCutter comparison.
+```
