@@ -24,3 +24,23 @@ BLOCKERS: 1) Restore GitHub Actions minutes/budget in the repo owner's GitHub bi
           Everything after blocker 1 is ready: workflow, release notes, and installer scripts are in the repo.
 NEXT:     Make the packaged --self-test run an upload → spin round trip so installer smoke tests catch core-flow crashes.
 ```
+
+## 2026-10-15 (later) — owner green-lights: merges, cleanup, paywall, bundled models
+
+```
+✅ LotVue360 v2.1.0 — CODE READY FOR THE WINDOWS BUILD; ACCEPTANCE PENDING
+WHAT:     Desktop 360-spin merchandising app for independent dealers: car photos → gated capture → studio 360 spin with the background replaced → public buyer page; $99/mo after 5 free vehicles.
+USE IT:   Owner builds the EXE on Windows: README → "Build the Windows installer".
+PROOF:    [pushed] b4d8dec  merge arena/8a1443be (appointment-route 500 fix, refresh-token revocation)
+          [pushed] 586ce10  removed the 12 dormant backup copies (36,039 lines; still in history)
+          [pushed] 9794dd3  merge arena/4d8a2343 / PR #2 (billing, plate blur, stranger-dealer tests) onto main's webhook, approval gates and auth
+          [pushed] 732ab23  isnet-general-use + u2net fallback bundled in desktop builds, pinned by SHA-256
+          [live-probed, source] self-test: "background removal via isnet-general-use", offline from the bundled folder
+          [live-probed, source] 11 dealer photos → gate PASS with subject checks → 36-frame studio spin "completed", background_removed=true, 58 s on CPU
+          [verified] 239 tests pass; ruff, compileall, git diff --check; inline JS on 8 rendered pages passes node --check
+          [inspected] spin frames at full resolution: background replaced, but in-between frames ghost, size/position jump between angles, shadow floats — see NEXT.md
+          [not run] Windows EXE build/install (owner's PC); CarCutter acceptance test (reference video pending); live Stripe charge
+CORRECTION: the earlier entry's "password not in repo" was wrong. mobile_native/android/keystore.properties is tracked and holds the store and key passwords (my scan searched for "storePassword"; the file uses LOTVUE_STORE_PASS / LOTVUE_KEY_PASS).
+BLOCKERS: CarCutter reference video; owner decisions in NEXT.md (DIS5K terms, keystore, history purge, tests.yml); live Stripe test.
+NEXT:     Run the CarCutter acceptance test as soon as the reference video arrives.
+```

@@ -80,13 +80,23 @@ python -m ruff check app tests scripts
 python -m compileall -q app tests scripts
 ```
 
-## Ship an update
+## Build the Windows installer (owner's PC)
 
-1. Merge the reviewed change to `main` and confirm the **CI** workflow is green on that commit.
-2. Bump `MyAppVersion` in `LotVue360.iss` (and the `/api/health` version in `app/main.py`) to the new version.
-3. Tag and push: `git tag -a v2.1.0 -m "LotVue360 v2.1.0" && git push origin v2.1.0`.
+The acceptance target is a Windows EXE built locally; these are the same steps the Windows CI job ran. Needs 64-bit Python 3.11, [Inno Setup 6](https://jrsoftware.org/isinfo.php), and network access the first time (FFmpeg and the two background-removal models, about 355 MB, are downloaded and hash-checked).
 
-A `v*` tag runs **Desktop releases**: tests, the four native builds with installer smoke tests, then a GitHub Release with every installer, ZIP, and `.sha256` sidecar, using `.github/RELEASE_NOTES.md` as the notes. Running the same workflow manually (`workflow_dispatch`) builds 30-day artifacts without publishing. Both need GitHub Actions minutes on the owner's account.
+```powershell
+py -3.11 -m venv .venv-desktop
+.venv-desktop\Scripts\activate
+$env:PIP_CONSTRAINT = "requirements-release-constraints.txt"
+python -m pip install -r requirements-desktop.txt
+python scripts/build_desktop.py --platform windows --output dist/desktop-release --build-id local
+python scripts/verify_desktop_artifact.py --archive dist/desktop-release/LotVue360-windows-x64.zip --platform windows --architecture x64 --build-id local
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" LotVue360.iss
+```
+
+The installer lands at `dist\desktop-release\LotVue360-OneClick-windows-x64.exe`. Before handing it out: install it, run `"%LOCALAPPDATA%\Programs\LotVue360\LotVue360.exe" --self-test`, and check that `desktop_launch.log` in the data folder ends with `packaged self-test passed: … background removal via isnet-general-use`. To ship a new version, bump `MyAppVersion` in `LotVue360.iss` and the `/api/health` version in `app/main.py`, then rebuild.
+
+The `Desktop releases` GitHub workflow can build all four platforms and publish a GitHub Release on a `v*` tag, but it needs GitHub Actions minutes on the owner's account.
 
 ## Billing (how a dealer pays)
 

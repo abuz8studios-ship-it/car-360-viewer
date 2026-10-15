@@ -1,5 +1,6 @@
-FINISH LINE:   GitHub Release v2.1.0 carries one-click installers for Windows x64, macOS Intel, macOS Apple Silicon, and Linux x64; a stranger installs one and completes the core flow below.
-TARGET:        installer (GitHub Release, built by .github/workflows/desktop-release.yml on a v* tag)
-CORE FLOW:     1. Install and launch → 2. Create an account and sign in → 3. Upload 4–72 car photos (capture gate answers) → 4. Build the 360 spin → 5. Open the public buyer page and drag the spin
-MONEY PATH:    n/a for v1 — pricing is unapproved and Stripe stays disabled by default (owner decision)
-OUT OF SCOPE:  live Stripe billing; the hosted lotvue.abuz8ai.com service; ComfyUI/WAN/TTS video generation; Gaussian-splat 3D; background-removal model selection; code signing and notarization; Android/iOS store builds; marketplace, DMS, email/SMS, and other provider connectors
+FINISH LINE:   A Windows one-click installer (LotVue360-OneClick-windows-x64.exe), built on the owner's PC from this branch, installs on Mohammed's and Bob's Windows machines and passes the acceptance test below.
+TARGET:        installer (Windows x64 EXE; build steps in README → "Build the Windows installer")
+ACCEPTANCE:    4 photos in → smooth 360° MP4 out that matches the CarCutter reference video: no jitter, fixed frame count, background replaced, no halo. (Reference video pending from the owner.)
+CORE FLOW:     1. Install and launch → 2. Create an account (signed straight in) → 3. Upload car photos (capture gate answers) → 4. Build the 360 spin with the background replaced → 5. Open the public buyer page / export the MP4
+MONEY PATH:    5 free vehicles per account (lifetime, no reset), then $99/month Dealership plan via Stripe Checkout. Off until LOTVUE_FEATURE_PAYMENTS=1 and LOTVUE_PRICING_APPROVED=1; one live charge-and-refund is the owner's step.
+OUT OF SCOPE:  the GitHub "Desktop releases" workflow; macOS/Linux installers; the hosted lotvue.abuz8ai.com service; ComfyUI/WAN/TTS video generation; Gaussian-splat 3D; code signing and notarization; Android/iOS store builds; marketplace, DMS, email/SMS, and other provider connectors
