@@ -4061,7 +4061,8 @@ def _run_vehicle_spin_job(vin: str, manifest: dict | None = None) -> None:
         spin_manifest = {
             "count": spin_count,
             "source_frames": source_count,
-            "engine": "opencv-frame-interpolation",
+            "engine": ("cutout-first-studio-spin" if render.get("stability") is not None
+                       else "opencv-frame-interpolation"),
             "render_mode": render.get("mode", "unknown"),
             "render_status": render.get("status", "unknown"),
             "background_removed": bool(render.get("mode") == "studio"),
