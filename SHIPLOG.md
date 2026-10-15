@@ -61,3 +61,4 @@ PROOF:    [live-probed, installed] build → artifact verifier (pinned model has
 LIMITS:   4 photos give a clean turn between the four views (width tween, no ghosting), not new in-between angles; CarCutter-level smoothness from 4 photos needs view synthesis. Reference video still pending.
 NEXT:     Owner builds the Windows EXE (README → "Build the Windows installer") and runs the CarCutter comparison.
 ```
+Rebuilt from d925d67 (health 2.1.0, no server paths in upload responses): installer sha256 a279dfdc…0e8fabe; installed, self-test passed with isnet-general-use, full 11-photo flow re-run green (spin completed, /view 200, MP4 200).
