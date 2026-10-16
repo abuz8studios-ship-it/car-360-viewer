@@ -66,6 +66,15 @@ def test_viewer_api_escapes_database_content_and_limits_asset_paths(tmp_path, mo
     assert 'payload.jpg' not in report.text
 
 
+def test_vdp_formats_numeric_price_and_mileage_for_buyers() -> None:
+    assert viewer_api._display_fact("price", "189900") == "$189,900"
+    assert viewer_api._display_fact("price", "$18,995.50") == "$18,995.50"
+    assert viewer_api._display_fact("mileage", "31000") == "31,000 mi"
+    assert viewer_api._display_fact("price", "Call for price") == "Call for price"
+    assert viewer_api._display_fact("price", "-5") == "-5"
+    assert viewer_api._display_fact("trim", "1200") == "1200"
+
+
 def test_viewer_identifier_rejects_path_and_html_payloads() -> None:
     for value in ("../secret", "VIN%2f..", '<script>alert(1)</script>', ""):
         try:

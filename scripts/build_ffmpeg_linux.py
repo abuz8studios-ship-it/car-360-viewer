@@ -55,7 +55,13 @@ def _run(command: list[str], *, cwd: Path, env: dict[str, str], log_path: Path |
     return output
 
 
-def _clone_source(repository: str, reference: str, expected_commit: str, destination: Path) -> str:
+def _clone_source(
+    repository: str, reference: str, expected_commit: str, destination: Path, *, tag: str = "",
+) -> str:
+    """Fetch exactly ``expected_commit``; with ``tag``, also fetch that tag and
+    require it to peel to the same commit. FFmpeg's version string comes from
+    ``git describe --tags``, so without the tag a release build reports a bare
+    commit hash instead of its release name."""
     env = os.environ.copy()
     env.setdefault("GIT_TERMINAL_PROMPT", "0")
     _run(["git", "init", "--quiet", str(destination)], cwd=destination.parent, env=env)
@@ -90,6 +96,23 @@ def _clone_source(repository: str, reference: str, expected_commit: str, destina
         raise RuntimeError(
             f"Pinned source checkout mismatch: {repository} {reference} resolved to {actual_head}, expected {expected_commit}"
         )
+    if tag:
+        _run(
+            ["git", "-C", str(destination), "fetch", "--quiet", "--depth=1", "origin",
+             f"+refs/tags/{tag}:refs/tags/{tag}"],
+            cwd=destination.parent,
+            env=env,
+        )
+        tagged = subprocess.run(
+            ["git", "-C", str(destination), "rev-parse", f"refs/tags/{tag}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        if tagged != expected_commit:
+            raise RuntimeError(
+                f"Pinned release tag mismatch: {repository} {tag} points to {tagged}, expected {expected_commit}"
+            )
     return actual_head
 
 
@@ -146,7 +169,7 @@ def build(output: Path, jobs: int) -> Path:
             x264_source = sources / "x264"
 
             print(f"Cloning FFmpeg {FFMPEG_REF} ({FFMPEG_COMMIT})", flush=True)
-            _clone_source(FFMPEG_REPOSITORY, FFMPEG_REF, FFMPEG_COMMIT, ffmpeg_source)
+            _clone_source(FFMPEG_REPOSITORY, FFMPEG_REF, FFMPEG_COMMIT, ffmpeg_source, tag=FFMPEG_REF)
             print(f"Cloning x264 {X264_COMMIT}", flush=True)
             _clone_source(X264_REPOSITORY, X264_REF, X264_COMMIT, x264_source)
 
