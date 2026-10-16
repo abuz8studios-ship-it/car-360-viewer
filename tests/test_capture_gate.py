@@ -155,6 +155,21 @@ def test_media_reupload_without_details_keeps_vehicle_details(tmp_path, monkeypa
     assert vehicle["exterior_frames"] == 36
 
 
+def test_env_file_override_appended_later_takes_effect(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "# template\nLOTVUE_GOOGLE_STORE_CODE=\nLOTVUE_DEALER_NAME=\n"
+        "LOTVUE_GOOGLE_STORE_CODE=STORE-1\nLOTVUE_DEALER_NAME=\"Stranger Motors\"\nnot a setting\n",
+        encoding="utf-8",
+    )
+
+    values = main._read_env_values(env_file)
+
+    assert values["LOTVUE_GOOGLE_STORE_CODE"] == "STORE-1"
+    assert values["LOTVUE_DEALER_NAME"] == "Stranger Motors"
+    assert "not a setting" not in values
+
+
 def test_capture_page_collects_vehicle_details() -> None:
     html = main.capture_page().body.decode()
     for field in ("vinField", "yearField", "makeField", "modelField"):

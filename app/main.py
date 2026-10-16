@@ -51,12 +51,25 @@ _ENV_FILE = (
     _env_root_path / ".env"
     if _env_root_path is not None else Path(__file__).resolve().parent / ".env"
 )
+def _read_env_values(path: Path) -> dict[str, str]:
+    """Parse KEY=VALUE lines like the desktop launcher: the last duplicate wins
+    (so an appended override takes effect) and matching quotes are stripped."""
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if key:
+            values[key] = value
+    return values
+
+
 if _ENV_FILE.exists():
-    for _line in _ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
-        _line = _line.strip()
-        if _line and not _line.startswith("#") and "=" in _line:
-            _k, _v = _line.split("=", 1)
-            os.environ.setdefault(_k.strip(), _v.strip())
+    for _k, _v in _read_env_values(_ENV_FILE).items():
+        os.environ.setdefault(_k, _v)  # explicitly exported variables still win
 
 from app_paths import BASE_DIR, DB_PATH, STORAGE_DIR
 from background_catalog import (
