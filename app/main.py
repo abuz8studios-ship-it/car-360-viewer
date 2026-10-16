@@ -1007,7 +1007,9 @@ def db_upsert_vehicle(vin, year="", make="", model="", ext_frames=0, int_count=0
                               trim_level, engine, transmission, drivetrain, fuel_type, body_style, stock_number, turntable_style, job_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(vin) DO UPDATE SET
-            year=excluded.year, make=excluded.make, model=excluded.model,
+            year=CASE WHEN excluded.year != '' THEN excluded.year ELSE year END,
+            make=CASE WHEN excluded.make != '' THEN excluded.make ELSE make END,
+            model=CASE WHEN excluded.model != '' THEN excluded.model ELSE model END,
             exterior_frames=excluded.exterior_frames, interior_count=excluded.interior_count,
             watermark_mode=excluded.watermark_mode,
             user_email=CASE WHEN COALESCE(user_email,'')='' THEN excluded.user_email ELSE user_email END,
@@ -4141,7 +4143,7 @@ def dashboard(request: Request):
                     <a href="/view3d/{vin}" class="btn btn-outline" style="font-size:0.8rem;padding:0.35rem 0.8rem;">3D Viewer</a>
                     <a href="/tag/{vin}" class="btn btn-outline" style="font-size:0.8rem;padding:0.35rem 0.8rem;">Tag</a>
                     <button onclick="generateCommercial('{vin}', this)" id="comm-btn-{vin}" class="btn" style="font-size:0.8rem;padding:0.35rem 0.8rem;background:#7c3aed;border:none;color:white;" title="Generate AI Commercial">&#127916;</button>
-                    <button onclick="showPricing('{vin}')" class="btn btn-outline" style="font-size:0.8rem;padding:0.35rem 0.8rem;" title="Market Pricing">&#128200;</button>
+                    <button onclick="showPricing('{vin}')" class="btn btn-outline" style="font-size:0.8rem;padding:0.35rem 0.8rem;" title="Set price &amp; view market data" aria-label="Set price and view market data">&#128200; Price</button>
                     <button onclick="showSyndication('{vin}')" class="btn btn-outline" style="font-size:0.8rem;padding:0.35rem 0.8rem;" title="Export Listing">&#128228;</button>
                     <button onclick="deleteVehicle('{vin}')" class="btn btn-danger" style="font-size:0.8rem;padding:0.35rem 0.8rem;">&#128465;</button>
                 </div>
@@ -4446,11 +4448,36 @@ def dashboard(request: Request):
             document.body.appendChild(modal);
             modal.addEventListener('click', e => {{ if (e.target === modal) modal.remove(); }});
 
+            // Asking price is what the buyer page and listing feeds publish.
+            function attachPriceForm(current) {{
+                const box = document.createElement('form');
+                box.style.cssText = 'margin-top:1.2rem;display:flex;gap:0.5rem;';
+                box.innerHTML = '<input id="askPriceInput" inputmode="decimal" aria-label="Asking price in US dollars" placeholder="Asking price (USD)" style="flex:1;padding:0.55rem 0.7rem;border:1px solid #d0d7de;border-radius:8px;font-size:0.95rem;">' +
+                    '<button type="submit" style="padding:0.55rem 1rem;border:none;border-radius:8px;background:#2E75B6;color:#fff;font-weight:700;cursor:pointer;">Save price</button>';
+                const msg = document.createElement('div');
+                msg.style.cssText = 'font-size:0.8rem;color:#6c757d;margin-top:0.4rem;';
+                box.querySelector('input').value = current || '';
+                box.addEventListener('submit', async ev => {{
+                    ev.preventDefault();
+                    const price = box.querySelector('input').value.replace(/[$,\\s]/g, '');
+                    const r = await fetch('/api/vehicle/' + encodeURIComponent(vin) + '/set-price', {{
+                        method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ price }})
+                    }});
+                    const d = await r.json().catch(() => ({{}}));
+                    if (!r.ok) {{ msg.style.color = '#cf222e'; msg.textContent = (typeof d.detail === 'string' && d.detail) || 'Could not save the price'; return; }}
+                    modal.remove();
+                    location.reload();
+                }});
+                const panel = modal.querySelector('div');
+                panel.appendChild(box);
+                panel.appendChild(msg);
+            }}
+
             try {{
                 const res = await fetch('/api/vehicle/' + vin + '/market-price');
                 const data = await res.json();
                 const p = data.pricing;
-                if (!p) {{ modal.querySelector('div > div').textContent = 'No pricing data available'; return; }}
+                if (!p) {{ modal.querySelector('div > div').textContent = 'No market data for this vehicle yet. You can still set the asking price.'; attachPriceForm(''); return; }}
 
                 modal.querySelector('div').innerHTML = `
                     <button onclick="document.getElementById('pricing-modal').remove()" style="position:absolute;top:0.75rem;right:0.75rem;background:none;border:none;color:#8b949e;font-size:1.4rem;cursor:pointer;">&times;</button>
@@ -4468,6 +4495,7 @@ def dashboard(request: Request):
                         <div style="display:flex;justify-content:space-between;"><span>Mileage Factor</span><span style="color:#2C3E50;font-weight:600;">${{p.factors?.mileage_factor || '-'}}x</span></div>
                     </div>
                 `;
+                attachPriceForm(p.asking_price || '');
             }} catch(e) {{
                 modal.querySelector('div > div').textContent = 'Error loading pricing: ' + e.message;
             }}
@@ -4758,6 +4786,20 @@ def capture_page():
   <div class="container">
     {heic_note}
 
+    <div class="card" id="vehicleDetails">
+      <h2>Vehicle Details</h2>
+      <p class="subtitle">Enter the real 17-character VIN so the buyer page and Google vehicle listing identify this car. Leave it blank to use a temporary ID.</p>
+      <div class="fg">
+        <label for="vinField">VIN</label>
+        <input type="text" id="vinField" maxlength="17" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="e.g. 1HGCM82633A004352">
+      </div>
+      <div class="row2">
+        <div class="fg"><label for="yearField">Year</label><input type="text" id="yearField" maxlength="4" inputmode="numeric" placeholder="2019"></div>
+        <div class="fg"><label for="makeField">Make</label><input type="text" id="makeField" maxlength="40" placeholder="Honda"></div>
+      </div>
+      <div class="fg"><label for="modelField">Model</label><input type="text" id="modelField" maxlength="60" placeholder="Accord"></div>
+    </div>
+
     <div class="card" id="step1">
       <h2>Upload Media</h2>
       <p class="subtitle">Select photos or a walkaround video. Photos work best.</p>
@@ -4886,7 +4928,22 @@ def capture_page():
       document.getElementById('gateForceBtn').onclick = () => {{ el.remove(); startProcess(true); }};
     }}
 
+    function vehicleFields() {{
+      const vin = document.getElementById('vinField').value.trim().toUpperCase();
+      if (vin && !/^[A-HJ-NPR-Z0-9]{{17}}$/.test(vin)) {{
+        throw new Error('VIN must be 17 letters/numbers (no I, O, or Q), or leave it blank.');
+      }}
+      return {{
+        vin: vin,
+        year: document.getElementById('yearField').value.trim(),
+        make: document.getElementById('makeField').value.trim(),
+        model: document.getElementById('modelField').value.trim(),
+      }};
+    }}
+
     async function gateAwareUpload(fd, force) {{
+      const details = vehicleFields();
+      Object.keys(details).forEach(k => {{ if (details[k]) fd.append(k, details[k]); }});
       if (force) fd.append('force', '1');
       const r = await fetch('/api/upload', {{ method: 'POST', body: fd }});
       let d = null;
@@ -5684,7 +5741,14 @@ async def upload_media(
 
             # Validate before replacing a previous upload. Failed retries never
             # destroy the dealer's last good batch.
-            gate = await run_in_threadpool(validate_dir, stage_dir)
+            try:
+                gate = await run_in_threadpool(validate_dir, stage_dir)
+            except Exception as e:
+                print(f"[gate] photo analysis failed for {vin}: {type(e).__name__}: {e}")
+                gate = {"verdict": "FAIL", "reasons": [
+                            "the photos could not be analyzed — re-export them as JPEG "
+                            "and upload again"],
+                        "frames": photo_count, "checks": {}}
             if gate["verdict"] == "FAIL" and force != "1":
                 raise HTTPException(status_code=422, detail={
                     "error": "capture_rejected", "gate": gate_summary(gate)})
@@ -5714,7 +5778,10 @@ async def upload_media(
     try:
         gate = await run_in_threadpool(validate_video_file, video_path)
     except Exception as e:
-        gate = {"verdict": "FAIL", "reasons": [f"unreadable video: {e}"],
+        print(f"[gate] video analysis failed for {vin}: {type(e).__name__}: {e}")
+        gate = {"verdict": "FAIL", "reasons": [
+                    "the video could not be read — record a new walkaround with the "
+                    "phone camera app and upload the MP4/MOV file directly"],
                 "frames": 0, "checks": {}}
     if gate["verdict"] == "FAIL" and force != "1":
         await run_in_threadpool(_unlink_file, video_path)
@@ -9905,12 +9972,17 @@ def register_page():
             for (const [k, v] of fd.entries()) params.append(k, v);
             try {
                 const r = await fetch('/api/register', { method: 'POST', body: params });
-                const data = await r.json();
-                if (data.status === 'ok') {
+                const data = await r.json().catch(() => ({}));
+                if (r.ok && data.status === 'ok') {
                     document.getElementById('successMsg').style.display = 'block';
-                    setTimeout(() => window.location.href = '/login', 1000);
+                    // Sign the new dealer straight in so they land on their dashboard.
+                    const login = new URLSearchParams();
+                    login.append('email', fd.get('email'));
+                    login.append('password', fd.get('password'));
+                    const s = await fetch('/api/login', { method: 'POST', body: login, credentials: 'same-origin' });
+                    setTimeout(() => window.location.href = s.ok ? '/dashboard' : '/login', 600);
                 } else {
-                    alert(data.error || 'Registration failed');
+                    alert((typeof data.detail === 'string' && data.detail) || data.error || 'Registration failed');
                 }
             } catch (err) {
                 alert('Connection error — try again');
@@ -9982,12 +10054,12 @@ def login_page():
             for (const [k, v] of fd.entries()) params.append(k, v);
             try {
                 const r = await fetch('/api/login', { method: 'POST', body: params });
-                const data = await r.json();
-                if (data.status === 'ok') {
+                const data = await r.json().catch(() => ({}));
+                if (r.ok && data.status === 'ok') {
                     const next = new URLSearchParams(location.search).get('next') || '/dashboard';
                     window.location.href = next;
                 } else {
-                    document.getElementById('errorMsg').textContent = data.error || 'Invalid email or password';
+                    document.getElementById('errorMsg').textContent = (typeof data.detail === 'string' && data.detail) || data.error || 'Invalid email or password';
                     document.getElementById('errorMsg').style.display = 'block';
                     btn.textContent = 'Sign In'; btn.disabled = false;
                 }
@@ -10872,7 +10944,14 @@ async def generate_3d(request: Request, vin: str, video: Optional[UploadFile] = 
             if saved < 4:
                 raise HTTPException(status_code=400, detail="Upload at least 4 readable photos with a 256px minimum dimension.")
             # ── P0 QUALITY GATE — the exact input class that caused COLMAP 2/N ────
-            gate = await run_in_threadpool(_gate_dir, stage_dir)
+            try:
+                gate = await run_in_threadpool(_gate_dir, stage_dir)
+            except Exception as e:
+                print(f"[gate] 3D photo analysis failed for {vin}: {type(e).__name__}: {e}")
+                gate = {"verdict": "FAIL", "reasons": [
+                            "the photos could not be analyzed — re-export them as JPEG "
+                            "and upload again"],
+                        "frames": saved, "checks": {}}
             if gate["verdict"] == "FAIL" and force != "1":
                 raise HTTPException(status_code=422, detail={
                     "error": "capture_rejected", "gate": _gate_sum(gate)})
@@ -10889,7 +10968,10 @@ async def generate_3d(request: Request, vin: str, video: Optional[UploadFile] = 
         try:
             gate = await run_in_threadpool(_gate_video, walk)
         except Exception as e:
-            gate = {"verdict": "FAIL", "reasons": [f"unreadable video: {e}"],
+            print(f"[gate] 3D video analysis failed for {vin}: {type(e).__name__}: {e}")
+            gate = {"verdict": "FAIL", "reasons": [
+                        "the video could not be read — record a new walkaround with the "
+                        "phone camera app and upload the MP4/MOV file directly"],
                     "frames": 0, "checks": {}}
         if gate["verdict"] == "FAIL" and force != "1":
             await run_in_threadpool(_unlink_file, walk)

@@ -34,7 +34,7 @@ sys.path.insert(0, str(BASE))
 from studio import cut_car, _bbox, studio_frame, STORAGE
 from validate_video import _orb_inliers, _resolve_tool
 
-FFMPEG = _resolve_tool("FFMPEG_PATH", "ffmpeg.exe")
+FFMPEG = _resolve_tool("FFMPEG_PATH", "ffmpeg")
 
 # Use an optional isolated interpreter for CLIP; otherwise reuse this runtime.
 _isolated_python = os.getenv("LOTVUE_PY_ISOLATED", "").strip()
