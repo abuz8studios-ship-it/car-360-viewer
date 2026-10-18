@@ -307,7 +307,8 @@ def _stage_ffmpeg(stage_app: Path) -> dict[str, object]:
             shutil.copy2(source_root / "source" / name, staged_sources / name)
         shutil.copy2(source_root / "BUILD-INFO.json", stage_app / "bin" / "FFMPEG-SOURCE-BUILD-INFO.json")
     (stage_app / "bin" / "FFMPEG-LICENSE.txt").write_text(
-        source_info + "\n--- ffmpeg -L ---\n" + license_text + "\n", encoding="utf-8",
+        f"Detected license: {license_id}\n" + source_info + "\n--- ffmpeg -L ---\n" + license_text + "\n",
+        encoding="utf-8",
     )
     (stage_app / "bin" / "FFMPEG-BUILD-INFO.txt").write_text(
         "--- ffmpeg -version ---\n" + version_text

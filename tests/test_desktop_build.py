@@ -112,6 +112,42 @@ def test_stages_pinned_linux_ffmpeg_binaries_and_matching_sources(tmp_path: Path
     assert (stage_app / "bin" / "FFMPEG-SOURCE-BUILD-INFO.json").is_file()
 
 
+def test_prebuilt_ffmpeg_license_notice_names_the_detected_license(tmp_path: Path, monkeypatch) -> None:
+    # Windows/macOS stage static-ffmpeg's prebuilt binaries; the release verifier
+    # requires FFMPEG-LICENSE.txt to name the detected license on every platform.
+    import types
+
+    fetched = tmp_path / "static-ffmpeg"
+    fetched.mkdir()
+    for name in ("ffmpeg", "ffprobe"):
+        binary = fetched / name
+        binary.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "arg = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+            f"if arg == '-version': print('{name} version 8.0-static')\n"
+            "elif arg == '-L': print('GNU General Public License, either version 3 of the License or any later version')\n"
+            "elif arg == '-buildconf': print('configuration: --enable-gpl --enable-version3')\n"
+            "else: sys.exit(2)\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+    run_module = types.ModuleType("static_ffmpeg.run")
+    run_module.get_or_fetch_platform_executables_else_raise = lambda: (str(fetched / "ffmpeg"), str(fetched / "ffprobe"))
+    monkeypatch.setitem(sys.modules, "static_ffmpeg", types.ModuleType("static_ffmpeg"))
+    monkeypatch.setitem(sys.modules, "static_ffmpeg.run", run_module)
+    monkeypatch.delenv("LOTVUE_FFMPEG_ROOT", raising=False)
+    monkeypatch.setattr(build_desktop.os, "name", "posix")  # stage the test binaries without an .exe suffix
+    stage_app = tmp_path / "staged-app"
+    (stage_app / "bin").mkdir(parents=True)
+
+    result = build_desktop._stage_ffmpeg(stage_app)
+
+    assert result["license"] == "GPL-3.0-or-later"
+    assert "GPL-3.0-or-later" in (stage_app / "bin" / "FFMPEG-LICENSE.txt").read_text(encoding="utf-8")
+    assert "ffmpeg -version" in (stage_app / "bin" / "FFMPEG-BUILD-INFO.txt").read_text(encoding="utf-8")
+
+
 def _synthetic_model_pins(cache: Path) -> dict:
     """Small stand-ins for the pinned rembg models, pre-seeded in a build cache."""
     cache.mkdir(parents=True, exist_ok=True)
