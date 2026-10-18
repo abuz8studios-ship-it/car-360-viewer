@@ -137,6 +137,27 @@ def test_enabled_model_uses_only_explicit_session_and_never_implicit_rembg_defau
     assert calls == [("image-bytes", session, {})]
 
 
+def _ort_telemetry_setting_after_import(env: dict[str, str]) -> str:
+    import os
+    import subprocess
+
+    probe = "import os, sys; sys.path.insert(0, 'app'); import rembg_runtime; print(os.environ.get('ORT_DISABLE_TELEMETRY', ''))"
+    clean = {k: v for k, v in os.environ.items() if k != "ORT_DISABLE_TELEMETRY"}
+    result = subprocess.run([sys.executable, "-c", probe], env={**clean, **env}, capture_output=True, text=True,
+                            cwd=Path(__file__).resolve().parents[1], check=True)
+    return result.stdout.strip()
+
+
+def test_onnx_runtime_telemetry_is_off_before_any_session_can_load() -> None:
+    # ONNX Runtime 1.30 on Linux uploads device info to mobile.events.data.microsoft.com
+    # from every session unless this is set before onnxruntime is imported.
+    assert _ort_telemetry_setting_after_import({}) == "1"
+
+
+def test_operator_choice_for_onnx_runtime_telemetry_is_respected() -> None:
+    assert _ort_telemetry_setting_after_import({"ORT_DISABLE_TELEMETRY": "0"}) == "0"
+
+
 def test_upload_route_returns_503_and_cleans_temp_file_if_model_is_unconfigured(tmp_path, monkeypatch) -> None:
     import main
     from ai_studio import background_studio

@@ -23,6 +23,12 @@ MODEL_DIR_ENV = "LOTVUE_REMBG_MODEL_DIR"
 BUNDLED_MODEL_DIR = Path(__file__).resolve().parent / "models" / "rembg"
 _LOCK = threading.Lock()
 _SESSION: Any = None
+
+# ONNX Runtime 1.30 on Linux uploads device info to Microsoft
+# (mobile.events.data.microsoft.com) from every inference session. A local dealer
+# tool must not phone home, and the switch only works if set before onnxruntime is
+# imported, which every rembg/onnxruntime import in the app does lazily below.
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
 _SESSION_MODEL = ""
 _ACTIVE_MODEL = ""
 
