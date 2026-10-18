@@ -70,3 +70,17 @@ Driven over HTTP against the installed app with a fresh data dir:
 - Capture gate: a synthetic moving-camera clip passed on the bundled model and produced 36 frames; the signed-out manifest, `/vdp` and `/embed` all returned 200. A fixed-camera clip was rejected in 10 s with the turntable reason (`bg_motion` 0.0002).
 
 Known, not fixed: the Linux FFmpeg has no PNG decoder (`--disable-autodetect` drops zlib). Only the optional GPU WAN paths (`wan_comfy_api.py`, `commercial_pipeline._wan_via_wan_package`) feed it PNG frames; spins and the default real-footage commercial use JPEG. Not established: Windows/macOS builds (Linux host; hosted Actions still budget-blocked), real-vehicle footage, live Stripe/SMTP. The artifacts and install live in an ephemeral cloud container and are not GitHub artifacts.
+
+## 2026-10-18 — Hosted desktop builds green on all four platforms; Windows one-click installer available
+After the owner fixed GitHub Actions billing, Desktop releases was dispatched on the branch. Run [39153393890](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/39153393890) (`f163407`) got real runners and passed verify (Ruff and the full test suite). The Windows and both macOS builds then failed `verify_desktop_artifact.py` with "FFmpeg license/build notices are incomplete". Cause: `cb7a6c9` (2026-10-09) moved the prebuilt static-ffmpeg notice ahead of license detection and dropped its `Detected license:` line. Linux passed only because its source-build info states GPL-2.0-or-later. Every hosted run had been budget-blocked since then, so this went unseen. Fixed in `512211e` with a regression test; 258 tests pass locally.
+
+Run [39154726924](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/39154726924) (`512211e`) passed every job: verify, Windows x64, Linux x64, macOS arm64 and macOS x64. Each job built the app, verified the archive, built its one-click installer, and smoke-tested it (checksum, silent install, packaged `--self-test`, uninstall that keeps user data) before upload. Artifacts expire 2026-11-17:
+
+| Artifact | ID | Size (bytes) |
+|---|---|---|
+| `lotvue-desktop-windows-x64` (contains `LotVue360-OneClick-windows-x64.exe`) | 12147126920 | 1,212,363,130 |
+| `lotvue-desktop-linux-x64` | 12146567706 | 1,472,719,245 |
+| `lotvue-desktop-macos-arm64` | 12146213293 | 1,250,535,281 |
+| `lotvue-desktop-macos-x64` | 12146234228 | 1,268,118,447 |
+
+Still not established: install on the owner's own PC, code signing and notarization (none), real-vehicle footage, live Stripe/SMTP.
