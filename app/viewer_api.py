@@ -199,6 +199,23 @@ def build_manifest(vin: str) -> dict:
             print(f"[Viewer-API] vehicle metadata unavailable for {vin}: {exc}")
     return man
 
+def _display_fact(key: str, value) -> str:
+    """Buyer-facing price/mileage text: ``$189,900`` / ``31,000 mi``. Values that
+    are not plain non-negative numbers are shown as entered (and escaped later)."""
+    text = str(value).strip()
+    if key not in {"price", "mileage"}:
+        return text
+    try:
+        number = float(text.replace(",", "").replace("$", ""))
+    except ValueError:
+        return text
+    if not math.isfinite(number) or number < 0:
+        return text
+    if key == "mileage":
+        return f"{number:,.0f} mi"
+    return f"${number:,.0f}" if number.is_integer() else f"${number:,.2f}"
+
+
 VDP_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} — LotVue Pro</title>
@@ -264,7 +281,7 @@ def register_viewer(app):
         man = build_manifest(vin)
         v = man.get("vehicle", {})
         title = " ".join(str(v.get(k, "") or "") for k in ("year", "make", "model")).strip() or f"VIN {vin}"
-        bits = [str(v[k]) for k in ("trim", "trim_level", "mileage", "price") if v.get(k)]
+        bits = [_display_fact(k, v[k]) for k in ("trim", "trim_level", "mileage", "price") if v.get(k)]
         return VDP_HTML.format(vin=html.escape(vin, quote=True), vin_js=json.dumps(vin),
                                title=html.escape(title, quote=True),
                                sub=html.escape(" · ".join(bits) or "LotVue Pro 3D listing", quote=True))

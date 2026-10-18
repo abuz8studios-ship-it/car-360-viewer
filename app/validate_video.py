@@ -26,6 +26,14 @@ CHECKS (all measured, none inferred):
                 threshold = static-camera turntable signature -> FAIL
   EXPOSURE      mean luma sanity per frame
 
+SEGMENTATION MODES
+  CAR_PRESENT, CROPPING and ANGLE need a subject matte, which comes only from
+  the operator-approved matting model (rembg_runtime). The default install has
+  none, so those three are reported in checks["not_evaluated"] and the verdict
+  rests on CONTINUITY, CAMERA_MOTION (measured outside a centred subject prior)
+  and EXPOSURE. checks["segmentation"] is "model", "unavailable" or
+  "model_failed" (configured model could not run; same model-free checks).
+
 USAGE
   python validate_video.py --video path\to\walkaround.mp4 [--json]
   python validate_video.py --dir path\to\frames [--json]
@@ -64,15 +72,20 @@ PAIR_SPACING_S = 0.4      # video continuity pairs sampled this far apart
 
 # ── ffmpeg resolution (mirrors main.py; no import of main — circular) ────────
 def _resolve_tool(env_key, name):
-    for cand in (os.environ.get(env_key),
-                 str(BASE / "bin" / name),
-                 str(BASE.parents[1] / "AI" / "ffmpeg" / name)):
+    """env override -> bundled app/bin -> legacy workstation -> PATH.
+
+    ``name`` is the bare tool name; the platform executable suffix is added
+    here so Linux/macOS source runs do not look for ``ffprobe.exe``."""
+    exe = name + (".exe" if os.name == "nt" and not name.endswith(".exe") else "")
+    for cand in (os.environ.get(env_key, "").strip(),
+                 str(BASE / "bin" / exe),
+                 str(BASE.parent.parent / "AI" / "ffmpeg" / exe)):
         if cand and os.path.exists(cand):
             return cand
-    return shutil.which(name) or shutil.which(name.replace(".exe", "")) or name  # PATH fallback
+    return shutil.which(exe) or exe
 
-FFMPEG = _resolve_tool("FFMPEG_PATH", "ffmpeg.exe")
-FFPROBE = _resolve_tool("FFPROBE_PATH", "ffprobe.exe")
+FFMPEG = _resolve_tool("FFMPEG_PATH", "ffmpeg")
+FFPROBE = _resolve_tool("FFPROBE_PATH", "ffprobe")
 
 
 def _video_duration(video_path):
@@ -137,25 +150,43 @@ def continuity_check(pair_list):
             "weak_ratio": round(ratio, 2), "ok": ratio <= WEAK_PAIR_RATIO_MAX}
 
 
-def _segmentation_enabled():
-    """Subject checks need an operator-approved matting model. Fresh installs
-    ship without one, so the gate must still answer (model-free) instead of
-    crashing the upload."""
-    from rembg_runtime import is_enabled
-    return is_enabled()
+# Without an approved matting model the gate cannot measure the car's
+# silhouette, so background motion is measured outside a centred subject prior
+# (a walkaround keeps the car centred; a turntable leaves this area frozen).
+_YY, _XX = np.mgrid[0:64, 0:64]
+_CENTRE_PRIOR = (((_XX - 31.5) / 22.4) ** 2 + ((_YY - 35.0) / 19.2) ** 2) <= 1.0
+MODEL_FREE_SKIPPED = ["car_present", "cropping", "angle_coverage"]
 
 
-def _frame_facts(path, segment=True):
-    """One frame -> (facts dict, small grayscale, small subject mask or None)."""
+def _model_masker():
+    """Subject-mask callable backed by the operator-approved matting model, or
+    None when no model is selected/acknowledged (the default install)."""
+    try:
+        from rembg_runtime import is_enabled
+    except ImportError:
+        return None
+    if not is_enabled():
+        return None
+
+    def mask(img):
+        from studio import cut_car  # lazy: pulls in the matting model once
+        return np.array(cut_car(img).getchannel("A")) > 24
+    return mask
+
+
+def _frame_facts(path, masker=None):
+    """One frame -> (facts dict, small grayscale, small subject mask).
+
+    ``masker=None`` records model-free facts only (exposure + a centred
+    subject prior for the background-motion check)."""
     img = Image.open(path).convert("RGB")
     f = {"file": Path(path).name}
     g = np.asarray(img.convert("L").resize((64, 64)), dtype=np.float32) / 255.0
     f["luma"] = round(float(np.asarray(img.convert("L")).mean()), 1)
-    if not segment:
-        f.update(area=None, present=None, cropped=[], aspect=None)
-        return f, g, None
-    from studio import cut_car  # lazy: pulls in the matting model once
-    m = np.array(cut_car(img).getchannel("A")) > 24
+    if masker is None:
+        f.update(area=None, present=None, cropped=None, aspect=None)
+        return f, g, _CENTRE_PRIOR
+    m = masker(img)
     h, w = m.shape
     f["area"] = round(float(m.mean()), 4)
     ms = np.asarray(Image.fromarray((m * 255).astype(np.uint8)).resize((64, 64))) > 64
@@ -194,20 +225,29 @@ def analyze_set(files, sample=SAMPLE, pair_list=None):
             pidx = sorted(set(min(n - 2, int(i * n / 8)) for i in range(8)))
             pair_list = [(files[i], files[i + 1]) for i in pidx]
         cont = continuity_check(pair_list)
-    segment = _segmentation_enabled()
     idx = sorted(set(min(n - 1, int(i * n / min(sample, n))) for i in range(min(sample, n))))
-    per, grays, masks = [], [], []
-    for i in idx:
-        f, g, ms = _frame_facts(files[i], segment)
-        per.append(f); grays.append(g); masks.append(ms)
+    masker = _model_masker()
+    segmentation = "model" if masker else "unavailable"
+
+    def sample_facts(mask_fn):
+        rows = [_frame_facts(files[i], mask_fn) for i in idx]
+        return [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
+
+    try:
+        per, grays, masks = sample_facts(masker)
+    except Exception as exc:
+        if masker is None:
+            raise
+        # A configured model that cannot load/run must not turn every capture
+        # into a rejection; fall back to the model-free checks and say so.
+        print(f"[gate] matting model unavailable, using model-free checks: {type(exc).__name__}: {exc}")
+        segmentation = "model_failed"
+        per, grays, masks = sample_facts(None)
+    segmented = segmentation == "model"
 
     k = len(per)
     expo_bad = sum(1 for p in per if not (LUMA_LO <= p["luma"] <= LUMA_HI)) / k
-    checks = {"exposure_bad_ratio": round(expo_bad, 2),
-              "pair_inliers": cont["pair_inliers"], "weak_pair_ratio": cont["weak_ratio"],
-              "sampled": k}
-    present_ratio, crop_ratio, bg_motion, aspects = 1.0, 0.0, None, []
-    if segment:
+    if segmented:
         present_ratio = sum(1 for p in per if p.get("present")) / k
         crop_ratio = sum(1 for p in per if p["cropped"]) / k
         aspects = [p["aspect"] for p in per if p["aspect"]]
@@ -215,28 +255,32 @@ def analyze_set(files, sample=SAMPLE, pair_list=None):
         mid = (max(aspects) + min(aspects)) / 2 if aspects else 0
         states = ["w" if a > mid else "n" for a in aspects]
         transitions = sum(1 for a, b in zip(states, states[1:]) if a != b)
-
-        # background parallax: mean-abs-diff of non-subject pixels, consecutive pairs
-        diffs = []
-        for j in range(len(grays) - 1):
-            bg = ~(masks[j] | masks[j + 1])
-            if bg.mean() < 0.05:
-                continue  # subject fills frame; no background to compare
-            diffs.append(float(np.abs(grays[j] - grays[j + 1])[bg].mean()))
-        bg_motion = round(float(np.median(diffs)), 4) if diffs else 0.0
-        checks.update(present_ratio=round(present_ratio, 2), crop_ratio=round(crop_ratio, 2),
-                      aspect_range=a_range, coverage_transitions=transitions,
-                      bg_motion=bg_motion)
     else:
-        # Without a matte the car cannot be told from the background, so the
-        # car-present, cropping, coverage and turntable checks are not run.
-        checks["subject_checks"] = "skipped: no background-removal model configured"
+        present_ratio = crop_ratio = a_range = transitions = None
+        aspects = []
 
+    # background parallax: mean-abs-diff of non-subject pixels, consecutive pairs
+    diffs = []
+    for j in range(len(grays) - 1):
+        bg = ~(masks[j] | masks[j + 1])
+        if bg.mean() < 0.05:
+            continue  # subject fills frame; no background to compare
+        diffs.append(float(np.abs(grays[j] - grays[j + 1])[bg].mean()))
+    bg_motion = round(float(np.median(diffs)), 4) if diffs else 0.0
+
+    checks = {"present_ratio": None if present_ratio is None else round(present_ratio, 2),
+              "crop_ratio": None if crop_ratio is None else round(crop_ratio, 2),
+              "exposure_bad_ratio": round(expo_bad, 2), "aspect_range": a_range,
+              "coverage_transitions": transitions, "bg_motion": bg_motion,
+              "pair_inliers": cont["pair_inliers"], "weak_pair_ratio": cont["weak_ratio"],
+              "sampled": k, "segmentation": segmentation}
+    if not segmented:
+        checks["not_evaluated"] = list(MODEL_FREE_SKIPPED)
     reasons = []
-    if present_ratio < PRESENT_RATIO_MIN:
+    if segmented and present_ratio < PRESENT_RATIO_MIN:
         reasons.append(f"car not clearly visible in {int((1-present_ratio)*k)}/{k} "
                        "sampled frames — keep the whole car in frame")
-    if crop_ratio > CROP_RATIO_MAX:
+    if segmented and crop_ratio > CROP_RATIO_MAX:
         reasons.append("car is cut off by the frame edge in most of the capture — "
                        "step back so the full car fits")
     if expo_bad > 0.5:

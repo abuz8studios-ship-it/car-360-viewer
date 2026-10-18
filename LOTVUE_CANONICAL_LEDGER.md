@@ -1,8 +1,10 @@
 # LotVue360 — Canonical Position Ledger
 
-> **Snapshot:** 2026-10-04 (America/New_York). This ledger is the current repo-level position; dated workstation/production proofs elsewhere remain historical until re-run. Do not treat local tests, configuration checks, or old artifacts as live integration or production proof.
+> **Snapshot:** 2026-10-16 (America/New_York). This ledger is the current repo-level position; dated workstation/production proofs elsewhere remain historical until re-run. Do not treat local tests, configuration checks, or old artifacts as live integration or production proof.
 >
-> **Current code line:** application route/engine source remains `08b9fcd` (`Secure walkaround intermediate artifacts`). Packaging commit `a919b7b` (`Add Linux one-click desktop install path`) on the fixed Arena branch adds Linux packaging scripts, verifier coverage, and workflow steps. No application feature code changed in that packaging commit; later status-only docs may record the current hosted/local build results.
+> **Current code line:** `c942206` on `claude/kind-gates-d5n7ij` (on top of `main` merge `8dd485b`). It contains `743f114` (default-install capture gate + dealer-flow UI fixes), `6da0f17` (Linux FFmpeg `n8.0` tag fix, VDP price/mileage formatting) and `c942206` (source-run `.env` parsing matches the launcher). The 2026-10-04 rows below are kept where they are still the latest evidence.
+>
+> **2026-10-16 update:** 212 local tests pass. Stranger-dealer steps 1–6 pass through the browser UI on the source server **and on the installed Linux x86_64 one-click app** built from `c942206`; the CI-equivalent installer smoke passed. Media was synthetic (three.js render), not real-vehicle footage. Hosted CI is still blocked before any step. Full evidence: `LEDGER_LOG.md` 2026-10-16.
 
 ## Where we are
 
@@ -10,7 +12,9 @@ LotVue360 is an actively connected **local application codebase**, not a product
 
 | Area | Current status | Evidence / boundary |
 |---|---|---|
-| Current application source | **LOCAL VERIFIED** | `08b9fcd`; application regression set **189 passed in 4.68 s** (subprocess **5.73 s**, peak child RSS **141.8 MiB**). Configured Ruff, Python/spec compilation, `pip check`, diff checks, and Node syntax check passed. Targeted walkaround/static/auth tests: **19 passed in 1.39 s**. |
+| Current application source (2026-10-16) | **LOCAL VERIFIED + LOCAL E2E** | `c942206`: **212 passed**; Ruff, compile, `pip check`, diff and `node --check` of inline scripts passed. Capture gate works on default installs (model-free continuity/motion/exposure; car-present/crop/angle reported `not_evaluated` until a model is approved). Steps 1–6 driven through the UI on source and installed builds with synthetic media. |
+| Linux x86_64 one-click installer (2026-10-16) | **LOCALLY BUILT, VERIFIED, INSTALLED, JOURNEY-TESTED** | Built from `c942206` with pinned FFmpeg n8.0/x264 (NASM). ZIP 426,785,618 B, SHA-256 `3245d50cbb24abb28680201adc3e0a95eb714fb2f96fa7a7ada06196c89baa2e`, 8,004 files, verifier passed. `.run` 365,480,468 B, SHA-256 `55af0d1a4103df1b948041cdd4690a0e6488d0c5e736fb565d6fd6e3fa88f91f`; CI-equivalent smoke passed; full dealer journey passed on the installed app. Local `dist/` output only, not a GitHub artifact or release. |
+| Previous application source (2026-10-04) | **LOCAL VERIFIED** | `08b9fcd`; application regression set **189 passed in 4.68 s** (subprocess **5.73 s**, peak child RSS **141.8 MiB**). Configured Ruff, Python/spec compilation, `pip check`, diff checks, and Node syntax check passed. Targeted walkaround/static/auth tests: **19 passed in 1.39 s**. |
 | Current packaging changes | **SOURCE + MOCKED INSTALL TESTS; no bundle** | Full repo suite after Linux installer/verifier changes: **193 passed in 3.41 s** (Python-runner wall **3.74 s**, pytest-process peak RSS **142.6 MiB**). Installer/archive targeted tests: **20 passed in 0.16 s**; shell syntax, Ruff, compilation, dependency check, YAML parse, and diff checks passed. The installer was exercised with a synthetic launcher/layout and path names containing spaces, quotes, backslashes, and `%`; no frozen application was installed or smoke-tested. The actual build stopped before PyInstaller at the unavailable FFmpeg LFS download. |
 | Dealer Studio route glue | **LOCALLY TESTED; not live** | Existing composite route, text-only video-ad draft route, and authenticated walkaround start/status route are surfaced in Dealer Studio. Start remains explicit; owner/tenant and queued/error behavior has local tests. No real media generation, provider call, or output-quality test. |
 | Walkaround limits | **CODE + TEST VERIFIED** | Per source directory: scan at most **4,096** entries; worst case up to **8,192** across studio and exterior fallback. Retain at most **72** JPEG candidates; validate at most **4** selected images; cumulative validation is at most `min(200 MiB, configured photo-batch cap)`. Application photo defaults are **30 MiB/file** and **40 MP/image**. |
@@ -26,12 +30,12 @@ The PRD's August 12 stranger-dealer run is **historical evidence only**. Its che
 
 | PRD gate | Position now | What closes it |
 |---|---|---|
-| 1. Account registration and working dashboard | **OPEN / re-verify** | Fresh external dealer account on the actual live service; verify registration, login, and dashboard without agent help. |
-| 2. Upload real walkaround video | **Historical pass 2026-08-12; re-run** | Fresh dealer uploads representative real-car footage on the current deployed version. |
-| 3. Reject bad capture / accept good capture with clear reasons | **Historical pass 2026-08-12; re-run** | Repeat both paths on deployed product and review clarity of surfaced reasons. |
-| 4. Produce usable 360 spin/background result | **Historical pass 2026-08-12; visual QA still open** | Render a current real vehicle and inspect the full-resolution spin, including identity, crop, seams, and backgrounds. |
-| 5. Public VDP works | **Historical pass 2026-08-12; live service not checked** | Verify current public URL, access rules, and media behavior on the deployed domain. |
-| 6. Google Vehicle Listings feed accepts listing | **Historical validator pass; live feed/ingestion not checked** | Re-run on current real inventory and verify Google registration/ingestion with owner-supplied public URL and credentials. |
+| 1. Account registration and working dashboard | **Local pass 2026-10-16 (source + installed app); live service OPEN** | Fresh external dealer account on the actual live service; verify registration, login, and dashboard without agent help. |
+| 2. Upload real walkaround video | **Local pass 2026-10-16 with synthetic footage; real-car re-run OPEN** | Fresh dealer uploads representative real-car footage on the current deployed version. |
+| 3. Reject bad capture / accept good capture with clear reasons | **Local pass 2026-10-16 (turntable rejected with reason in 2.9 s; walkaround accepted); default installs skip car-present/crop/angle until a model is approved** | Repeat both paths with real captures on the deployed product and review clarity of surfaced reasons. |
+| 4. Produce usable 360 spin/background result | **Local pass 2026-10-16: 36-frame spin in 13.3 s, photographed background (no model approved); real-vehicle visual QA still open** | Render a current real vehicle and inspect the full-resolution spin, including identity, crop, seams, and backgrounds. |
+| 5. Public VDP works | **Local pass 2026-10-16 (signed-out `/vdp`, `/view`, `/embed` 200, spin renders); live service not checked** | Verify current public URL, access rules, and media behavior on the deployed domain. |
+| 6. Google Vehicle Listings feed accepts listing | **Local pass 2026-10-16 (item has every required attribute, valid VIN, 10 resolving images); live feed/ingestion not checked** | Re-run on current real inventory and verify Google registration/ingestion with owner-supplied public URL and credentials. |
 | 7. Dealer pays and gets receipt | **OPEN / owner-gated** | Ahmad approves one canonical offer, reconciles every catalog, refreshes/configures valid Stripe credentials and webhook secret, then performs a controlled live transaction and verifies receipt, webhook, entitlement, and refund/rollback behavior. No agent may approve pricing. |
 | End-to-end Definition of Done | **NOT COMPLETE** | One previously unaware dealer completes all seven steps, including payment, without help; the server survives reboot; a submitted lead reaches Ahmad by live-tested email. |
 
