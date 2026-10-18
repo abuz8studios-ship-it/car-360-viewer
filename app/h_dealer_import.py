@@ -40,7 +40,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from app_paths import BASE_DIR, DB_PATH, STORAGE_DIR
+from app_paths import BASE_DIR, DB_PATH, STORAGE_DIR, python_script_command
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -781,7 +781,7 @@ def _load_clip_results(import_dir: Path) -> dict:
         return {}
     try:
         result = subprocess.run(
-            [sys.executable, "-s", str(script), str(import_dir)],
+            python_script_command(script, str(import_dir), no_user_site=True),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=600,
@@ -943,9 +943,9 @@ def _queue_3d_build(vin, images_dir):
         json.dumps({"status": "running", "step": "queued", "progress": 1, "vin": vin}),
         encoding="utf-8")
     subprocess.Popen(
-        [sys.executable, str(BASE_DIR / "gaussian_3d.py"), "--vin", vin,
-         "--images", str(images_dir), "--steps", "7000",
-         "--style", "natural", "--backdrop", "light"],
+        python_script_command(BASE_DIR / "gaussian_3d.py", "--vin", vin,
+                              "--images", str(images_dir), "--steps", "7000",
+                              "--style", "natural", "--backdrop", "light"),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(BASE_DIR))
 
 

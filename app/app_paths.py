@@ -30,6 +30,17 @@ def _default_data_dir() -> Path:
     return root / "LotVue360"
 
 
+def python_script_command(script: Path | str, *arguments: str, no_user_site: bool = False) -> list[str]:
+    """Command that runs one of the app's own scripts in a child process.
+
+    A frozen desktop build has no python executable: sys.executable is the
+    LotVue360 launcher, which runs an app script only when given --run-script.
+    Without it the launcher would start another copy of the app instead."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--run-script", str(script), *arguments]
+    return [sys.executable, *(["-s"] if no_user_site else []), str(script), *arguments]
+
+
 DATA_DIR = configured_path("LOTVUE_DATA_DIR", _default_data_dir())
 ENV_FILE = DATA_DIR / ".env"
 DB_PATH = DATA_DIR / "vehicles.db"

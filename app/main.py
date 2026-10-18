@@ -71,7 +71,7 @@ if _ENV_FILE.exists():
     for _k, _v in _read_env_values(_ENV_FILE).items():
         os.environ.setdefault(_k, _v)  # explicitly exported variables still win
 
-from app_paths import BASE_DIR, DB_PATH, STORAGE_DIR
+from app_paths import BASE_DIR, DB_PATH, STORAGE_DIR, python_script_command
 from background_catalog import (
     STATIC_BACKGROUND_DIR,
     background_asset_path,
@@ -286,10 +286,10 @@ def _write_gaussian_status(vin: str, payload: dict) -> None:
 def _run_gaussian_3d_job(vin: str, mode_args: list[str], steps: int,
                          style: str, backdrop: str) -> None:
     """Run one bounded Gaussian reconstruction as managed background work."""
-    command = [
-        sys.executable, str(BASE_DIR / "gaussian_3d.py"), "--vin", vin,
+    command = python_script_command(
+        BASE_DIR / "gaussian_3d.py", "--vin", vin,
         *mode_args, "--steps", str(steps), "--style", style, "--backdrop", backdrop,
-    ]
+    )
     try:
         result = subprocess.run(
             command,
@@ -10896,18 +10896,18 @@ async def generate_3d(request: Request, vin: str, video: Optional[UploadFile] = 
     from validate_video import validate_dir as _gate_dir, \
         validate_video_file as _gate_video, gate_summary as _gate_sum
     vin = validate_vehicle_id(vin)
-    await run_in_threadpool(_require_vehicle_owner, request, vin)
-    vehicle = await run_in_threadpool(db_get_vehicle, vin)
-    if not vehicle or vehicle.get("status", "active") != "active":
-        raise HTTPException(status_code=404, detail="Vehicle not found")
+    # 3D Studio can start a new vehicle, as /api/upload does: the shared check
+    # applies the free-vehicle quota and still refuses another dealer's vehicle.
+    user_email, vehicle = await run_in_threadpool(
+        _require_vehicle_access, request, vin, allow_create=True
+    )
     style = (style or "natural").strip().lower()
     if style not in {"natural", "studio", "branded"}:
         raise HTTPException(status_code=422, detail="Unsupported 3D render style")
     backdrop = (backdrop or "light").strip().lower()
     if backdrop not in ("light", "white", "silver", "warm", "blue"):
         backdrop = "light"
-    vdir = await run_in_threadpool(_safe_vehicle_directory, vin)
-    await run_in_threadpool(_ensure_safe_vehicle_subdir, vin, "splat", create=True)
+    vdir = await run_in_threadpool(_prepare_vehicle_upload, vin, user_email, vehicle, ("splat",))
     if _background_job_running(f"gaussian3d:{vin}"):
         return JSONResponse({"error": "A 3D reconstruction is already running for this vehicle"}, status_code=409)
     try:

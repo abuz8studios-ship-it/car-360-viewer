@@ -31,6 +31,7 @@ from PIL import Image
 
 BASE = Path(__file__).parent
 sys.path.insert(0, str(BASE))
+from app_paths import python_script_command
 from studio import cut_car, _bbox, studio_frame, STORAGE
 from validate_video import _orb_inliers, _resolve_tool
 
@@ -38,7 +39,12 @@ FFMPEG = _resolve_tool("FFMPEG_PATH", "ffmpeg")
 
 # Use an optional isolated interpreter for CLIP; otherwise reuse this runtime.
 _isolated_python = os.getenv("LOTVUE_PY_ISOLATED", "").strip()
-ISOLATED_PY = _isolated_python if _isolated_python and Path(_isolated_python).is_file() else sys.executable
+
+
+def _clip_command(script, photo_dir):
+    if _isolated_python and Path(_isolated_python).is_file():
+        return [_isolated_python, "-s", str(script), str(photo_dir)]
+    return python_script_command(script, str(photo_dir), no_user_site=True)
 
 
 def clip_exteriors(files):
@@ -52,7 +58,7 @@ def clip_exteriors(files):
             name = f"p_{i+1:04d}.jpg"
             shutil.copyfile(p, tmp / name)
             mapping[name] = p
-        r = subprocess.run([ISOLATED_PY, "-s", str(BASE / "clip_classify.py"), str(tmp)],
+        r = subprocess.run(_clip_command(BASE / "clip_classify.py", tmp),
                            capture_output=True, text=True, timeout=900)
         data = json.loads(r.stdout.strip().splitlines()[-1])
         if not data.get("ok"):
@@ -113,7 +119,7 @@ def clip_fullcar_filter(files):
             name = f"p_{i+1:04d}.jpg"
             shutil.copyfile(p, tmp / name)
             mapping[name] = p
-        r = subprocess.run([ISOLATED_PY, "-s", str(BASE / "clip_fullcar.py"), str(tmp)],
+        r = subprocess.run(_clip_command(BASE / "clip_fullcar.py", tmp),
                            capture_output=True, text=True, timeout=900)
         data = json.loads(r.stdout.strip().splitlines()[-1])
         if not data.get("ok"):

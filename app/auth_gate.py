@@ -238,6 +238,20 @@ def _owns_vehicle(token: str, vehicle_id: str, db_path: str, jwt_module, secret:
         return False
 
 
+def _starts_new_vehicle(method: str, path: str, vehicle_id: str, db_path: str) -> bool:
+    """3D Studio may start a vehicle that does not exist yet. Its handler creates
+    it for the signed-in dealer (quota applies), like /api/upload does."""
+    if method != "POST" or not re.fullmatch(r"/api/vehicle/[A-Za-z0-9_-]{1,32}/generate-3d", path):
+        return False
+    try:
+        with sqlite3.connect(db_path, timeout=2) as conn:
+            return conn.execute(
+                "SELECT 1 FROM vehicles WHERE vin=?", ((vehicle_id or "").upper(),)
+            ).fetchone() is None
+    except sqlite3.Error:
+        return False
+
+
 def _private_vehicle_scope(path: str) -> str | None:
     parts = path.strip("/").split("/")
     if not parts or not parts[0]:
@@ -417,7 +431,8 @@ def install_auth_gate(app):
         if vehicle_id:
             if not verified_email:
                 return JSONResponse({"detail": "Sign in required"}, status_code=401)
-            if not await run_in_threadpool(_owns_vehicle, token, vehicle_id, _db_path(), jwt, _jwt_secret(), JWT_ALG):
+            if not await run_in_threadpool(_owns_vehicle, token, vehicle_id, _db_path(), jwt, _jwt_secret(), JWT_ALG) \
+                    and not await run_in_threadpool(_starts_new_vehicle, method, path, vehicle_id, _db_path()):
                 return JSONResponse({"detail": "Vehicle not found"}, status_code=404)
             return _no_cache(await call_next(request))
         if path.startswith("/storage/"):

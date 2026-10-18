@@ -44,6 +44,9 @@ hiddenimports = [
     "uvicorn.protocols.http.h11_impl", "uvicorn.protocols.http.httptools_impl",
     "uvicorn.protocols.websockets.auto", "uvicorn.protocols.websockets.websockets_impl",
     "uvicorn.lifespan.on", "anyio._backends._asyncio",
+    # Engine scripts such as gaussian_3d.py run via `--run-script` and are not
+    # analysed by PyInstaller; keep the stdlib modules they need in the bundle.
+    "argparse", "runpy",
 ]
 
 for package in PACKAGES:

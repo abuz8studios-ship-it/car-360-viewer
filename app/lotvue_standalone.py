@@ -467,10 +467,38 @@ def _run_tray() -> bool:
         return False
 
 
+def _run_script(script: str, arguments: list[str]) -> int:
+    """Run one of the app's own scripts (e.g. gaussian_3d.py) in this runtime.
+
+    Frozen builds have no python executable, so the app starts its engine
+    scripts as `LotVue360 --run-script <script> ...`. Only .py files inside the
+    app directory are accepted."""
+    import runpy
+
+    app_dir = APP_DIR.resolve()
+    path = Path(script).resolve()
+    if path.suffix != ".py" or not path.is_file() or app_dir not in path.parents:
+        _log(f"refused --run-script outside the app directory: {script}")
+        print(f"refusing to run a script outside the app directory: {script}", file=sys.stderr)
+        return 2
+    if str(app_dir) not in sys.path:
+        sys.path.insert(0, str(app_dir))
+    sys.argv = [str(path), *arguments]
+    try:
+        runpy.run_path(str(path), run_name="__main__")
+    except SystemExit as exc:
+        if exc.code is None:
+            return 0
+        return exc.code if isinstance(exc.code, int) else 1
+    return 0
+
+
 def main() -> int:
     _configure_stdio()
     # Redirect frozen windowed-build streams before importing the app, whose
     # startup diagnostics use print(). This ordering also applies to CI smoke.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--run-script":
+        return _run_script(sys.argv[2], sys.argv[3:])
     if "--self-test" in sys.argv:
         return _smoke_test()
     _log(f"launching: app={APP_DIR}; data={DATA_DIR}; port={PORT}; frozen={FROZEN}")
