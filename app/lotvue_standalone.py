@@ -314,6 +314,14 @@ def _smoke_test() -> int:
             except (OSError, subprocess.SubprocessError) as exc:
                 _log(f"packaged self-test failed: bundled {name} is unavailable ({type(exc).__name__})")
                 return 1
+        # 3D Studio starts gaussian_3d.py through --run-script; without it a
+        # frozen build relaunches the app instead of running the 360/3D engine.
+        try:
+            subprocess.run([sys.executable, "--run-script", str(APP_DIR / "gaussian_3d.py"), "--help"],
+                           capture_output=True, check=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            _log(f"packaged self-test failed: the 360/3D engine did not start ({type(exc).__name__})")
+            return 1
     start_engine()
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
