@@ -111,3 +111,11 @@ Still not established: install on the owner's own PC, code signing and notarizat
   - The 11-photo spin now goes around the car in one direction; the earlier re-sort scrambled it.
   - Contact sheets were inspected. The quality gate passed every run without force. The app log has 0 tracebacks.
 - **Not established:** real WAN output quality and speed on an NVIDIA GPU. The stand-in returns cross-fades, not WAN frames. `Setup-AI-Spin.ps1` was parse-checked and its `.env` editing tested under PowerShell 7 on Linux, but it has not run on Windows. huggingface.co is blocked from this container; the model paths and byte sizes come from the Hugging Face API.
+- **Hosted build:** [Desktop releases run 39351109893](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/39351109893) (`7b89a93`) passed verify (lint + tests), Windows x64, Linux x64, macOS arm64 and macOS x64, each with its installer smoke test. The Windows package verifier now requires `Setup-AI-Spin.ps1/.cmd`. Artifacts expire 2026-11-19:
+
+  | Artifact | ID | Size (bytes) |
+  | --- | --- | --- |
+  | `lotvue-desktop-windows-x64` | 12233244989 | 1,212,361,902 |
+  | `lotvue-desktop-linux-x64` | 12233034289 | — |
+  | `lotvue-desktop-macos-arm64` | 12233368608 | — |
+  | `lotvue-desktop-macos-x64` | 12233264447 | — |
