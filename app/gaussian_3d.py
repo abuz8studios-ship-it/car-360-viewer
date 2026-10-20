@@ -436,8 +436,8 @@ def generative_upgrade(vin, target=72):
     except Exception as e:
         return _ai_skipped(f"the AI engine could not load ({type(e).__name__})")
     if not comfyui_up():
-        return _ai_skipped(f"ComfyUI is not running at {COMFYUI_URL} — start it on the "
-                           "NVIDIA PC (run_nvidia_gpu.bat) and re-run")
+        return _ai_skipped(f"ComfyUI is not running at {COMFYUI_URL} — double-click "
+                           "\"Start LotVue360 AI Engine\" on the NVIDIA PC and re-run")
     try:
         import cv2
         meta = json.loads((keys_dir / "gaps.json").read_text(encoding="utf-8"))

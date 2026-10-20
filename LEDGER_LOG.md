@@ -92,3 +92,22 @@ Still not established: install on the owner's own PC, code signing and notarizat
 - **Evidence:** on the installed Linux build `0f8f3a2`, with a fresh data directory, a new VIN plus 4 real Acura ILX dealer photos (`rnd/19UDE2F72MA005771/curated` #002, #004, #007, #010) produced a 36-frame spin and an H.264 MP4 (1280×854, 8 fps). This took about 25 s after upload, with no second launcher in `desktop_launch.log`. The previous build stayed at "queued 1%" with 0 frames. 262 tests pass (4 new).
 - **Quality, not yet CarCutter level:** the real angles are clean (cut-out, studio floor, shadow). Optical-flow in-betweens across ~90° gaps ghost, showing double, translucent bodies. All 11 photos came out worse, because the spin builder re-ordered the angles instead of keeping the upload order. The WAN generative in-between path, which needs ComfyUI on an NVIDIA GPU, and Gaussian 3D, which needs a walkaround video plus COLMAP/Brush on a GPU, were not exercised.
 - **Hosted build:** [Desktop releases run 39172200137](https://github.com/abuz8studios-ship-it/car-360-viewer/actions/runs/39172200137) (`e01f359`) passed verify, Windows x64, Linux x64, macOS arm64 and macOS x64, including each installer's smoke test with the new engine check. Artifacts (expire 2026-11-17): `lotvue-desktop-windows-x64` 12153366401 (1,212,493,778 B), `lotvue-desktop-linux-x64` 12153313264, `lotvue-desktop-macos-arm64` 12153695050, `lotvue-desktop-macos-x64` 12153705481.
+
+## 2026-10-20 — Three 360 spin styles; the dealer's photo order is kept; AI in-betweens wired to ComfyUI
+- **Code:** `f98834d` adds three 3D Studio spin styles. AI smooth uses WAN 2.2 first-last-frame through ComfyUI and falls back to blended with a stated reason. Blended uses optical flow. Real photos only holds each photo, with no invented frames. Photo order now follows file names; re-sorting by angle is opt-in. The ComfyUI bridge defaults to `wan_2.1_vae.safetensors`, the VAE name published in `Comfy-Org/Wan_2.2_ComfyUI_Repackaged`; the old `wan_2.1_vae_official.safetensors` is not in that repo. It fetches frames over `/history` + `/view`. `Setup-AI-Spin.ps1/.cmd` ship in the Windows package and installer.
+- **Tests:** 272 tests pass (10 new). They include a fake ComfyUI HTTP server that drives `generate_wan_flf_frames` and `generative_upgrade` end to end.
+- **Installed Linux build** (`40101d2-spinmodes`, same source as `f98834d`): ZIP 755,264,882 B, SHA-256 `854af68c…be3b98`, 8,041 files, verifier passed; `.run` 693,978,845 B. Fresh data directory, Acura ILX photos from `rnd/19UDE2F72MA005771/curated`:
+
+  | Run | Photos | Engine | Frames | Time |
+  | --- | --- | --- | --- | --- |
+  | Real photos only | 4 (#002, #004, #007, #010) | `photos` | 36 (9 per photo) | 72.8 s |
+  | Blended | same 4 | `optical-flow` | 36 | 25.4 s |
+  | AI smooth, no ComfyUI | same 4 | `optical-flow` | 36 | 25.4 s |
+  | AI smooth, stand-in ComfyUI on :8188 | same 4 | `wan-flf` | 72 | 65.3 s |
+  | Blended | all 11, upload order | `optical-flow` | 36 | 37.4 s |
+
+  - Without ComfyUI, the status note began "AI in-between frames were skipped: ComfyUI is not running at http://127.0.0.1:8188".
+  - Against the stand-in, the app sent 4 arcs (1→2, 2→3, 3→4, 4→1), each 21 frames at 720×480, with both Fun-InP 14B fp8 UNets and `wan_2.1_vae.safetensors`.
+  - The 11-photo spin now goes around the car in one direction; the earlier re-sort scrambled it.
+  - Contact sheets were inspected. The quality gate passed every run without force. The app log has 0 tracebacks.
+- **Not established:** real WAN output quality and speed on an NVIDIA GPU. The stand-in returns cross-fades, not WAN frames. `Setup-AI-Spin.ps1` was parse-checked and its `.env` editing tested under PowerShell 7 on Linux, but it has not run on Windows. huggingface.co is blocked from this container; the model paths and byte sizes come from the Hugging Face API.
