@@ -10727,6 +10727,15 @@ button.ghost:disabled{opacity:.6;cursor:wait}
   <label class="opt"><input type="radio" name="style" value="branded" onchange="selStyle()">Branded</label>
 </div>
 <span class="hint">Real lot = your actual lot, edges softened. Studio = clean studio floor. Branded = your own backdrop + logo.</span>
+<label>Frames between your photos</label>
+<div class="styles">
+  <label class="opt sel"><input type="radio" name="spin_mode" value="ai" checked onchange="syncSel()">AI smooth</label>
+  <label class="opt"><input type="radio" name="spin_mode" value="blend" onchange="syncSel()">Blended</label>
+  <label class="opt"><input type="radio" name="spin_mode" value="photos" onchange="syncSel()">Real photos only</label>
+</div>
+<span class="hint">AI smooth = your NVIDIA GPU draws the views between your photos (needs ComfyUI running, takes several minutes; you get Blended if it isn't running). Blended = a quick morph between photos. Real photos only = nothing invented, every frame is one of your photos.</span>
+<label style="display:flex;gap:.5rem;align-items:center;font-weight:400;font-size:.92rem"><input type="checkbox" id="autoOrder"> My photos are out of order — sort them by angle for me</label>
+<span class="hint" style="display:block;font-size:.8rem;color:#7A8CA0">Otherwise photos are used in file-name order (IMG_001, IMG_002, …), going around the car.</span>
 <div id="backdropPanel" style="display:none">
   <label>Studio backdrop</label>
   <div class="styles" id="backdrops">
@@ -10805,12 +10814,17 @@ async function go(){
   if(!vin){alert('Enter a VIN/ID');return}
   if(!files||!files.length){alert('Choose a walkaround video or a set of photos');return}
   const vids=[...files].filter(f=>f.type.indexOf('video/')===0);
-  const imgs=[...files].filter(f=>f.type.indexOf('image/')===0);
+  // the file picker can hand files back in click order; the walkaround is name order
+  const imgs=[...files].filter(f=>f.type.indexOf('image/')===0)
+    .sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:'base'}));
   const style=(document.querySelector('input[name=style]:checked')||{}).value||'natural';
   const backdrop=(document.querySelector('input[name=backdrop]:checked')||{}).value||'light';
+  const spinMode=(document.querySelector('input[name=spin_mode]:checked')||{}).value||'ai';
   const fd=new FormData();
   fd.append('style', style);
   fd.append('backdrop', backdrop);
+  fd.append('spin_mode', spinMode);
+  fd.append('photo_order', document.getElementById('autoOrder').checked?'auto':'upload');
   if(imgs.length>=4){ imgs.forEach(f=>fd.append('photos',f)); }
   else if(vids.length){ fd.append('video',vids[0]); }
   else { alert('Upload one video, or at least 4 photos'); return; }
@@ -10839,7 +10853,8 @@ async function poll(){
     if(j.status==='done'){
       document.getElementById('prog').style.width='100%';
       let msg = j.splat_ready ? '✅ True 3D ready — orbit it anywhere!' : '✅ 360° spin ready.';
-      if(!j.splat_ready && j.note){ msg += '  ℹ '+j.note; }
+      if(j.spin_engine==='wan-flf'){ msg += ' Made with AI in-between frames.'; }
+      if(j.note){ msg += '  ℹ '+j.note; }
       document.getElementById('status').textContent=msg;
       const v=document.getElementById('view');v.style.display='block';
       document.getElementById('vlink').textContent = j.splat_ready ? '🔄 Open Interactive 3D' : '🔄 Open 360 Viewer';
@@ -10892,6 +10907,8 @@ async def generate_3d(request: Request, vin: str, video: Optional[UploadFile] = 
                       steps: str = Form("7000"),
                       style: str = Form("natural"),
                       backdrop: str = Form("light"),
+                      spin_mode: str = Form("ai"),
+                      photo_order: str = Form("upload"),
                       force: str = Form("")):  # "1" bypasses the capture quality gate
     from validate_video import validate_dir as _gate_dir, \
         validate_video_file as _gate_video, gate_summary as _gate_sum
@@ -10907,6 +10924,14 @@ async def generate_3d(request: Request, vin: str, video: Optional[UploadFile] = 
     backdrop = (backdrop or "light").strip().lower()
     if backdrop not in ("light", "white", "silver", "warm", "blue"):
         backdrop = "light"
+    # ai = AI in-betweens on the GPU (blended when ComfyUI isn't running),
+    # blend = optical-flow in-betweens, photos = real photos only
+    spin_mode = (spin_mode or "ai").strip().lower()
+    if spin_mode not in {"ai", "blend", "photos"}:
+        raise HTTPException(status_code=422, detail="Unsupported 360 spin mode")
+    photo_order = (photo_order or "upload").strip().lower()
+    if photo_order not in {"upload", "auto"}:
+        raise HTTPException(status_code=422, detail="Unsupported photo order")
     vdir = await run_in_threadpool(_prepare_vehicle_upload, vin, user_email, vehicle, ("splat",))
     if _background_job_running(f"gaussian3d:{vin}"):
         return JSONResponse({"error": "A 3D reconstruction is already running for this vehicle"}, status_code=409)
@@ -10988,6 +11013,7 @@ async def generate_3d(request: Request, vin: str, video: Optional[UploadFile] = 
         mode_args = ["--video", str(walk)]
     else:
         raise HTTPException(status_code=400, detail="Upload a walkaround video or 4+ photos.")
+    mode_args += ["--spin-mode", spin_mode, "--photo-order", photo_order]
 
     await run_in_threadpool(
         _write_gaussian_status, vin,

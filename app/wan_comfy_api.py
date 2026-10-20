@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import argparse
 import subprocess
+import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -26,11 +27,14 @@ COMFYUI_URL = (os.getenv("COMFYUI_URL") or "http://127.0.0.1:8188").rstrip("/")
 _COMFYUI_ROOT = configured_path("COMFYUI_ROOT", BASE_DIR / "ComfyUI")
 COMFYUI_OUTPUT = str(configured_path("COMFYUI_OUTPUT", _COMFYUI_ROOT / "output"))
 FFMPEG = os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg") or "ffmpeg"
+POLL_SECONDS = 5  # how often a running ComfyUI job is checked
 
 UNET = "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
 CLIP = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
 CLIP_VISION = "clip_vision_h.safetensors"
-VAE = os.environ.get("WAN_VAE_NAME", "wan_2.1_vae_official.safetensors")  # WAN 2.2 14B I2V pairs with the 2.1 VAE (16-ch)
+# WAN 2.2 14B pairs with the 2.1 VAE (16-ch); this is its file name in
+# Comfy-Org/Wan_2.2_ComfyUI_Repackaged (split_files/vae/).
+VAE = os.environ.get("WAN_VAE_NAME", "wan_2.1_vae.safetensors")
 # First-last-frame gap synthesis (the 360-spin arc filler): WAN 2.2 Fun-InP 14B,
 # conditioned on BOTH endpoint photos, sampled in the canonical two-stage
 # high-noise -> low-noise chain.
@@ -97,6 +101,42 @@ def _build_workflow(uploaded: str, prompt: str, width: int, height: int,
         "12": {"class_type": "SaveImage",
                "inputs": {"images": ["11", 0], "filename_prefix": prefix}},
     }
+
+
+def _collect_output_frames(entry: dict, prefix: str, out_dir: str, node: str = "12") -> list:
+    """Copy a finished job's SaveImage frames into out_dir as flf_NNNN.png.
+    Frames are read over HTTP (/view), so ComfyUI may run from its own folder
+    (e.g. the portable Windows build) rather than <app>/ComfyUI. Copies ComfyUI
+    left in COMFYUI_OUTPUT on this machine are removed afterwards."""
+    images = sorted(
+        (img for img in ((entry.get("outputs") or {}).get(node) or {}).get("images", [])
+         if img.get("filename", "").startswith(prefix)),
+        key=lambda img: img["filename"],
+    )
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    moved = []
+    if images:
+        for i, img in enumerate(images):
+            query = urllib.parse.urlencode({"filename": img["filename"],
+                                            "subfolder": img.get("subfolder", ""),
+                                            "type": img.get("type", "output")})
+            dst = os.path.join(out_dir, f"flf_{i:04d}.png")
+            with urllib.request.urlopen(f"{COMFYUI_URL}/view?{query}", timeout=60) as resp, \
+                    open(dst, "wb") as fh:
+                shutil.copyfileobj(resp, fh)
+            moved.append(dst)
+            local = os.path.join(COMFYUI_OUTPUT, img.get("subfolder", ""), img["filename"])
+            try:
+                os.remove(local)
+            except OSError:
+                pass
+        return moved
+    # older ComfyUI builds without outputs in /history: read its output folder
+    for i, f in enumerate(sorted(glob.glob(os.path.join(COMFYUI_OUTPUT, f"{prefix}_*.png")))):
+        dst = os.path.join(out_dir, f"flf_{i:04d}.png")
+        shutil.move(f, dst)
+        moved.append(dst)
+    return moved
 
 
 def comfyui_up(timeout=6) -> bool:
@@ -207,13 +247,15 @@ def generate_wan_flf_frames(start_image: str, end_image: str, out_dir: str,
 
         start_t = time.time()
         missing_polls = 0
+        entry = {}
         while time.time() - start_t < timeout_s:
-            time.sleep(5)
+            time.sleep(POLL_SECONDS)
             try:
                 hist = _get(f"/history/{prompt_id}")
                 if prompt_id in hist:
                     missing_polls = 0
-                    st = hist[prompt_id].get("status", {})
+                    entry = hist[prompt_id]
+                    st = entry.get("status", {})
                     if st.get("status_str") == "error":
                         msgs = [m for m in st.get("messages", []) if m[0] == "execution_error"]
                         log(f"[WAN-FLF] execution error: {str(msgs)[:400]}")
@@ -232,16 +274,8 @@ def generate_wan_flf_frames(start_image: str, end_image: str, out_dir: str,
             log(f"[WAN-FLF] timeout after {timeout_s}s")
             _cancel_and_clean()
             return []
-        frames = sorted(glob.glob(os.path.join(COMFYUI_OUTPUT, f"{prefix}_*.png")))
-        log(f"[WAN-FLF] {len(frames)} frames in {time.time()-start_t:.0f}s")
-        if not frames:
-            return []
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-        moved = []
-        for i, f in enumerate(frames):
-            dst = os.path.join(out_dir, f"flf_{i:04d}.png")
-            shutil.move(f, dst)
-            moved.append(dst)
+        moved = _collect_output_frames(entry, prefix, out_dir)
+        log(f"[WAN-FLF] {len(moved)} frames in {time.time()-start_t:.0f}s")
         return moved
     except urllib.error.HTTPError as e:
         try:

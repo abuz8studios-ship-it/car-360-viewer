@@ -439,6 +439,7 @@ def build(platform_name: str, output: Path, build_id: str) -> Path:
         if platform_name == "windows":
             for script_name in (
                 "Install-LotVue360.ps1", "Install-LotVue360.cmd", "Uninstall-LotVue360.ps1",
+                "Setup-AI-Spin.ps1", "Setup-AI-Spin.cmd",
             ):
                 shutil.copy2(ROOT / script_name, package_root / script_name)
         elif platform_name == "macos":

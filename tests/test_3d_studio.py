@@ -51,3 +51,31 @@ def test_3d_studio_rejects_a_bad_request_without_creating_a_vehicle(client, app_
 
     assert r.status_code == 422
     assert app_module.db_get_vehicle("LV360BADSTYLE01") is None
+
+
+def test_3d_studio_passes_the_spin_mode_and_photo_order_to_the_engine(client, app_module, monkeypatch):
+    _gate_passes(monkeypatch)
+    jobs = []
+    monkeypatch.setattr(app_module, "_submit_background_job",
+                        lambda key, fn, *args: jobs.append(args) or "started")
+    register(client, "studio3d-modes@example.com")
+
+    r = client.post("/api/vehicle/LV360MODES0001/generate-3d", files=_photos(),
+                    data={"spin_mode": "photos", "photo_order": "auto"})
+    assert r.status_code == 200, r.text
+    r = client.post("/api/vehicle/LV360MODES0002/generate-3d", files=_photos())
+    assert r.status_code == 200, r.text
+
+    first, default = (args[1] for args in jobs)
+    assert first[-4:] == ["--spin-mode", "photos", "--photo-order", "auto"]
+    assert default[-4:] == ["--spin-mode", "ai", "--photo-order", "upload"]
+
+
+def test_3d_studio_rejects_an_unknown_spin_mode_without_creating_a_vehicle(client, app_module, monkeypatch):
+    _gate_passes(monkeypatch)
+    register(client, "studio3d-badmode@example.com")
+
+    for data in ({"spin_mode": "magic"}, {"photo_order": "random"}):
+        r = client.post("/api/vehicle/LV360BADMODE01/generate-3d", data=data, files=_photos())
+        assert r.status_code == 422
+    assert app_module.db_get_vehicle("LV360BADMODE01") is None

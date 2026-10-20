@@ -136,6 +136,8 @@ def _app_bundle_paths(platform_name: str, package_root: str) -> tuple[str, str, 
             f"{package_root}/Install-LotVue360.ps1",
             f"{package_root}/Install-LotVue360.cmd",
             f"{package_root}/Uninstall-LotVue360.ps1",
+            f"{package_root}/Setup-AI-Spin.ps1",
+            f"{package_root}/Setup-AI-Spin.cmd",
         )
     elif platform_name == "macos":
         app_prefix = f"{package_root}/LotVue360.app/Contents/Resources/app"

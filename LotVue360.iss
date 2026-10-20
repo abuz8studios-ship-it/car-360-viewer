@@ -41,6 +41,7 @@ Source: "build\desktop\dist\LotVue360\*"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 Name: "{autoprograms}\LotVue360"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
 Name: "{autodesktop}\LotVue360"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autoprograms}\LotVue360 - Set up AI spin (NVIDIA)"; Filename: "{app}\Setup-AI-Spin.cmd"; WorkingDir: "{app}"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch LotVue360 now"; Flags: nowait postinstall skipifsilent

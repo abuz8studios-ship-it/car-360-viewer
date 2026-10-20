@@ -93,8 +93,9 @@ def extract_frames(video, out_dir, max_frames):
 
 def copy_photos(src_dir, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
-    srcs = sorted(Path(src_dir).glob("*.jpg")) + sorted(Path(src_dir).glob("*.jpeg")) \
-        + sorted(Path(src_dir).glob("*.png"))
+    # one sort across all extensions: the name order IS the dealer's shot order
+    srcs = sorted(f for f in Path(src_dir).iterdir()
+                  if f.suffix.lower() in (".jpg", ".jpeg", ".png"))
     srcs = [f for f in srcs if "_isolated" not in f.name and "_mask" not in f.name]
     for i, f in enumerate(srcs):
         shutil.copy(f, out_dir / f"frame_{i+1:04d}.jpg")
@@ -269,6 +270,28 @@ def interpolate_spin_frames(spin_dir, target=SPIN_DENSE, gap_degrees=None):
     return made
 
 
+def hold_spin_frames(spin_dir, target=SPIN_DENSE):
+    """"Real photos only" spin: stretch the stabilized photos to `target` frames by
+    holding each one for an even share of the loop — no invented in-between views,
+    so every frame the buyer sees is a real photo of the car."""
+    frames_list = sorted(Path(spin_dir).glob("spin_*.jpg"))
+    n = len(frames_list)
+    if n < 2 or n >= target:
+        return n
+    tmp_dir = Path(spin_dir) / f"_hold_tmp_{os.getpid()}"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    base, extra = target // n, target % n
+    out_idx = 1
+    for i, f in enumerate(frames_list):
+        for _ in range(base + (1 if i < extra else 0)):
+            shutil.copy(f, tmp_dir / f"spin_{out_idx:04d}.jpg")
+            out_idx += 1
+    made = _swap_spin_frames(Path(spin_dir), tmp_dir)
+    print(f"[3D] real-photos spin: held {n} photos across {made} frames")
+    return made
+
+
 def _swap_spin_frames(spin_dir, tmp_dir, retries=3):
     """Swap a freshly-built spin sequence into place with per-file os.replace
     (retry on Windows share violations while the live server streams a frame),
@@ -297,7 +320,15 @@ def _swap_spin_frames(spin_dir, tmp_dir, retries=3):
 
 
 # ── STEP A: the always-on 360 spin (works from ANY input) ────────────────────
-def build_spin(frames, vin, target=72, style=None, backdrop=None, ordered=False):
+SPIN_MODES = ("ai", "blend", "photos")
+PHOTO_ORDERS = ("upload", "auto")
+
+
+def build_spin(frames, vin, target=72, style=None, backdrop=None, ordered=False,
+               spin_mode="ai", photo_order="upload"):
+    """spin_mode: ai = optical-flow tweens now, WAN upgrade afterwards (run());
+    blend = optical-flow tweens only; photos = real photos held, nothing invented.
+    photo_order: upload = trust the dealer's shot order; auto = ORB re-sort."""
     from PIL import Image, ImageOps
     spin_dir = STORAGE_DIR / vin / "spin"
     spin_dir.mkdir(parents=True, exist_ok=True)
@@ -319,8 +350,10 @@ def build_spin(frames, vin, target=72, style=None, backdrop=None, ordered=False)
     # Sparse PHOTO sets (video frames are already time-ordered): put the shots in
     # walkaround order BEFORE stabilizing — the stabilizer smooths the bbox track
     # across the sequence, so a scrambled order corrupts the center/size lock.
+    # Only on request: a dealer's upload order is usually the walkaround already,
+    # and the ORB re-sort can scramble it (it mis-ordered an 11-photo Acura set).
     gap_degrees = None
-    if not ordered and len(sel) < SPIN_DENSE:
+    if not ordered and photo_order == "auto" and len(sel) < SPIN_DENSE:
         sel, gap_degrees = order_photos_by_angle(sel)
     # STABILIZE into a smooth GLO3D-style turntable: lock the car centered at a
     # constant size so it rotates in place (raw handheld frames jitter/drift).
@@ -346,7 +379,13 @@ def build_spin(frames, vin, target=72, style=None, backdrop=None, ordered=False)
     # Sparse set -> densify to a smooth CLOSED 360 (CarCutter Next-Gen parity):
     # optical-flow interpolate the stabilized frames up to SPIN_DENSE, wrap included.
     engine = "raw"
-    if 2 <= cnt < SPIN_DENSE:
+    if 2 <= cnt < SPIN_DENSE and spin_mode == "photos":
+        try:
+            cnt = hold_spin_frames(spin_dir, target=SPIN_DENSE)
+            engine = "photos"
+        except Exception as e:
+            print(f"[3D] real-photos spin failed: {e}")
+    elif 2 <= cnt < SPIN_DENSE:
         # keep the stabilized keyframes + gap map so the generative upgrade
         # (WAN first-last-frame arcs) can rebuild a premium spin afterwards
         keys_dir = spin_dir / "_keys"
@@ -369,6 +408,14 @@ def build_spin(frames, vin, target=72, style=None, backdrop=None, ordered=False)
     return cnt
 
 
+def _ai_skipped(reason):
+    """Record why the AI in-betweens didn't run (shown to the dealer in the note);
+    the blended spin already delivered stays live. Returns 0 for generative_upgrade."""
+    print(f"[3D] AI in-betweens skipped, blended spin kept: {reason}")
+    _STATE["spin_ai_skipped"] = reason
+    return 0
+
+
 def generative_upgrade(vin, target=72):
     """PREMIUM tier: replace the optical-flow spin with WAN 2.2 Fun-InP generative
     arcs — true novel-view synthesis between each pair of real photos (the real
@@ -382,17 +429,15 @@ def generative_upgrade(vin, target=72):
     if n < 2:
         return 0
     if os.environ.get("LOTVUE_SPIN_GEN", "1") != "1":
-        print("[3D] generative upgrade disabled (LOTVUE_SPIN_GEN=0)")
-        return 0
+        return _ai_skipped("AI in-betweens are turned off on this install (LOTVUE_SPIN_GEN=0)")
     try:
         sys.path.insert(0, str(BASE_DIR))
-        from wan_comfy_api import generate_wan_flf_frames, comfyui_up, FLF_PROMPT
+        from wan_comfy_api import generate_wan_flf_frames, comfyui_up, COMFYUI_URL
     except Exception as e:
-        print(f"[3D] generative upgrade unavailable: {e}")
-        return 0
+        return _ai_skipped(f"the AI engine could not load ({type(e).__name__})")
     if not comfyui_up():
-        print("[3D] generative upgrade skipped: ComfyUI :8188 not reachable")
-        return 0
+        return _ai_skipped(f"ComfyUI is not running at {COMFYUI_URL} — start it on the "
+                           "NVIDIA PC (run_nvidia_gpu.bat) and re-run")
     try:
         import cv2
         meta = json.loads((keys_dir / "gaps.json").read_text(encoding="utf-8"))
@@ -432,11 +477,13 @@ def generative_upgrade(vin, target=72):
         arc_dir = gen_dir / f"_arc{i}"
         frames = generate_wan_flf_frames(str(keys[i]), str(keys[(i + 1) % n]),
                                          str(arc_dir), prompt=prompt,
-                                         num_frames=length, seed=1000 + i)
+                                         num_frames=length, seed=1000 + i,
+                                         steps=int(os.environ.get("LOTVUE_FLF_STEPS", "20")),
+                                         timeout_s=int(os.environ.get("LOTVUE_FLF_TIMEOUT", "1800")))
         if len(frames) < need + 2:
-            print(f"[3D] generative arc {i+1}/{n} failed ({len(frames)} frames) — keeping flow spin")
             shutil.rmtree(gen_dir, ignore_errors=True)
-            return 0
+            return _ai_skipped(f"ComfyUI returned {len(frames)} frames for arc {i+1}/{n} — check "
+                               "the ComfyUI window for a missing WAN model or out-of-memory error")
         _emit(cv2.imread(str(keys[i])))                  # real photo anchor
         tweens = frames[1:-1]                            # drop endpoint dupes
         idxs = [round(j * (len(tweens) - 1) / (need - 1)) for j in range(need)] if need > 1 else [0]
@@ -754,9 +801,12 @@ def run(args):
 
     # STEP A — always deliver a 360 spin (works from anything)
     set_status("Building 360 spin", 25)
+    spin_mode = getattr(args, "spin_mode", "") or "ai"
+    _STATE.pop("spin_ai_skipped", None)
     nspin = build_spin(frames, _VIN, style=(getattr(args, "style", "") or None),
                        backdrop=(getattr(args, "backdrop", "") or None),
-                       ordered=ordered)
+                       ordered=ordered, spin_mode=spin_mode,
+                       photo_order=(getattr(args, "photo_order", "") or "upload"))
     _STATE["spin_ready"] = nspin > 0
     _STATE["spin_frames"] = nspin
     _STATE["spin_url"] = f"/storage/{_VIN}/spin/"
@@ -768,7 +818,7 @@ def run(args):
     # PREMIUM upgrade for sparse photo sets: WAN first-last-frame arcs replace the
     # optical-flow tweens with true generative novel views (real photos stay as
     # anchors). The flow spin above is already live, so failure costs nothing.
-    if not ordered and (STORAGE_DIR / _VIN / "spin" / "_keys").exists():
+    if spin_mode == "ai" and not ordered and (STORAGE_DIR / _VIN / "spin" / "_keys").exists():
         try:
             ngen = generative_upgrade(_VIN)
             if ngen:
@@ -778,7 +828,7 @@ def run(args):
                 if export_mp4(_VIN):
                     _STATE["spin_mp4"] = f"/storage/{_VIN}/spin/spin.mp4"
         except Exception as e:
-            print(f"[3D] generative upgrade error (flow spin kept): {e}")
+            _ai_skipped(f"the AI engine stopped with an error ({e})")
     set_status("Spin complete — now attempting true 3D", 70, spin_ready=True, spin_frames=nspin)
 
     # STEP B — best-effort true 3D upgrade
@@ -803,6 +853,9 @@ def run(args):
                 f"({detail}) — for 3D, reshoot a slow complete circle (or add 30+ overlapping photos) and re-run.")
         print(f"[3D] true-3D skipped: {reason}")
 
+    if _STATE.get("spin_ai_skipped"):
+        note = (f"AI in-between frames were skipped: {_STATE['spin_ai_skipped']}. "
+                "You have the blended spin for now. " + note).strip()
     _STATE["splat_ready"] = splat_ready
     _STATE["viewer"] = f"/splat3d/{_VIN}"
     _STATE["note"] = note
@@ -820,5 +873,10 @@ if __name__ == "__main__":
     ap.add_argument("--max-frames", type=int, default=150)
     ap.add_argument("--style", default="", help="natural | studio | branded (else env default)")
     ap.add_argument("--backdrop", default="", help="light|white|silver|warm|blue (studio backdrop)")
+    ap.add_argument("--spin-mode", choices=SPIN_MODES, default="ai",
+                    help="ai: AI in-betweens via ComfyUI, blended if it isn't running; "
+                         "blend: optical-flow in-betweens; photos: real photos only")
+    ap.add_argument("--photo-order", choices=PHOTO_ORDERS, default="upload",
+                    help="upload: keep the photos in the order given; auto: re-sort by angle")
     a = ap.parse_args()
     sys.exit(0 if run(a) else 1)

@@ -50,6 +50,8 @@ def _make_archive(
             f"{package_root}/Install-LotVue360.ps1",
             f"{package_root}/Install-LotVue360.cmd",
             f"{package_root}/Uninstall-LotVue360.ps1",
+            f"{package_root}/Setup-AI-Spin.ps1",
+            f"{package_root}/Setup-AI-Spin.cmd",
         )
         suffix = ".exe"
         archive_name = "LotVue360-windows-x64.zip"

@@ -80,6 +80,43 @@ Edit the per-user `.env` using a plain-text editor only if you have the account 
 
 The readiness page is available at `/studio`; its non-sensitive local configuration snapshot is `GET /api/system/health`. That endpoint deliberately performs no external probes. A provider-specific test is still required before describing any integration as connected.
 
+## 360 spins from a few photos: AI smooth, Blended, Real photos only
+
+3D Studio turns 4 or more photos into a closed 360° spin. The photos go around the car in **file-name order** (`IMG_001`, `IMG_002`, …). Tick "My photos are out of order" only when they aren't; the app then tries to sort them by angle. Pick one of three spin styles:
+
+- **AI smooth** (default): the NVIDIA GPU draws the views between each pair of photos with WAN 2.2 first-last-frame (through ComfyUI). The real photos stay in as anchor frames. A Blended spin is shown right away and replaced when the AI frames are done, which takes several minutes per spin. If ComfyUI isn't running, you keep the Blended spin and the result says why.
+- **Blended**: quick optical-flow morphs between photos, CPU only. Wide gaps between photos can ghost.
+- **Real photos only**: nothing invented. Each photo is held for an even share of the loop, so the spin steps from photo to photo.
+
+### Set up AI smooth on a Windows PC with an NVIDIA card
+
+1. Install the latest NVIDIA driver from <https://www.nvidia.com/drivers>.
+2. Start Menu → **LotVue360 - Set up AI spin (NVIDIA)**. A portable or ZIP install can run `Setup-AI-Spin.cmd` from the LotVue360 folder instead. The setup:
+   - downloads the portable ComfyUI for NVIDIA (about 2 GB);
+   - downloads four model files from Hugging Face (about 33 GB):
+     - `wan2.2_fun_inpaint_high_noise_14B_fp8_scaled.safetensors` and `wan2.2_fun_inpaint_low_noise_14B_fp8_scaled.safetensors` from `Comfy-Org/Wan_2.2_ComfyUI_Repackaged` → `models/diffusion_models`;
+     - `umt5_xxl_fp8_e4m3fn_scaled.safetensors` from `Comfy-Org/Wan_2.1_ComfyUI_repackaged` → `models/text_encoders`;
+     - `wan_2.1_vae.safetensors` → `models/vae`;
+   - sets `COMFYUI_URL`, `COMFYUI_OUTPUT` and `LOTVUE_SPIN_GEN=1` in `%LOCALAPPDATA%\LotVue360\.env`;
+   - adds a **Start LotVue360 AI Engine** shortcut on the desktop;
+   - starts ComfyUI and checks that it lists the WAN node and all four models.
+
+   It needs about 40 GB free. The default folder is `%USERPROFILE%\LotVue360-AI`; to use another drive, run `Setup-AI-Spin.cmd -InstallDir D:\LotVue360-AI`. Re-running skips finished downloads and resumes interrupted ones.
+3. Restart LotVue360. Before making AI spins, double-click **Start LotVue360 AI Engine** and keep its window open.
+
+Recommended hardware: 16–24 GB of video memory and 32 GB or more of system RAM. Cards with less memory are slower and may run out of memory.
+
+Optional `.env` tuning:
+
+| Setting | What it does | Default |
+| --- | --- | --- |
+| `LOTVUE_FLF_W`, `LOTVUE_FLF_H` | Render size of the AI frames | 720×480 |
+| `LOTVUE_FLF_STEPS` | Sampling steps per arc | 20 |
+| `LOTVUE_FLF_TIMEOUT` | Seconds allowed per arc | 1800 |
+| `WAN_VAE_NAME` | A different VAE file name | `wan_2.1_vae.safetensors` |
+
+The ComfyUI software and the WAN model weights are downloaded from their publishers onto your PC and remain under their own licenses. They are not part of the LotVue360 installer.
+
 ## Run from source (developers)
 
 Use Python 3.11 and install from the repository root:
