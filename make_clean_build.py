@@ -10,6 +10,8 @@ Run AFTER assemble_portable.py.  Master login is printed at the end.
 import sqlite3
 import shutil
 import hashlib
+import os
+import secrets
 from pathlib import Path
 
 BUNDLE_APP = Path(r"E:\ABU\360Car\dist\LotVue360_standalone\app")
@@ -17,7 +19,7 @@ DB = BUNDLE_APP / "vehicles.db"
 
 # ---- master account (the only account in a fresh install) ----
 MASTER_EMAIL = "ahmad@abuz8ai.com"
-MASTER_PASS = "***REMOVED***"
+MASTER_PASS = os.environ.get("LOTVUE_MASTER_PASS") or secrets.token_urlsafe(12)
 MASTER_NAME = "Master Admin"
 MASTER_DEALER = "mylot"
 
